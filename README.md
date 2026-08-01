@@ -28,6 +28,24 @@ Regression tests are evidence.
 
 The kernel is our current best explanation.
 
+## Our Method
+
+The method is as important as the question.
+
+Rather than attempting to design a complete system from first principles, every architectural idea is treated as a hypothesis.
+
+Our typical cycle is:
+
+1. Ask a clear question.
+2. Build the smallest executable model capable of answering it.
+3. Observe the results.
+4. Preserve successful behavior as regression tests.
+5. Freeze the kernel periodically.
+6. Build real applications against the frozen kernel.
+7. Let repeated evidence—not intuition—justify changes.
+
+The kernel should be viewed as our current best scientific model explaining the evidence gathered so far. It is expected to evolve, but only when new evidence explains more with fewer assumptions.
+
 ## Current Direction
 
 We currently believe:
@@ -39,6 +57,14 @@ We currently believe:
 - Applications should reveal missing primitives.
 
 These are working beliefs, not immutable truths. The project exists to test them.
+
+## Inspiration
+
+This project was initially inspired by ideas from the Forth programming language.
+
+Forth demonstrated that rich systems can emerge from a remarkably small set of orthogonal primitives. That philosophy influenced this work, particularly its preference for simple kernels, composability, and compiled execution.
+
+The goal, however, is not to build a Forth database. Ideas are retained because experiments support them, not because they resemble Forth.
 
 ## Success
 
