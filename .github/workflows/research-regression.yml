@@ -14,7 +14,7 @@ jobs:
   research-regression:
     name: Reproduce ForthDB research evidence
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       # Keep generated interpreter and compiler state outside the checkout so
       # the final cleanliness assertion measures real repository mutations.
@@ -49,10 +49,10 @@ jobs:
             conformance_runner.py \
             research_regression.py
 
-      - name: Test Rust conformance scaffold
+      - name: Test Rust semantic kernel
         run: cargo test --manifest-path rust/Cargo.toml
 
-      - name: Run conformance and research regression
+      - name: Run conformance, benchmarks, and research regression
         env:
           FORTHDB_REPORT_DIR: ${{ runner.temp }}/forthdb-research-artifacts
         run: |
@@ -63,19 +63,57 @@ jobs:
             --manifest-path rust/Cargo.toml \
             -p forthdb-conformance \
             -- conformance/v1/kernel_cases.json \
-            > "$FORTHDB_REPORT_DIR/rust-conformance-parser-v1.json"
+            > "$FORTHDB_REPORT_DIR/rust-conformance-v1.json"
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            > "$FORTHDB_REPORT_DIR/rust-kernel-benchmarks.json"
           python research_regression.py --output-dir "$FORTHDB_REPORT_DIR"
 
       - name: Publish regression summary
         if: always()
+        env:
+          FORTHDB_REPORT_DIR: ${{ runner.temp }}/forthdb-research-artifacts
         run: |
-          report="${{ runner.temp }}/forthdb-research-artifacts/regression-report.md"
+          report="$FORTHDB_REPORT_DIR/regression-report.md"
           if [[ -f "$report" ]]; then
             cat "$report" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "# ForthDB Research Regression" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "No regression report was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          benchmark="$FORTHDB_REPORT_DIR/rust-kernel-benchmarks.json"
+          if [[ -f "$benchmark" ]]; then
+            python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report_dir = Path(os.environ["FORTHDB_REPORT_DIR"])
+          data = json.loads((report_dir / "rust-kernel-benchmarks.json").read_text())
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("\n## Rust semantic-kernel benchmark observation\n\n")
+              handle.write(
+                  "Hosted-runner timings are observations, not merge thresholds or cross-system claims.\n\n"
+              )
+              handle.write("| Workload | Median ns/op | Median ops/s | Operations/sample |\n")
+              handle.write("| --- | ---: | ---: | ---: |\n")
+              for measurement in data["measurements"]:
+                  handle.write(
+                      f"| `{measurement['name']}` | "
+                      f"{measurement['median_ns_per_operation']:.2f} | "
+                      f"{measurement['median_operations_per_second']:.0f} | "
+                      f"{measurement['operations_per_sample']} |\n"
+                  )
+              handle.write(
+                  f"\nRelease profile on `{data['environment']['os']}/"
+                  f"{data['environment']['architecture']}`; total harness time "
+                  f"`{data['total_elapsed_ms']} ms`.\n"
+              )
+          PY
           fi
 
       - name: Upload research evidence
