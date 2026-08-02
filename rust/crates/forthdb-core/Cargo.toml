@@ -5,4 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[lib]
+test = false
+
 [dependencies]
