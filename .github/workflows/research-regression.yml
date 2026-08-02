@@ -49,7 +49,7 @@ jobs:
             conformance_runner.py \
             research_regression.py
 
-      - name: Test Rust semantic kernel
+      - name: Test Rust semantic and committed-world engines
         run: cargo test --manifest-path rust/Cargo.toml
 
       - name: Run conformance, benchmarks, and research regression
@@ -67,7 +67,13 @@ jobs:
           cargo run --quiet --release \
             --manifest-path rust/Cargo.toml \
             -p forthdb-bench \
+            --bin forthdb-bench \
             > "$FORTHDB_REPORT_DIR/rust-kernel-benchmarks.json"
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin world \
+            > "$FORTHDB_REPORT_DIR/rust-world-benchmarks.json"
           python research_regression.py --output-dir "$FORTHDB_REPORT_DIR"
 
       - name: Publish regression summary
@@ -84,37 +90,51 @@ jobs:
             echo "No regression report was produced." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          benchmark="$FORTHDB_REPORT_DIR/rust-kernel-benchmarks.json"
-          if [[ -f "$benchmark" ]]; then
-            python - <<'PY'
+          python - <<'PY'
           import json
           import os
           from pathlib import Path
 
           report_dir = Path(os.environ["FORTHDB_REPORT_DIR"])
-          data = json.loads((report_dir / "rust-kernel-benchmarks.json").read_text())
           summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          reports = [
+              (
+                  "rust-kernel-benchmarks.json",
+                  "Rust semantic-kernel benchmark observation",
+              ),
+              (
+                  "rust-world-benchmarks.json",
+                  "Rust MemoryCommitStore benchmark observation",
+              ),
+          ]
+
           with summary.open("a", encoding="utf-8") as handle:
-              handle.write("\n## Rust semantic-kernel benchmark observation\n\n")
-              handle.write(
-                  "Hosted-runner timings are observations, not merge thresholds or cross-system claims.\n\n"
-              )
-              handle.write("| Workload | Median ns/op | Median ops/s | Operations/sample |\n")
-              handle.write("| --- | ---: | ---: | ---: |\n")
-              for measurement in data["measurements"]:
+              for filename, title in reports:
+                  path = report_dir / filename
+                  if not path.exists():
+                      continue
+                  data = json.loads(path.read_text())
+                  handle.write(f"\n## {title}\n\n")
                   handle.write(
-                      f"| `{measurement['name']}` | "
-                      f"{measurement['median_ns_per_operation']:.2f} | "
-                      f"{measurement['median_operations_per_second']:.0f} | "
-                      f"{measurement['operations_per_sample']} |\n"
+                      "Hosted-runner timings are observations, not merge thresholds or cross-system claims.\n\n"
                   )
-              handle.write(
-                  f"\nRelease profile on `{data['environment']['os']}/"
-                  f"{data['environment']['architecture']}`; total harness time "
-                  f"`{data['total_elapsed_ms']} ms`.\n"
-              )
+                  handle.write(
+                      "| Workload | Median ns/op | Median ops/s | Operations/sample |\n"
+                  )
+                  handle.write("| --- | ---: | ---: | ---: |\n")
+                  for measurement in data["measurements"]:
+                      handle.write(
+                          f"| `{measurement['name']}` | "
+                          f"{measurement['median_ns_per_operation']:.2f} | "
+                          f"{measurement['median_operations_per_second']:.0f} | "
+                          f"{measurement['operations_per_sample']} |\n"
+                      )
+                  handle.write(
+                      f"\nRelease profile on `{data['environment']['os']}/"
+                      f"{data['environment']['architecture']}`; total harness time "
+                      f"`{data['total_elapsed_ms']} ms`.\n"
+                  )
           PY
-          fi
 
       - name: Upload research evidence
         if: always()
