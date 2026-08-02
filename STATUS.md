@@ -4,17 +4,73 @@
 
 ## Current State
 
-ForthDB has progressed through three executable stages:
+ForthDB now has:
 
 1. a semantic kernel
-2. an in-memory atomic publication experiment
+2. an in-memory atomic publication experiment retained as research history
 3. a durable committed-world transaction model
+4. two application pairs that run through both the bare kernel and the durable model
+5. a unified regression executed locally and by GitHub Actions
 
-The project’s current implementation direction is the committed-world model in `forthdb_world.py`.
+The current implementation direction remains the committed-world model in `forthdb_world.py`.
 
 The original kernel remains the semantic reference and should not be discarded or bypassed. The committed-world model constructs and recovers each world by applying operations through that kernel.
 
-The repository now also contains a unified research regression and a GitHub Actions workflow. Together they make the public repository self-verifying: a clean machine can run the existing evidence, compare the original and durable application models, and publish a structured report without relying on conversation context.
+The public repository is now self-verifying: a clean machine can run both applications, compare the original and durable semantic projections, test recovery, verify deterministic logs, and publish a structured report without relying on conversation context.
+
+## Application Evidence
+
+### Library application
+
+Files:
+
+- `library_demo.py`
+- `world_library_demo.py`
+
+The library model demonstrates:
+
+- two-hop graph traversal
+- redefinition and current-state lookup
+- restoration through `forget`
+- duplicate assertions and provenance
+- deep history with one-record current lookup
+- compiled identity surviving display-name changes and symbol rebinding
+- movement, checkout, and return
+- snapshot stability and durable recovery
+
+### Deployment control-plane application
+
+Files:
+
+- `deployment_demo.py`
+- `world_deployment_demo.py`
+
+The deployment model deliberately tests a different workload. It represents:
+
+- three services: API, Worker, and Schema
+- old and proposed versions
+- version dependencies
+- Production deployment targets
+- release approval
+- desired state
+- observed state
+- progressive convergence
+- rollback as a later committed decision
+
+The application demonstrates:
+
+- an incompatible release is rejected
+- rejection appends no durable bytes and creates no world
+- a compatible release changes all desired versions in one committed transition
+- a snapshot captured before release continues to expose the complete earlier configuration
+- external rollout progress may arrive through separate later commits
+- drift can be queried while observed state converges toward desired state
+- stale deployment operators abort instead of overwriting a later release
+- rollback creates another valid world rather than erasing the failed rollout
+- desired-version history remains available after rollback
+- restart recovery reconstructs the rollback world and its remaining drift
+
+The bare-kernel and committed-world applications produce the same shared semantic projection.
 
 ## File Status
 
@@ -26,35 +82,27 @@ The canonical semantic reference implementation.
 
 It defines entities, facts, slots, immutable definition records, active heads, history, indexes, query planning, joins, provenance, symbol resolution, compiled identity, and rendering.
 
-Future persistence and transaction experiments should normally use this implementation to interpret `define` and `forget` operations.
-
 #### `library_demo.py`
 
-The baseline regression suite and first application model.
+The original application and semantic baseline.
 
-It demonstrates graph traversal, redefinition, `forget`, duplicate assertions and provenance, deep history with one-record current lookup, compiled identity, and a small library workflow.
+#### `deployment_demo.py`
 
-This script is the reference semantic evidence.
+The second application on the bare kernel. It establishes the semantic behavior of release validation, desired and observed state, convergence, rollback, and history independently of persistence.
 
 ### Historical experiment
 
 #### `forthdb_atomic.py`
 
-The first executable atomicity model.
+The first executable atomicity model. It introduced private staging, all-or-nothing in-memory publication, explicit rollback, and failure injection before publication.
 
-It introduced private transaction staging, all-or-nothing in-memory publication, explicit rollback, and failure injection before publication.
-
-It is superseded by `forthdb_world.py` because it does not provide durable commit frames, crash recovery, immutable world identity, or a single committed-world publication object.
-
-It remains in the repository because it records an important step in the project’s reasoning.
+It is superseded by `forthdb_world.py` but retained because it records an important step in the reasoning.
 
 #### `atomic_demo.py`
 
-Tests and demonstration for `forthdb_atomic.py`.
+Tests and demonstration for the historical atomic model.
 
-This file remains runnable as preserved evidence of the intermediate model.
-
-### Current model
+### Current durable model
 
 #### `forthdb_world.py`
 
@@ -80,9 +128,11 @@ The append log is authoritative. Materialized worlds and indexes are reconstruct
 
 #### `world_library_demo.py`
 
-The primary component-level integration, ACID, and recovery evidence.
+The library application through the committed-world model.
 
-It runs the library application through the committed-world database and verifies snapshot stability, stale-writer rejection, constraint rejection, transaction-local reads, validator immutability, recovery after failure between `fsync` and publication, incomplete-tail handling, and fail-closed corruption detection.
+#### `world_deployment_demo.py`
+
+The deployment control-plane application through committed worlds. It adds application-scale evidence for atomic publication, graph-wide constraints, desired-versus-observed state, stale operators, rollback, and recovery.
 
 ### Preservation infrastructure
 
@@ -90,51 +140,80 @@ It runs the library application through the committed-world database and verifie
 
 The primary unified research regression.
 
-It:
+It currently runs five component suites:
 
-- runs the semantic kernel suite
-- runs the historical atomic suite
-- runs the committed-world ACID suite
-- executes the original library model
-- executes the committed-world library model in two separate Python processes
-- uses different `PYTHONHASHSEED` values for those processes
-- compares a shared semantic projection across the original and durable models
-- verifies restart recovery against the live committed world
-- verifies deterministic world identity
-- verifies byte-identical durable commit logs
-- emits JSON and Markdown evidence reports
+- semantic kernel
+- historical atomic model
+- committed-world ACID model
+- deployment semantic application
+- deployment committed-world application
 
-The semantic projection is a contract check. Observations such as record counts, frame size, and final version are reported but are not automatically frozen as permanent architectural requirements.
+The current suite total is **21 tests**.
+
+It also verifies, for both the library and deployment applications:
+
+- execution against the semantic kernel
+- execution through the committed-world model in two separate Python processes
+- different `PYTHONHASHSEED` values
+- cross-model semantic continuity
+- restart recovery
+- deterministic world identity
+- byte-identical durable logs
+- deterministic application projections
+
+The generated report schema is version 2 and contains separate observations and semantic projections for both applications.
 
 #### `.github/workflows/research-regression.yml`
 
 The clean-machine witness for the research regression.
 
-It runs on pushes to `main`, pull requests, and manual dispatches using a reference Python 3.13 environment. It compiles the sources, runs `research_regression.py`, publishes the Markdown report to the job summary, uploads both reports as an artifact, and verifies that execution leaves the checkout unchanged.
+It runs on pushes to `main`, pull requests, and manual dispatches using Python 3.13. It compiles all source files, runs `research_regression.py`, places the Markdown report in the job summary, uploads both reports, and verifies that execution leaves the checkout unchanged.
 
 The workflow is intentionally thin. Correctness remains defined by executable Python assertions that can also run locally.
 
 ## Reproduction Commands
 
-Run the complete research regression from the repository root:
+Run the complete research regression:
 
 ```bash
 python research_regression.py
 ```
 
-The reports are written to `artifacts/` by default.
-
-The individual stages remain available:
+Run the individual applications and experiments:
 
 ```bash
 python library_demo.py
+python deployment_demo.py
 python atomic_demo.py
 python world_library_demo.py
+python world_deployment_demo.py
 ```
 
 The project currently depends only on the Python standard library.
 
-A change should not be considered an improvement if it breaks the baseline kernel behavior, cross-model semantic continuity, or committed-world recovery evidence without an explicit and documented reason.
+A change should not be considered an improvement if it breaks baseline kernel behavior, either application’s cross-model semantic continuity, or committed-world recovery evidence without an explicit and documented reason.
+
+## Current Observations
+
+These values describe the current implementation and are not automatically permanent contracts.
+
+### Library committed-world run
+
+- active slots: 26
+- immutable records: 31
+- world version: 6
+- deterministic log size: 7,295 bytes
+- world digest: `b2f1b004e1572d9eed38f431634bacf554c2ef741bf51161ac65656dd1e70072`
+
+### Deployment committed-world run
+
+- active slots: 74
+- immutable records: 85
+- world version: 7
+- deterministic log size: 18,107 bytes
+- world digest: `657224ccf1955bcd9e62a3d7d5d93e977a65651d226ed18ac0823f3cea1d8b36`
+
+Both applications produce byte-identical logs across independent Python processes with different hash seeds.
 
 ## Current ACID Claim
 
@@ -147,6 +226,7 @@ The committed-world implementation is an executable ACID model within a single-p
 - incomplete trailing frames are not applied
 - successful publication exposes the complete successor world
 - failed candidate construction or validation changes no committed world
+- a deployment release cannot become visible as a partial desired-state update
 
 ### Consistency demonstrated
 
@@ -154,6 +234,7 @@ The committed-world implementation is an executable ACID model within a single-p
 - registered constraints may reject candidates before durability
 - validators are checked for read-only behavior
 - recovery recomputes and verifies the resulting world digest
+- deployment compatibility is checked across the selected version graph before publication
 
 ### Isolation demonstrated
 
@@ -161,6 +242,7 @@ The committed-world implementation is an executable ACID model within a single-p
 - transactions read their own candidate state
 - stale writers abort instead of overwriting a later world
 - commits are serialized inside one process
+- a pre-release reader continues to observe the entire old deployment configuration
 
 ### Durability demonstrated
 
@@ -169,6 +251,7 @@ The committed-world implementation is an executable ACID model within a single-p
 - a simulated failure after `fsync` but before publication still recovers the transaction
 - incomplete tails are ignored
 - established-history corruption raises an error rather than being silently repaired
+- deployment desired state, remaining drift, current release, version, and digest survive restart
 
 ## What Is Not Yet Claimed
 
@@ -186,70 +269,62 @@ It does not yet claim:
 - zero-copy or structurally shared snapshots
 - optimized commit latency or throughput
 - a stable public file-format compatibility guarantee
+- actual deployment execution or reconciliation agents
 
-These are implementation, optimization, and productization questions. They are not currently reasons to change the committed-world semantic contract.
+These remain implementation, optimization, and productization questions. They are not currently reasons to change the committed-world semantic contract.
 
 ## Multiple Writers
 
-The current design decision is complete enough for now:
+The current design decision remains:
 
 > A transaction extends exactly the committed world on which it was based. If a later world has already been published, the stale transaction must not silently commit over it.
 
-The current implementation enforces this among writers inside one process.
+The deployment application now demonstrates this with two operators preparing different releases from the same parent world.
 
-Coordination among independent processes is deferred. It may later use file locking, a single writer service, a server coordinator, compare-and-swap storage, or another mechanism. Choosing that mechanism is an implementation problem and should not force a premature change to the transaction model.
+The current implementation enforces the rule among writers inside one process. Coordination among independent processes is deferred.
 
 ## Decisions to Preserve
 
 1. `forthdb_kernel.py` remains the canonical semantic implementation.
-2. Later models should apply operations through the kernel instead of casually duplicating its behavior.
-3. The library application is a continuing compatibility test, not a disposable demo.
+2. Later models apply operations through the kernel instead of casually duplicating its behavior.
+3. Applications are continuing compatibility tests, not disposable demos.
 4. The append log of complete valid commit frames is authoritative.
 5. A transaction creates an immutable successor world rather than mutating the current one.
 6. Readers capture one immutable world.
 7. A stale transaction aborts unless a future explicit conflict-resolution model says otherwise.
 8. Indexes and active-head materializations are derived state.
 9. Durability precedes in-memory publication and reported commit success.
-10. Performance work should follow evidence, not anticipation.
-11. Research assertions belong in locally runnable code; GitHub Actions supplies an independent execution environment and preserved run evidence.
+10. Desired state and observed state are distinct claims.
+11. Rollback is represented as a new committed decision.
+12. Performance work follows evidence rather than anticipation.
 
 ## Current Research Questions
 
-These questions remain open but are not immediate blockers:
+The second application reduced the risk that the architecture was merely library-shaped, but important questions remain:
 
+- Which third application would challenge a substantially different axis?
 - What should a stable long-term commit-frame format contain?
 - Should definition identity eventually be independent of reference-kernel list position?
 - What checkpoint form preserves deterministic world identity?
 - What retention contracts should govern compaction and archival?
 - Which multi-process commit coordinator best fits the committed-world model?
 - When is coarse stale-world rejection too restrictive for real applications?
-- Which application should follow the library model to test a substantially different workload?
-
-## Immediate Maintenance Priorities
-
-The near-term priority remains preservation rather than expansion:
-
-- keep the unified research regression green
-- keep all three component scripts independently runnable
-- keep architecture and status documents synchronized with demonstrated behavior
-- preserve cross-model semantic continuity
-- treat generated metrics as observations unless deliberately promoted to contracts
-- avoid performance claims not supported by measurement
-- avoid broadening the ACID claim beyond the tested concurrency boundary
+- Should application constraints become named, durable declarations or remain runtime code?
+- How should external reconcilers associate observations with the committed desired world they attempted to realize?
 
 ## Milestone Summary
 
-The project now has:
+ForthDB now has more than one application-shaped proof.
+
+It has:
 
 - a stable semantic reference
-- an application-level regression model
+- two substantially different application models
 - an executable explanation of atomic publication
 - a durable committed-world architecture
 - a bounded ACID contract
 - deterministic recovery evidence
-- a cross-model semantic compatibility test
-- deterministic durable-byte evidence across separate processes
-- a clean-machine GitHub Actions witness with preserved JSON and Markdown reports
-- a public repository capable of transmitting and independently verifying the research state
+- cross-model semantic continuity for both applications
+- a successful GitHub Actions workflow that independently reproduces the evidence
 
-The next implementation work should deepen or challenge this model without discarding the evidence that produced it.
+The deployment model is the first strong evidence that committed worlds are useful beyond the original library domain. The next work should challenge or deepen that result without discarding the evidence that produced it.
