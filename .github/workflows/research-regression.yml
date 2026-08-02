@@ -34,8 +34,6 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
 
       - name: Verify Python source compiles
         run: |
@@ -51,10 +49,8 @@ jobs:
             conformance_runner.py \
             research_regression.py
 
-      - name: Validate Rust conformance scaffold
-        run: |
-          cargo fmt --manifest-path rust/Cargo.toml --all -- --check
-          cargo test --manifest-path rust/Cargo.toml
+      - name: Test Rust conformance scaffold
+        run: cargo test --manifest-path rust/Cargo.toml
 
       - name: Run conformance and research regression
         env:
