@@ -299,17 +299,8 @@ impl fmt::Debug for CandidateWorld {
 
 impl CandidateWorld {
     fn construct(base: &World, operations: Vec<Operation>) -> Result<Self, CandidateError> {
-        let base_frames = base.frames();
-        let reconstructed = World::reconstruct(&base_frames)?;
-        if reconstructed.id != base.id || reconstructed.version != base.version {
-            return Err(CandidateError::BaseWorldMismatch {
-                expected: base.id,
-                actual: reconstructed.id,
-            });
-        }
-
-        let mut kernel = reconstructed.kernel;
-        let mut next_entity = reconstructed.next_entity;
+        let mut kernel = base.kernel.clone();
+        let mut next_entity = base.next_entity;
         for operation in &operations {
             apply_operation(&mut kernel, &mut next_entity, operation)?;
         }
