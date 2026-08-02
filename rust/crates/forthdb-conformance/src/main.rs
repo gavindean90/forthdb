@@ -1,5 +1,7 @@
+mod executor;
+
+use executor::execute_fixture;
 use forthdb_conformance::load_fixture;
-use serde_json::json;
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -15,20 +17,12 @@ fn main() -> ExitCode {
         .map(PathBuf::from)
         .unwrap_or_else(default_fixture_path);
 
-    match load_fixture(&fixture_path) {
-        Ok(fixture) => {
-            let report = json!({
-                "implementation": "rust",
-                "scope": "conformance-fixture-parser",
-                "schema_version": fixture.schema_version,
-                "cases": fixture.case_count(),
-                "steps": fixture.step_count(),
-                "status": "parsed-and-validated"
-            });
+    match load_fixture(&fixture_path).and_then(|fixture| execute_fixture(&fixture)) {
+        Ok(report) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report)
-                    .expect("the fixed parser report must serialize")
+                    .expect("the fixed conformance report must serialize")
             );
             ExitCode::SUCCESS
         }
