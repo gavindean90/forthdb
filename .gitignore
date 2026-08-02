@@ -1,2 +1,4 @@
 /artifacts/
 *.fdb
+/rust/target/
+/rust/Cargo.lock
