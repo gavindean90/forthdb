@@ -15,6 +15,12 @@ jobs:
     name: Reproduce ForthDB research evidence
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Compilation and imports normally create __pycache__ directories beside
+      # source files. Keep those caches outside the checkout so the final
+      # cleanliness assertion measures real repository mutations rather than
+      # normal Python interpreter bookkeeping.
+      PYTHONPYCACHEPREFIX: ${{ runner.temp }}/forthdb-python-cache
 
     steps:
       - name: Check out repository
