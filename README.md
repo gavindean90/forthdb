@@ -44,13 +44,33 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design contract and [STATUS.md](S
 | `forthdb_atomic.py` | First in-memory atomic publication experiment | Superseded, retained for research history |
 | `atomic_demo.py` | Tests for the first atomic experiment | Historical evidence |
 | `forthdb_world.py` | Durable committed-world transaction and recovery model | Current implementation direction |
-| `world_library_demo.py` | Library integration, ACID, recovery, and corruption tests | Primary current evidence |
+| `world_library_demo.py` | Library integration, ACID, recovery, and corruption tests | Primary component evidence |
+| `research_regression.py` | Unified suites, cross-model comparison, recovery, and determinism checks | Primary research regression |
+| `.github/workflows/research-regression.yml` | Clean-machine execution and evidence publication | Automated witness |
 | `ARCHITECTURE.md` | Committed-world design contract | Current documentation |
 | `STATUS.md` | Research status and reproducibility guide | Current documentation |
 
 ## Reproduce the Evidence
 
 The repository currently uses only the Python standard library.
+
+The primary command is:
+
+```bash
+python research_regression.py
+```
+
+It runs all three component suites and then verifies that:
+
+- the original library model and committed-world library model produce the same shared semantic projection
+- recovery reconstructs the live committed world
+- two separate Python processes with different hash seeds produce the same world digest
+- those independent processes produce byte-identical durable commit logs
+- the generated application projection is deterministic
+
+It writes machine-readable and human-readable reports to `artifacts/` by default.
+
+The individual stages remain directly runnable:
 
 ```bash
 python library_demo.py
@@ -63,6 +83,23 @@ python world_library_demo.py
 `atomic_demo.py` preserves the intermediate experiment that demonstrated private staging, all-or-nothing publication, and rollback before the committed-world design was discovered.
 
 `world_library_demo.py` runs the library application through the durable committed-world model and tests snapshot behavior, stale-writer rejection, constraint failure, `fsync` ordering, crash recovery, incomplete-tail handling, and corruption detection.
+
+## GitHub Actions
+
+The **Research Regression** workflow runs on pushes to `main`, pull requests, and manual dispatches.
+
+GitHub Actions is not a second definition of correctness. The assertions live in `research_regression.py` so they can also be executed locally. Actions contributes a clean, independent machine that knows only what is committed to the repository.
+
+A green workflow means that a fresh checkout can:
+
+- compile every Python artifact
+- pass the semantic kernel, historical atomic, and committed-world suites
+- reproduce the library workload through both the original and durable models
+- verify cross-model semantic continuity
+- verify crash recovery and deterministic durable history
+- complete without modifying the checked-out repository
+
+Each run places the Markdown report in the job summary and uploads the JSON and Markdown reports as a workflow artifact. Observational values such as file size and record counts are reported; they are not automatically treated as permanent architectural contracts.
 
 ## Current ACID Contract
 
