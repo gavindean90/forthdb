@@ -37,10 +37,12 @@ jobs:
           python -m py_compile \
             forthdb_kernel.py \
             library_demo.py \
+            deployment_demo.py \
             forthdb_atomic.py \
             atomic_demo.py \
             forthdb_world.py \
             world_library_demo.py \
+            world_deployment_demo.py \
             research_regression.py
 
       - name: Run research regression
