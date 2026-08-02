@@ -14,6 +14,8 @@ The project’s current implementation direction is the committed-world model in
 
 The original kernel remains the semantic reference and should not be discarded or bypassed. The committed-world model constructs and recovers each world by applying operations through that kernel.
 
+The repository now also contains a unified research regression and a GitHub Actions workflow. Together they make the public repository self-verifying: a clean machine can run the existing evidence, compare the original and durable application models, and publish a structured report without relying on conversation context.
+
 ## File Status
 
 ### Foundation
@@ -30,15 +32,7 @@ Future persistence and transaction experiments should normally use this implemen
 
 The baseline regression suite and first application model.
 
-It demonstrates:
-
-- two-hop graph traversal
-- redefinition and current-state lookup
-- restoration of a previous definition through `forget`
-- duplicate assertions with distinct and provenance modes
-- efficient current lookup after deep history
-- compiled identity surviving display-name changes and symbol rebinding
-- a library workflow involving works, copies, shelves, patrons, movement, checkout, and return
+It demonstrates graph traversal, redefinition, `forget`, duplicate assertions and provenance, deep history with one-record current lookup, compiled identity, and a small library workflow.
 
 This script is the reference semantic evidence.
 
@@ -58,7 +52,7 @@ It remains in the repository because it records an important step in the project
 
 Tests and demonstration for `forthdb_atomic.py`.
 
-This file should remain runnable as preserved evidence of the intermediate model.
+This file remains runnable as preserved evidence of the intermediate model.
 
 ### Current model
 
@@ -86,24 +80,51 @@ The append log is authoritative. Materialized worlds and indexes are reconstruct
 
 #### `world_library_demo.py`
 
-The primary integration, ACID, and recovery evidence.
+The primary component-level integration, ACID, and recovery evidence.
 
-It runs the library application through the committed-world database and verifies behavior including:
+It runs the library application through the committed-world database and verifies snapshot stability, stale-writer rejection, constraint rejection, transaction-local reads, validator immutability, recovery after failure between `fsync` and publication, incomplete-tail handling, and fail-closed corruption detection.
 
-- application results matching the semantic baseline
-- snapshot stability across later commits
-- durable recovery producing the same version and world digest
-- stale writers aborting
-- rejected constraints creating no world
-- transaction-local reads seeing staged changes
-- validators being unable to mutate candidate state
-- a transaction surviving failure after `fsync` but before in-memory publication
-- incomplete final frames not becoming worlds
-- corruption in established history failing closed
+### Preservation infrastructure
+
+#### `research_regression.py`
+
+The primary unified research regression.
+
+It:
+
+- runs the semantic kernel suite
+- runs the historical atomic suite
+- runs the committed-world ACID suite
+- executes the original library model
+- executes the committed-world library model in two separate Python processes
+- uses different `PYTHONHASHSEED` values for those processes
+- compares a shared semantic projection across the original and durable models
+- verifies restart recovery against the live committed world
+- verifies deterministic world identity
+- verifies byte-identical durable commit logs
+- emits JSON and Markdown evidence reports
+
+The semantic projection is a contract check. Observations such as record counts, frame size, and final version are reported but are not automatically frozen as permanent architectural requirements.
+
+#### `.github/workflows/research-regression.yml`
+
+The clean-machine witness for the research regression.
+
+It runs on pushes to `main`, pull requests, and manual dispatches using a reference Python 3.13 environment. It compiles the sources, runs `research_regression.py`, publishes the Markdown report to the job summary, uploads both reports as an artifact, and verifies that execution leaves the checkout unchanged.
+
+The workflow is intentionally thin. Correctness remains defined by executable Python assertions that can also run locally.
 
 ## Reproduction Commands
 
-Run from the repository root with a recent Python 3 interpreter:
+Run the complete research regression from the repository root:
+
+```bash
+python research_regression.py
+```
+
+The reports are written to `artifacts/` by default.
+
+The individual stages remain available:
 
 ```bash
 python library_demo.py
@@ -113,7 +134,7 @@ python world_library_demo.py
 
 The project currently depends only on the Python standard library.
 
-A change should not be considered an improvement if it breaks the baseline kernel behavior or committed-world recovery evidence without an explicit, documented reason.
+A change should not be considered an improvement if it breaks the baseline kernel behavior, cross-model semantic continuity, or committed-world recovery evidence without an explicit and documented reason.
 
 ## Current ACID Claim
 
@@ -180,8 +201,6 @@ Coordination among independent processes is deferred. It may later use file lock
 
 ## Decisions to Preserve
 
-The following decisions represent the current research baseline:
-
 1. `forthdb_kernel.py` remains the canonical semantic implementation.
 2. Later models should apply operations through the kernel instead of casually duplicating its behavior.
 3. The library application is a continuing compatibility test, not a disposable demo.
@@ -192,6 +211,7 @@ The following decisions represent the current research baseline:
 8. Indexes and active-head materializations are derived state.
 9. Durability precedes in-memory publication and reported commit success.
 10. Performance work should follow evidence, not anticipation.
+11. Research assertions belong in locally runnable code; GitHub Actions supplies an independent execution environment and preserved run evidence.
 
 ## Current Research Questions
 
@@ -207,20 +227,19 @@ These questions remain open but are not immediate blockers:
 
 ## Immediate Maintenance Priorities
 
-The near-term priority is preservation rather than expansion:
+The near-term priority remains preservation rather than expansion:
 
-- keep all three scripts runnable
-- document changes with descriptive commit messages
-- add automated execution of the regression scripts
+- keep the unified research regression green
+- keep all three component scripts independently runnable
 - keep architecture and status documents synchronized with demonstrated behavior
+- preserve cross-model semantic continuity
+- treat generated metrics as observations unless deliberately promoted to contracts
 - avoid performance claims not supported by measurement
 - avoid broadening the ACID claim beyond the tested concurrency boundary
 
 ## Milestone Summary
 
-The project has moved beyond isolated database primitives.
-
-It now has:
+The project now has:
 
 - a stable semantic reference
 - an application-level regression model
@@ -228,6 +247,9 @@ It now has:
 - a durable committed-world architecture
 - a bounded ACID contract
 - deterministic recovery evidence
-- a public repository capable of transmitting the research state between independent sessions
+- a cross-model semantic compatibility test
+- deterministic durable-byte evidence across separate processes
+- a clean-machine GitHub Actions witness with preserved JSON and Markdown reports
+- a public repository capable of transmitting and independently verifying the research state
 
 The next implementation work should deepen or challenge this model without discarding the evidence that produced it.
