@@ -105,7 +105,7 @@ fn candidate_size_measurement(operation_count: u64, iterations: u64) -> Measurem
             checksum
         },
         format!(
-            "Constructs and kernel-validates a private successor from genesis with {operation_count} staged definitions."
+            "Clones an empty immutable base, applies {operation_count} staged definitions, and kernel-validates the private successor."
         ),
     )
 }
@@ -131,7 +131,7 @@ fn candidate_history_measurement(history_depth: u64, iterations: u64) -> Measure
             checksum
         },
         format!(
-            "Constructs one staged definition after replaying and validating {history_depth} committed operations."
+            "Deep-clones and validates a base world containing {history_depth} committed definitions, then applies one staged definition."
         ),
     )
 }
@@ -162,7 +162,7 @@ fn snapshot_capture_measurement(iterations: u64) -> Measurement {
             }
             checksum
         },
-        "Captures an immutable reader world through the publication cell and clones its Arc.".to_owned(),
+        "Captures an immutable reader world through the current-world read lock and clones its Arc.".to_owned(),
     )
 }
 
@@ -191,7 +191,7 @@ fn commit_sequence_measurement(commit_count: u64) -> Measurement {
             }
             checksum
         },
-        "End-to-end in-memory commit: candidate replay, kernel validation, frame append, and atomic publication. History grows during the sample.".to_owned(),
+        "End-to-end in-memory commit: base-world clone, staged operation, kernel validation, frame append, and atomic publication while history grows.".to_owned(),
     )
 }
 
