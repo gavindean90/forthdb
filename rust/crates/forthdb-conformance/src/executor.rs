@@ -1,5 +1,6 @@
-use super::{
-    ExpectedValueSpec, FixtureError, KernelFixture, PatternSourceSpec, Step, TermSpec,
+use forthdb_conformance::{
+    ExpectedRow, ExpectedValueSpec, FixtureError, KernelCase, KernelFixture, PatternSourceSpec, Step,
+    TermSpec,
 };
 use forthdb_core::{
     Atom, Binding, BoundValue, EntityId, ForthDb, Literal, Pattern, Predicate, QueryOptions,
@@ -52,7 +53,7 @@ pub fn execute_fixture(fixture: &KernelFixture) -> Result<ExecutionReport, Fixtu
     })
 }
 
-fn execute_case(case: &super::KernelCase) -> Result<usize, FixtureError> {
+fn execute_case(case: &KernelCase) -> Result<usize, FixtureError> {
     let mut db = ForthDb::new();
     let entities: BTreeMap<String, EntityId> = case
         .entities
@@ -279,7 +280,7 @@ fn compare_rows(
     context: &str,
     name: &str,
     actual: &[QueryRow],
-    expected: &[super::ExpectedRow],
+    expected: &[ExpectedRow],
     entities: &BTreeMap<String, EntityId>,
 ) -> Result<(), FixtureError> {
     let mut actual_rows: Vec<CanonicalRow> = actual
@@ -332,7 +333,7 @@ fn mismatch(context: &str, name: &str, expected: String, actual: String) -> Fixt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::load_fixture;
+    use forthdb_conformance::load_fixture;
     use std::path::PathBuf;
 
     fn checked_in_fixture() -> PathBuf {
