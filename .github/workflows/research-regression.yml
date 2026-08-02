@@ -1,0 +1,77 @@
+name: Research Regression
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  research-regression:
+    name: Reproduce ForthDB research evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up reference Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Verify source compiles
+        run: |
+          python -m py_compile \
+            forthdb_kernel.py \
+            library_demo.py \
+            forthdb_atomic.py \
+            atomic_demo.py \
+            forthdb_world.py \
+            world_library_demo.py \
+            research_regression.py
+
+      - name: Run research regression
+        env:
+          FORTHDB_REPORT_DIR: ${{ runner.temp }}/forthdb-research-artifacts
+        run: |
+          mkdir -p "$FORTHDB_REPORT_DIR"
+          python research_regression.py --output-dir "$FORTHDB_REPORT_DIR"
+
+      - name: Publish regression summary
+        if: always()
+        run: |
+          report="${{ runner.temp }}/forthdb-research-artifacts/regression-report.md"
+          if [[ -f "$report" ]]; then
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "# ForthDB Research Regression" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No regression report was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload research evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: forthdb-research-regression-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/forthdb-research-artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Verify repository remains clean
+        if: always()
+        run: |
+          status="$(git status --porcelain)"
+          if [[ -n "$status" ]]; then
+            echo "$status"
+            echo "Regression execution modified the checkout." >&2
+            exit 1
+          fi
