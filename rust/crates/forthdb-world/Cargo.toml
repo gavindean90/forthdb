@@ -5,5 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[lib]
+path = "src/wrapper.rs"
+
 [dependencies]
 forthdb-core = { path = "../forthdb-core" }
