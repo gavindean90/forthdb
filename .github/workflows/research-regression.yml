@@ -16,10 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      # Keep Python bytecode caches outside the checkout so the final
-      # cleanliness assertion measures real repository mutations rather than
-      # normal interpreter bookkeeping.
+      # Keep generated interpreter and compiler state outside the checkout so
+      # the final cleanliness assertion measures real repository mutations.
       PYTHONPYCACHEPREFIX: /tmp/forthdb-python-cache
+      CARGO_TARGET_DIR: /tmp/forthdb-cargo-target
 
     steps:
       - name: Check out repository
@@ -32,7 +32,10 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Verify source compiles
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Python source compiles
         run: |
           python -m py_compile \
             forthdb_kernel.py \
@@ -46,6 +49,9 @@ jobs:
             conformance_runner.py \
             research_regression.py
 
+      - name: Test Rust conformance scaffold
+        run: cargo test --manifest-path rust/Cargo.toml
+
       - name: Run conformance and research regression
         env:
           FORTHDB_REPORT_DIR: ${{ runner.temp }}/forthdb-research-artifacts
@@ -53,6 +59,11 @@ jobs:
           mkdir -p "$FORTHDB_REPORT_DIR"
           python conformance_runner.py \
             --output "$FORTHDB_REPORT_DIR/python-conformance-v1.json"
+          cargo run --quiet \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-conformance \
+            -- conformance/v1/kernel_cases.json \
+            > "$FORTHDB_REPORT_DIR/rust-conformance-parser-v1.json"
           python research_regression.py --output-dir "$FORTHDB_REPORT_DIR"
 
       - name: Publish regression summary
