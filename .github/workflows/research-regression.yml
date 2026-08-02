@@ -43,13 +43,16 @@ jobs:
             forthdb_world.py \
             world_library_demo.py \
             world_deployment_demo.py \
+            conformance_runner.py \
             research_regression.py
 
-      - name: Run research regression
+      - name: Run conformance and research regression
         env:
           FORTHDB_REPORT_DIR: ${{ runner.temp }}/forthdb-research-artifacts
         run: |
           mkdir -p "$FORTHDB_REPORT_DIR"
+          python conformance_runner.py \
+            --output "$FORTHDB_REPORT_DIR/python-conformance-v1.json"
           python research_regression.py --output-dir "$FORTHDB_REPORT_DIR"
 
       - name: Publish regression summary
