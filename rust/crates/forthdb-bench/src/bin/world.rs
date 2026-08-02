@@ -131,7 +131,7 @@ fn candidate_history_measurement(history_depth: u64, iterations: u64) -> Measure
             checksum
         },
         format!(
-            "Constructs one staged definition after replaying and validating {history_depth} committed one-operation worlds."
+            "Constructs one staged definition after replaying and validating {history_depth} committed operations."
         ),
     )
 }
@@ -221,7 +221,7 @@ fn reconstruction_measurement(frame_count: u64, iterations: u64) -> Measurement 
             checksum
         },
         format!(
-            "Enumerates and replays {frame_count} committed frames into a fresh in-memory world. This is logical reconstruction, not filesystem recovery."
+            "Enumerates and verifies {frame_count} no-op commit frames into a fresh in-memory world. This is logical reconstruction, not filesystem recovery."
         ),
     )
 }
@@ -240,16 +240,17 @@ fn transaction_with_definitions(operation_count: u64) -> Transaction {
 
 fn transaction_on_history(history_depth: u64) -> Transaction {
     let database = Database::new(MemoryCommitStore::new()).expect("empty memory store is valid");
+    let mut history = database.begin();
     for index in 0..history_depth {
-        let mut transaction = database.begin();
-        transaction.define(
+        history.define(
             SlotId::new(format!("history/{index}")),
             literal_fact("history", "value", &index.to_string()),
         );
-        database
-            .commit(transaction)
-            .expect("history setup commit must succeed");
     }
+    database
+        .commit(history)
+        .expect("history setup commit must succeed");
+
     let mut transaction = database.begin();
     transaction.define(
         SlotId::new("history/new"),
@@ -260,15 +261,10 @@ fn transaction_on_history(history_depth: u64) -> Transaction {
 
 fn committed_frames(frame_count: u64) -> Vec<Arc<forthdb_world::CommitFrame>> {
     let database = Database::new(MemoryCommitStore::new()).expect("empty memory store is valid");
-    for index in 0..frame_count {
-        let mut transaction = database.begin();
-        transaction.define(
-            SlotId::new(format!("frame/{index}")),
-            literal_fact("frame", "value", &index.to_string()),
-        );
+    for _ in 0..frame_count {
         database
-            .commit(transaction)
-            .expect("frame setup commit must succeed");
+            .commit(database.begin())
+            .expect("no-op frame setup commit must succeed");
     }
     database.frames()
 }
