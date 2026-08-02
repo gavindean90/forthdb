@@ -271,7 +271,7 @@ pub struct Record {
     pub resulting_head: Option<RecordId>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DefinitionStore {
     log: Vec<Record>,
     head: HashMap<SlotId, RecordId>,
@@ -370,7 +370,7 @@ impl DefinitionStore {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CurrentView {
     by_subject: HashMap<Atom, HashSet<RecordId>>,
     by_predicate: HashMap<Predicate, HashSet<RecordId>>,
@@ -565,6 +565,7 @@ struct Frame {
     provenance: Vec<SlotId>,
 }
 
+#[derive(Clone)]
 pub struct ForthDb {
     store: DefinitionStore,
     view: CurrentView,
