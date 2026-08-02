@@ -1,6 +1,6 @@
 # ForthDB Rust
 
-This workspace contains an independent Rust implementation of the ForthDB semantic kernel and the first storage-independent committed-world engine.
+This workspace contains an independent Rust implementation of the ForthDB semantic kernel and committed-world engine.
 
 ## Current scope
 
@@ -27,7 +27,7 @@ The current conformance result is:
 status: passed
 ```
 
-`forthdb-world` implements Milestone 1 of `WORLD_CONTRACT.md`:
+`forthdb-world` implements Milestones 1 and 2 of `WORLD_CONTRACT.md`:
 
 - `WorldId`
 - immutable `World` snapshots
@@ -40,11 +40,18 @@ status: passed
 - atomic replacement of the current `Arc<World>`
 - the `CommitStore` abstraction
 - `MemoryCommitStore`
-- in-memory frame enumeration and logical reconstruction
+- `FileCommitStore`
+- canonical versioned commit-frame encoding
+- synchronized append before publication
+- reopening and logical reconstruction
+- incomplete-tail recovery
+- fail-closed corruption handling
 
-The current candidate implementation deep-clones the base semantic kernel and applies only the staged transaction operations to that private clone. Existing readers retain their original immutable `Arc<World>`.
+The candidate implementation deep-clones the base semantic kernel and applies only the staged transaction operations to that private clone. Existing readers retain their original immutable `Arc<World>`.
 
-`forthdb-bench` contains separate release-mode observational benchmark binaries for the semantic kernel and committed-world engine.
+`FileCommitStore` writes the version 1 format specified in `../FILE_FORMAT.md` using ordinary file I/O and `sync_data()`. It intentionally contains no mmap or io_uring code.
+
+`forthdb-bench` contains separate release-mode observational benchmark binaries for the semantic kernel, committed-world engine, and file commit store.
 
 ## Run locally
 
@@ -61,6 +68,9 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
 
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin world
+
+cargo run --quiet --release --manifest-path rust/Cargo.toml \
+  -p forthdb-bench --bin file
 ```
 
 The benchmark commands print JSON containing workload dimensions, three elapsed samples, median/minimum/maximum nanoseconds per operation, operations per second, checksums, build profile, platform, and available GitHub metadata.
@@ -102,37 +112,55 @@ The accepted Milestone 1 benchmark was GitHub Actions run `30772620993`, using a
 
 An earlier correctness-first version reconstructed every candidate by replaying its complete operation history. It measured approximately 10.1 ms per commit over the same growing 1,000-commit sequence. Deep-cloning the immutable base world reduced that observation to approximately 0.484 ms per commit, about a 20-fold improvement.
 
-The remaining candidate cost is explicit: the current deep clone copies retained definitions and indexes, so candidate construction still grows with world size. This is not caused by `CommitStore` or publication. Structural sharing is the clear future optimization for the in-memory world representation, while the storage roadmap can proceed independently through the `CommitStore` boundary.
+The remaining candidate cost is explicit: the current deep clone copies retained definitions and indexes, so candidate construction still grows with world size. This is not caused by `CommitStore` or publication. Structural sharing is the clear future optimization for the in-memory world representation.
+
+## FileCommitStore baseline
+
+The first complete Milestone 2 benchmark was GitHub Actions run `30773123911`, using a release build on Linux x86-64 and the hosted runner's temporary filesystem.
+
+| Workload | Median | Approx. throughput | Shape |
+| --- | ---: | ---: | --- |
+| 100 durable no-op commits | 464.24 µs/commit | 2,154 commits/s | Encode, append, `sync_data()`, and publish a fixed-size frame |
+| 100 durable one-definition commits | 507.51 µs/commit | 1,970 commits/s | Growing deep-cloned world plus synchronized append |
+| Reopen and reconstruct 100 frames | 73.25 µs | 13,652 reopens/s | Read, checksum, decode, validate, and reconstruct |
+| Reopen and reconstruct 1,000 frames | 404.70 µs | 2,471 reopens/s | Full validation of 1,000 persisted no-op frames |
+| Recover incomplete tail after 100 frames | 376.76 µs | 2,654 recoveries/s | Detect seven-byte tail, truncate, and synchronize |
+
+The close spacing between no-op and one-definition durable commits shows that this small-world benchmark is primarily synchronization-bound: adding one definition increased the median by roughly 43 µs. These values are not device-independent guarantees, but they establish that the unbatched ordinary-I/O implementation already sustains roughly 2,000 individually synchronized commits per second on this runner.
+
+Reopening 1,000 frames remained below half a millisecond in this observation. That result covers physical frame checks plus logical identity and invariant verification; it is not a checkpointed startup measurement.
 
 ## Benchmark boundaries
 
-The current world measurements include:
+The current measurements cover:
 
-- private candidate construction
-- kernel validation
-- in-memory commit-frame append
+- semantic-kernel operations and current-head reads
+- private candidate construction and validation
 - immutable snapshot capture
-- stale-world publication semantics
-- logical reconstruction from memory frames
+- in-memory frame append and logical reconstruction
+- canonical frame encoding and checksums
+- ordinary file append and `sync_data()`
+- reopening from disk
+- incomplete-tail truncation
+- fail-closed tests for established corruption
 
 They do not include:
 
-- serialization
-- checksums
-- filesystem writes or `fsync`
 - mmap
 - io_uring
+- batching or group commit
 - checkpoints
-- process-crash recovery
+- compaction
+- process-crash fault injection
 - cross-process writer coordination
 - application-scale Rust library or deployment workloads
 
-Hosted runners are noisy and may differ in CPU model, placement, contention, and virtualization. Benchmark numbers therefore do not fail ordinary commits. Semantic conformance and committed-world correctness remain required gates; timing remains reported evidence.
+Hosted runners are noisy and may differ in CPU model, placement, contention, filesystem, storage device, and virtualization. Benchmark numbers therefore do not fail ordinary commits. Semantic conformance and committed-world correctness remain required gates; timing remains reported evidence.
 
 The figures are not comparisons with Python, SQLite, RocksDB, PostgreSQL, or another database. Such comparisons require deliberately matched workloads and contracts.
 
 ## Next storage milestone
 
-The next storage milestone is `FileCommitStore`: canonical commit-frame encoding, append, synchronization, reopening, and fail-closed validation of established history using ordinary file I/O.
+The next storage milestone is `MmapCommitStore`: map the same canonical committed history for read and recovery while preserving the existing transaction, publication, and file-format contracts.
 
-That milestone must preserve the same `World`, `Transaction`, `CandidateWorld`, `CommitFrame`, and `CommitStore` semantics. Mmap and io_uring remain later storage implementations, not changes to the transaction model.
+Mmap is a read-path and startup mechanism. It does not replace synchronized append. io_uring remains the later write-submission milestone, where batching and queue depth can be measured without changing committed-world semantics.

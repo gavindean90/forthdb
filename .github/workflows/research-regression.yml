@@ -74,6 +74,11 @@ jobs:
             -p forthdb-bench \
             --bin world \
             > "$FORTHDB_REPORT_DIR/rust-world-benchmarks.json"
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin file \
+            > "$FORTHDB_REPORT_DIR/rust-file-benchmarks.json"
           python research_regression.py --output-dir "$FORTHDB_REPORT_DIR"
 
       - name: Publish regression summary
@@ -105,6 +110,10 @@ jobs:
               (
                   "rust-world-benchmarks.json",
                   "Rust MemoryCommitStore benchmark observation",
+              ),
+              (
+                  "rust-file-benchmarks.json",
+                  "Rust FileCommitStore benchmark observation",
               ),
           ]
 
