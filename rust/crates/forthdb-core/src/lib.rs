@@ -1025,7 +1025,7 @@ mod tests {
         ];
         let distinct = db.query(&patterns, QueryOptions::default());
         assert_eq!(distinct.rows.len(), 1);
-        assert_eq!(distinct.metrics.candidate_facts, 4);
+        assert_eq!(distinct.metrics.candidate_facts, 3);
 
         let duplicates = db.query(
             &patterns,
