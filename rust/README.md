@@ -11,6 +11,7 @@ This workspace contains the Rust semantic kernel and committed-world engine.
 5. Structurally shared worlds
 6. Queued-intent semantic epoch control
 7. Bounded ingress and commit tickets
+8. Ordinary-file durability epochs
 
 All stores implement the same `CommitStore` contract. Strict transactions derive and validate a private candidate, append its canonical `CommitFrame`, wait for required durability, and only then publish the immutable successor.
 
@@ -20,10 +21,13 @@ Milestone 6A added a distinct `QueuedIntent` model and a pure epoch planner. Que
 
 Milestone 6A.2 adds a fixed-capacity MPSC ingress and one in-memory committer thread. Admission is nonblocking and returns the original intent when the queue is full. Tickets expose queued, claimed, and resolved phases. Dropping a ticket never cancels its admitted intent; failed result delivery is observed separately after the authoritative history transition completes.
 
+Milestone 6B adds `FileEpochStore` and `DurableQueuedIntentController`. The paired ordinary-file transport can either synchronize every frame or encode a contiguous frame arena and synchronize once per epoch. An accepted durable ticket resolves only after the file synchronization succeeds and the reader head advances to the epoch tail. Observed failures enter verified repair; any uncertain repair permanently poisons the live handle.
+
 Design and evidence:
 
 - [`STRUCTURAL_SHARING.md`](STRUCTURAL_SHARING.md)
 - [`QUEUED_DURABILITY.md`](QUEUED_DURABILITY.md)
+- [`FILE_EPOCHS.md`](FILE_EPOCHS.md)
 - [`FILE_FORMAT.md`](../FILE_FORMAT.md)
 - [`WORLD_CONTRACT.md`](../WORLD_CONTRACT.md)
 
@@ -56,6 +60,9 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
 
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin queued_ingress
+
+cargo run --quiet --release --manifest-path rust/Cargo.toml \
+  -p forthdb-bench --bin queued_file_epoch
 ```
 
 `IoUringCommitStore` is Linux-only and reports unavailability when ring creation is denied by the running kernel or security policy.
@@ -100,16 +107,29 @@ The accepted integrated observation used a 100,000-definition base, ingress capa
 
 The abandoned workload committed every intent while reporting 4,096 abandoned tickets and 4,096 failed completion deliveries. Concurrent stress tests also prove one unique committed version per successful admission, no loss or duplication, bounded queue depth, and abandonment safety both before and after claim.
 
-The integrated controller is materially slower than the pure planner because it includes admission contention, locking, memory-store publication, global-head advancement, per-ticket channels, result routing, and reclamation. Stage 6B must therefore compare complete pipelines rather than extrapolating from the isolated planner alone.
+## Milestone 6B result
+
+The accepted paired ordinary-file benchmark used three alternating rounds over a 100,000-definition base. Batch size one is the no-amortization control.
+
+| Policy | Max batch | Median intents/s | Median syncs | Syncs/intent |
+| --- | ---: | ---: | ---: | ---: |
+| Per-frame | 1 | 2,502 | 512 | 1.0000 |
+| Per-epoch | 1 | 2,494 | 512 | 1.0000 |
+| Per-frame | 16 | 2,620 | 2,048 | 1.0000 |
+| Per-epoch | 16 | 6,541 | 128 | 0.0625 |
+
+At batch size one the policies converged, confirming that the paired harness does not manufacture an arena advantage. At batch size sixteen, one-sync epochs reduced synchronization calls by 16 times and increased median complete-pipeline throughput by approximately 2.50 times. Every run reopened with the exact expected canonical frame count.
+
+Failure tests use real files and inject deterministic write, synchronization, truncation, and verification failures. They include every byte boundary of a three-frame arena and subprocess termination without Rust cleanup. Successful repair restores the exact pre-epoch bytes; any uncertain double fault poisons the live handle.
 
 ## Correctness gates
 
-The shared and legacy semantic kernels remain under differential testing. Milestone 6 adds sequential-versus-queued world and frame parity, byte-for-byte file parity, temporary-entity scope enforcement, predecessor-relative preconditions, independent rejection, one-tail publication, a deterministic 10,000-intent differential sequence, and multi-producer admission/ticket stress.
+The shared and legacy semantic kernels remain under differential testing. Milestone 6 adds sequential-versus-queued world and frame parity, byte-for-byte file parity, temporary-entity scope enforcement, predecessor-relative preconditions, independent rejection, one-tail publication, a deterministic 10,000-intent differential sequence, multi-producer admission/ticket stress, ordinary-file repair/poisoning tests, exhaustive byte-boundary failure injection, and subprocess crash-prefix recovery.
 
-The existing world, file, mmap, io_uring, conformance, recovery, and canonical-byte suites remain mandatory. Milestones 6A and 6A.2 change no commit-store implementation or version 1 encoding.
+The existing world, file, mmap, io_uring, conformance, recovery, and canonical-byte suites remain mandatory. Milestone 6B adds a new file-epoch transport without changing `CommitFrame`, version 1 encoding, `FileCommitStore`, `MmapCommitStore`, or `IoUringCommitStore`.
 
 ## Current boundaries
 
-The engine does not yet implement dwell-time batching, ordinary-file durability epochs, group commit, deeper io_uring utilization, checkpoints, compaction, crash fault injection, worker restart, or cross-process writer coordination.
+The engine does not yet implement dwell-time batching, adaptive batch policy, io_uring epoch transports, checkpoints, compaction, true power-loss fault injection, worker restart, or cross-process writer coordination.
 
-The next experiment is Milestone 6B: encode accepted frames into one contiguous ordinary-file epoch, perform one positional write plus one synchronization, and prove verified repair or permanent poisoning after every observed failure.
+The next experiment is Milestone 6C: compare contiguous `WRITE`, `WRITEV`, and independent positional writes followed by a drained `FSYNC(DATASYNC)` barrier against the ordinary-file epoch control.
