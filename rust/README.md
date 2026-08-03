@@ -1,24 +1,52 @@
 # ForthDB Rust
 
-This workspace contains an independent Rust implementation of the ForthDB semantic kernel and committed-world engine.
+This workspace contains the independent Rust implementation of the ForthDB semantic kernel and committed-world engine.
 
-## Current scope
+## Implemented milestones
 
-`forthdb-core` implements:
+The Rust engine now implements the first four milestones in `WORLD_CONTRACT.md`:
+
+1. `MemoryCommitStore`
+2. `FileCommitStore`
+3. `MmapCommitStore`
+4. `IoUringCommitStore`
+
+All four stores implement the same `CommitStore` contract. The transaction layer constructs and validates a private `CandidateWorld`, appends its canonical `CommitFrame`, and publishes the immutable successor only after the store reports success.
+
+```text
+begin from immutable World
+          ↓
+construct CandidateWorld
+          ↓
+validate kernel + application rules
+          ↓
+append canonical CommitFrame
+          ↓
+wait for durable completion when required
+          ↓
+publish Arc<World>
+```
+
+The semantic kernel retains complete definition history while maintaining one active head per slot. Current-state resolution therefore follows the active head rather than scanning prior definitions.
+
+## Crates
+
+### `forthdb-core`
+
+The semantic kernel provides:
 
 - typed entities, slots, literals, predicates, symbols, variables, facts, and patterns
-- immutable definition records
+- immutable definition records and complete operation history
 - one active definition head per slot
-- `define`, `resolve`, `definitions`, `forget`, and complete operation history
+- `define`, `resolve`, `definitions`, and `forget`
 - active-head indexes for exact and partial fact lookup
-- variable matching and multi-pattern joins
-- distinct query results and provenance
-- display names, symbol binding, and compiled stable identity
-- deep cloning for private candidate-world construction
+- variable matching, multi-pattern joins, distinct results, and provenance
+- display names, symbol binding, and stable compiled identity
+- invariant validation and deep cloning for private candidate construction
 
-`forthdb-conformance` parses `conformance/v1/kernel_cases.json`, executes every step through the Rust kernel, and compares every checked result with the language-neutral contract.
+### `forthdb-conformance`
 
-The current conformance result is:
+The Rust kernel executes the language-neutral cases in `conformance/v1/kernel_cases.json`.
 
 ```text
 4 cases
@@ -27,37 +55,53 @@ The current conformance result is:
 status: passed
 ```
 
-`forthdb-world` implements Milestones 1, 2, and 3 of `WORLD_CONTRACT.md`:
+### `forthdb-world`
 
-- `WorldId`
-- immutable `World` snapshots
-- ordered transaction operations
-- private `CandidateWorld` construction
+The committed-world engine provides:
+
+- `WorldId`, immutable `World`, `Transaction`, `CandidateWorld`, and `CommitFrame`
+- deterministic world identity
+- read-your-own-writes candidate construction
 - kernel and application validation
-- deterministic logical world identity
 - stale-writer rejection
 - append-before-publication ordering
 - atomic replacement of the current `Arc<World>`
-- the `CommitStore` abstraction
-- `MemoryCommitStore`
-- `FileCommitStore`
-- `MmapCommitStore`
-- canonical versioned commit-frame encoding
-- synchronized append before publication
-- reopening and logical reconstruction
-- incomplete-tail recovery
-- fail-closed corruption handling
-- mapped frame-offset indexing
-- borrowed zero-copy record and payload slices
-- remapping after successful durable appends
+- logical reconstruction from committed frames
+- incomplete-tail recovery and fail-closed corruption handling
 
-The candidate implementation deep-clones the base semantic kernel and applies only the staged transaction operations to that private clone. Existing readers retain their original immutable `Arc<World>`.
+Its storage implementations are:
 
-`FileCommitStore` writes the version 1 format specified in `../FILE_FORMAT.md` using ordinary file I/O and `sync_data()`. `MmapCommitStore` maps those exact bytes for validation, recovery, and direct borrowed access to persisted records and payloads. The existing file store remains the authoritative append implementation; the mapped store remaps after a successful synchronized append.
+#### `MemoryCommitStore`
 
-A post-durability remap failure is recorded as an optimization failure rather than returned as a failed commit. That avoids reporting failure after a frame has already been synchronized. Cross-process mutation or truncation while a map is live remains outside the current contract.
+An in-memory append-only frame vector used as the storage-independent semantic baseline.
 
-`forthdb-bench` contains separate release-mode observational benchmark binaries for the semantic kernel, committed-world engine, file commit store, and mmap commit store.
+#### `FileCommitStore`
+
+Writes the version 1 format in `../FILE_FORMAT.md` using ordinary file I/O. Each commit is canonically encoded, appended, followed by `sync_data()`, and only then published.
+
+#### `MmapCommitStore`
+
+Maps the exact version 1 bytes for validation, recovery, and direct borrowed access through `mapped_record()` and `mapped_payload()`. A compact frame-span directory gives indexed access to persisted records without copying the file into an owned input buffer.
+
+The ordinary file implementation remains the authoritative append path. A post-durability remap failure is recorded as an optimization failure instead of falsely reporting that an already-synchronized commit failed.
+
+#### `IoUringCommitStore`
+
+A Linux-only queue-depth-one durability backend. It preserves the exact version 1 bytes and submits one linked pair per commit:
+
+```text
+IORING_OP_WRITE + IO_LINK
+            ↓
+IORING_OP_FSYNC with DATASYNC
+            ↓
+verify both CQEs
+            ↓
+publish World
+```
+
+The ring contains two entries because one commit requires two linked operations, but only one commit may be in flight. The store verifies exact write length and synchronization completion and attempts to truncate back to the pre-append offset on failure. Recovery and incomplete-tail handling reuse the established `FileCommitStore` path so both stores accept the same history.
+
+This first milestone intentionally contains no batching, group commit, registered buffers, registered files, SQPOLL, or multiple transactions in flight.
 
 ## Run locally
 
@@ -80,120 +124,102 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
 
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin mmap
+
+cargo run --quiet --release --manifest-path rust/Cargo.toml \
+  -p forthdb-bench --bin io_uring
 ```
 
-The benchmark commands print JSON containing workload dimensions, three elapsed samples, median/minimum/maximum nanoseconds per operation, operations per second, checksums, build profile, platform, and available GitHub metadata.
+`IoUringCommitStore` is available only on Linux. Its benchmark emits an explicit unavailable result when the running kernel or security policy does not permit ring creation.
 
-## Semantic-kernel baseline
+## Accepted observations
 
-The first complete kernel benchmark was GitHub Actions run `30770445865`, using a release build on Linux x86-64. These values are observations from a shared hosted runner, not stable performance guarantees.
+These figures come from shared GitHub-hosted Linux runners. They are reproducible observations, not stable guarantees or cross-database comparisons.
 
-| Workload | Median ns/op | Approx. ops/s | Workload shape |
-| --- | ---: | ---: | --- |
-| Define unique slots | 6,017.78 | 166,174 | 50,000 definitions, including all index updates |
-| Redefine one slot | 2,040.03 | 490,190 | 50,000 retained definitions behind one active head |
-| Resolve, history depth 1 | 24.73 | 40,443,075 | 500,000 resolutions |
-| Resolve, history depth 1,000 | 24.68 | 40,511,820 | 500,000 resolutions |
-| Resolve, history depth 50,000 | 24.76 | 40,392,698 | 500,000 resolutions |
-| Exact fact query | 670.46 | 1,491,512 | One exact result in 20,000 active facts |
-| Subject-predicate query | 707.02 | 1,414,389 | One bound object in 20,000 active facts |
-| Two-hop join, fanout 64 | 94,697.66 | 10,560 | 64 joined rows per query |
-| Forget to previous head | 1,919.10 | 521,077 | 10,000 forgets from a 30,000-definition chain |
+### Current-state reads
 
-Retaining 50,000 prior definitions did not measurably increase current-head resolution in that run. All three medians remained approximately 24.7 ns, consistent with current resolution following the active head rather than scanning history.
+The original semantic-kernel run retained 1, 1,000, and 50,000 definitions behind a slot while current-head resolution remained approximately 24.7 ns in all three cases. That is the central intended property: retained history does not require a current-state history scan.
 
-## MemoryCommitStore baseline
+### Immutable snapshots
 
-The accepted Milestone 1 benchmark was GitHub Actions run `30772620993`, using a release build on Linux x86-64.
+Capturing the current `Arc<World>` measured approximately 11 ns in the accepted Milestone 1 run.
 
-| Workload | Median | Approx. throughput | Shape |
-| --- | ---: | ---: | --- |
-| Candidate from genesis, 1 operation | 1.97 µs | 506,796 candidates/s | Clone empty base, apply and validate one definition |
-| Candidate from genesis, 10 operations | 23.03 µs | 43,424 candidates/s | Ten definitions |
-| Candidate from genesis, 100 operations | 220.44 µs | 4,536 candidates/s | One hundred definitions |
-| Candidate from genesis, 1,000 operations | 2.94 ms | 341 candidates/s | One thousand definitions |
-| One-operation candidate on 100-definition world | 86.49 µs | 11,563 candidates/s | Deep-clone base, apply one definition |
-| One-operation candidate on 1,000-definition world | 1.52 ms | 659 candidates/s | Deep-clone base, apply one definition |
-| One-operation candidate on 10,000-definition world | 18.33 ms | 54.6 candidates/s | Deep-clone base, apply one definition |
-| Capture immutable snapshot | 11.20 ns | 89.3 million snapshots/s | Read lock plus `Arc` clone |
-| Sequence of 1,000 one-operation commits | 483.93 µs/commit | 2,066 commits/s | Clone, validate, append, and publish while history grows |
-| Reconstruct 1,000 no-op frames | 138.53 µs | 7,219 reconstructions/s | Logical in-memory replay and identity verification |
+### Candidate construction
 
-An earlier correctness-first version reconstructed every candidate by replaying its complete operation history. It measured approximately 10.1 ms per commit over the same growing 1,000-commit sequence. Deep-cloning the immutable base world reduced that observation to approximately 0.484 ms per commit, about a 20-fold improvement.
+The present candidate implementation deep-clones the base semantic kernel. A one-operation candidate therefore grows with retained world size:
 
-The remaining candidate cost is explicit: the current deep clone copies retained definitions and indexes, so candidate construction still grows with world size. This is not caused by `CommitStore` or publication. Structural sharing is the clear future optimization for the in-memory world representation.
+| Retained world | Median candidate time |
+| ---: | ---: |
+| 100 definitions | 86.49 µs |
+| 1,000 definitions | 1.52 ms |
+| 10,000 definitions | 18.33 ms |
 
-## FileCommitStore baseline
+Structural sharing is the clear in-memory optimization frontier. It is independent of the storage transport work.
 
-The first complete Milestone 2 benchmark was GitHub Actions run `30773123911`, using a release build on Linux x86-64 and the hosted runner's temporary filesystem.
+### File and mmap storage
 
-| Workload | Median | Approx. throughput | Shape |
-| --- | ---: | ---: | --- |
-| 100 durable no-op commits | 464.24 µs/commit | 2,154 commits/s | Encode, append, `sync_data()`, and publish a fixed-size frame |
-| 100 durable one-definition commits | 507.51 µs/commit | 1,970 commits/s | Growing deep-cloned world plus synchronized append |
-| Reopen and reconstruct 100 frames | 73.25 µs | 13,652 reopens/s | Read, checksum, decode, validate, and reconstruct |
-| Reopen and reconstruct 1,000 frames | 404.70 µs | 2,471 reopens/s | Full validation of 1,000 persisted no-op frames |
-| Recover incomplete tail after 100 frames | 376.76 µs | 2,654 recoveries/s | Detect seven-byte tail, truncate, and synchronize |
+Accepted earlier observations included:
 
-The close spacing between no-op and one-definition durable commits shows that this small-world benchmark is primarily synchronization-bound: adding one definition increased the median by roughly 43 µs. These values are not device-independent guarantees, but they establish that the unbatched ordinary-I/O implementation already sustains roughly 2,000 individually synchronized commits per second on this runner.
+| Operation | Median |
+| --- | ---: |
+| Individually synchronized `FileCommitStore` no-op commit | 464.24 µs |
+| Reopen and reconstruct 1,000 file frames | 404.70 µs |
+| Mmap open and reconstruct 1,000 frames | 463.44 µs |
+| Hot zero-copy mapped-record lookup among 10,000 frames | 2.69 ns |
+| Full mapped-byte scan of 10,000 frames | 112.80 µs |
 
-Reopening 1,000 frames remained below half a millisecond in this observation. That result covers physical frame checks plus logical identity and invariant verification; it is not a checkpointed startup measurement.
+Mmap did not accelerate complete recovery because owned frame decoding and semantic reconstruction still dominate. Its demonstrated contribution is direct indexed access to persisted bytes without a separate owned file buffer.
 
-## MmapCommitStore baseline
+### Queue-depth-one io_uring
 
-The accepted Milestone 3 benchmark was GitHub Actions run `30774026801`, using a release build on Linux x86-64 and the hosted runner's temporary filesystem.
+The accepted Milestone 4 benchmark is GitHub Actions run `30778808277`. It compared ordinary synchronized I/O and io_uring in the same release-mode process and temporary filesystem.
 
-| Workload | Median | Approx. throughput | Shape |
-| --- | ---: | ---: | --- |
-| Mmap open and reconstruct 100 frames | 103.64 µs | 9,648 opens/s | Map, scan, checksum, decode, validate, and reconstruct |
-| Mmap open and reconstruct 1,000 frames | 463.44 µs | 2,158 opens/s | Full validation and reconstruction from mapped bytes |
-| Mmap open and reconstruct 10,000 frames | 3.96 ms | 253 opens/s | Full validation and reconstruction from mapped bytes |
-| Paired ordinary-file open, 1,000 frames | 419.81 µs | 2,382 opens/s | Same generated format and hosted run using `read_to_end` |
-| Zero-copy mapped record lookup, 10,000 frames | 2.69 ns | 372.2 million lookups/s | Hot offset-directory lookup returning a borrowed record slice |
-| Full mapped-byte scan, 10,000 frames | 112.80 µs/scan | 8,865 scans/s | Consume every mapped byte without an owned input copy |
-| 100 synchronized mmap no-op commits | 315.02 µs/commit | 3,174 commits/s | Canonical append, `sync_data()`, publication, and remap |
-| Recover mapped incomplete tail after 100 frames | 381.03 µs | 2,624 recoveries/s | Map, detect tail, unmap, truncate, synchronize, and remap |
+| Workload | Ordinary file I/O | io_uring | Difference |
+| --- | ---: | ---: | ---: |
+| 100 no-op commits | 254.85 µs/commit | 235.38 µs/commit | io_uring 7.6% faster |
+| 100 one-definition commits | 252.88 µs/commit | 281.94 µs/commit | io_uring 11.5% slower |
+| 1,000 no-op commits | 200.45 µs/commit | 238.14 µs/commit | io_uring 18.8% slower |
+| Open existing 1,000-frame history through io_uring store | — | 514.41 µs | — |
 
-Mmap did not improve full 1,000-frame reopening in this observation: the paired ordinary-file path was about 10% faster. The current startup path still decodes owned `CommitFrame` values and reconstructs the complete semantic world, so those costs dominate after the input bytes are available. Mapping removes the separate `read_to_end` input buffer, but it does not yet make semantic reconstruction zero-copy.
+The longer fixed-frame control is the best queue-depth-one comparison in this run. It shows that moving the same individually synchronized commit behind io_uring did not improve throughput by itself; the extra submission and completion machinery cost roughly 19% while the store waited after every commit.
 
-The new capability is direct indexed access to persisted bytes. Opening builds a compact frame-span directory, after which `mapped_record()` and `mapped_payload()` return borrowed slices into the mapping without allocation or payload decoding. The 2.69 ns result is a hot-cache microbenchmark of that narrow primitive, not an end-to-end database query or storage-device result.
-
-The synchronized mmap commit observation remained in the same sub-millisecond class as `FileCommitStore`. Hosted-runner variance and benchmark ordering prevent treating the measured difference as a durable speedup claim. The relevant result is that remapping did not introduce an order-of-magnitude penalty while preserving the same synchronized append contract.
+That is an expected and useful baseline. The architecture now has a correct io_uring transport without conflating it with batching. Any later throughput gain must come from actually using the queue: multiple prepared writes, deeper submission, or a separately specified group-commit policy.
 
 ## Benchmark boundaries
 
-The current measurements cover:
+The current evidence covers:
 
-- semantic-kernel operations and current-head reads
-- private candidate construction and validation
+- semantic operations and current-head reads
+- candidate construction and validation
 - immutable snapshot capture
-- in-memory frame append and logical reconstruction
+- in-memory append and logical reconstruction
 - canonical frame encoding and checksums
-- ordinary file append and `sync_data()`
-- reopening from disk
-- memory-mapped frame scanning and validation
-- borrowed zero-copy access to persisted record and payload bytes
-- incomplete-tail truncation and remapping
-- fail-closed tests for established corruption
+- ordinary synchronized file append
+- mapped scanning and borrowed persisted-byte access
+- queue-depth-one linked io_uring write and data synchronization
+- cross-store byte compatibility and reopening
+- incomplete-tail recovery and established-corruption rejection
 
-They do not include:
+It does not yet cover:
 
-- io_uring
-- batching or group commit
-- checkpoints
-- zero-copy semantic object reconstruction
 - structural sharing in candidate worlds
+- multiple io_uring commits in flight
+- batching or group commit
+- registered files or buffers
+- SQPOLL
+- checkpoints
+- zero-copy semantic reconstruction
 - compaction
 - process-crash fault injection
 - cross-process writer coordination
 - application-scale Rust library or deployment workloads
 
-Hosted runners are noisy and may differ in CPU model, placement, contention, filesystem, storage device, and virtualization. Benchmark numbers therefore do not fail ordinary commits. Semantic conformance and committed-world correctness remain required gates; timing remains reported evidence.
+## Next experiments
 
-The figures are not comparisons with Python, SQLite, RocksDB, PostgreSQL, or another database. Such comparisons require deliberately matched workloads and contracts.
+Milestone 4 completes the original storage sequence. Further work should now be selected by workload rather than numbered mechanically.
 
-## Next storage milestone
+The two clearest independent experiments are:
 
-The next storage milestone is `IoUringCommitStore`: preserve the same canonical frames and publication contract while moving append and synchronization submission behind Linux io_uring.
+1. **Structural sharing:** make candidate cost track transaction delta rather than retained world size.
+2. **Queued durability:** prepare and submit multiple independent commit records while preserving an explicitly defined publication and durability contract.
 
-The initial io_uring milestone should measure single-commit overhead honestly before introducing queue depth, batching, or group commit. Mmap remains the read and persisted-byte access path; io_uring is the write-submission path.
+Group commit is not merely a transport optimization. Publishing several transactions after one synchronization changes the durability and visibility contract and must be specified before implementation.
