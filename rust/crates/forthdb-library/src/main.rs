@@ -15,6 +15,7 @@ mod linux {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::time::Instant;
 
     const NAMESPACE: &str = "library";
     const CAPACITY: usize = 64;
@@ -26,6 +27,7 @@ mod linux {
         status: &'static str,
         engine: &'static str,
         database_path: String,
+        elapsed_us: u128,
         world_version: u64,
         world_id: String,
         frame_count: usize,
@@ -89,6 +91,7 @@ mod linux {
     }
 
     fn run_library(path: &Path) -> Result<Report, Box<dyn Error>> {
+        let started = Instant::now();
         let controller = DurableQueuedIntentController::open_owned_speculative(
             path,
             CAPACITY,
@@ -332,6 +335,7 @@ mod linux {
             status: "ok",
             engine: "speculative_io_uring_one_epoch_ahead",
             database_path: path.display().to_string(),
+            elapsed_us: started.elapsed().as_micros(),
             world_version: recovered_world.version(),
             world_id: recovered_world.id().to_string(),
             frame_count: recovered.frame_count(),

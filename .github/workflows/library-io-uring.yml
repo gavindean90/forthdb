@@ -36,6 +36,13 @@ jobs:
             -p forthdb-library \
             -- "$RUNNER_TEMP/forthdb-library-artifacts/library.fdb"
 
+      - name: Compare Python and Rust library engines
+        run: |
+          python library_comparison.py \
+            --rust-binary "$CARGO_TARGET_DIR/release/forthdb-library" \
+            --rounds 15 \
+            --output "$RUNNER_TEMP/forthdb-library-artifacts/library-comparison.json"
+
       - name: Publish application summary
         if: always()
         run: |
@@ -64,6 +71,16 @@ jobs:
                   f"Recovery parity: world `{recovery['same_world']}`, version "
                   f"`{recovery['same_version']}`, frames `{recovery['same_frame_count']}`.\n"
               )
+              comparison = report.parent / "library-comparison.json"
+              if comparison.exists():
+                  compared = json.loads(comparison.read_text())
+                  handle.write("\n## Python versus Rust\n\n")
+                  handle.write(
+                      f"Median complete scenario: Python `{compared['python']['median_us'] / 1000:.2f} ms`, "
+                      f"Rust io_uring `{compared['rust']['median_us'] / 1000:.2f} ms`, "
+                      f"ratio `{compared['python_to_rust_median_ratio']:.2f}x`.\n\n"
+                  )
+                  handle.write(f"{compared['caveat']}\n")
           PY
 
       - name: Upload application database and report
