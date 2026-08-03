@@ -72,6 +72,7 @@ fn wait_for_file(path: &Path) {
     }
 }
 
+#[cfg(feature = "fault-injection")]
 fn assert_crash_status(status: ExitStatus) {
     assert_eq!(
         status.code(),
@@ -106,6 +107,7 @@ fn child_process_entry() {
                 thread::sleep(Duration::from_secs(60));
             }
         }
+        #[cfg(feature = "fault-injection")]
         "crash-one-epoch" => {
             let controller = DurableQueuedIntentController::open_owned(
                 &database,
@@ -163,6 +165,7 @@ fn writer_lease_is_exclusive_across_processes_and_released_after_sigkill() {
     cleanup(&database);
 }
 
+#[cfg(feature = "fault-injection")]
 #[test]
 fn crash_windows_recover_only_the_physically_durable_prefix() {
     let cases = [
