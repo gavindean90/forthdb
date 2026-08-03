@@ -113,7 +113,7 @@ pub enum DurableTicketRejection {
 }
 
 impl DurableTicketRejection {
-    fn from_intent(error: &IntentRejection) -> Self {
+    pub(crate) fn from_intent(error: &IntentRejection) -> Self {
         match error {
             IntentRejection::WorldPrecondition { expected, actual } => Self::WorldPrecondition {
                 expected: *expected,

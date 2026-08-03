@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_INTENT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
@@ -181,6 +182,236 @@ impl QueuedIntent {
     pub fn forget(&mut self, slot: SlotId) {
         self.operations.push(IntentOperation::Forget { slot });
     }
+}
+
+pub(crate) fn encode_queued_intent(intent: &QueuedIntent, output: &mut Vec<u8>) {
+    put_u64(output, intent.namespace);
+    put_u32(output, intent.next_temporary);
+    put_u32(output, intent.preconditions.len() as u32);
+    for precondition in &intent.preconditions {
+        match precondition {
+            IntentPrecondition::ExpectedWorld(world) => {
+                output.push(0);
+                put_u64(output, world.value());
+            }
+            IntentPrecondition::ExpectedSlot { slot, expected } => {
+                output.push(1);
+                put_string(output, slot.as_str());
+                match expected {
+                    Some(fact) => {
+                        output.push(1);
+                        encode_fact(output, fact);
+                    }
+                    None => output.push(0),
+                }
+            }
+        }
+    }
+    put_u32(output, intent.operations.len() as u32);
+    for operation in &intent.operations {
+        match operation {
+            IntentOperation::AllocateEntity { temporary } => {
+                output.push(0);
+                encode_temporary(output, *temporary);
+            }
+            IntentOperation::Define { slot, fact } => {
+                output.push(1);
+                put_string(output, slot.as_str());
+                encode_intent_fact(output, fact);
+            }
+            IntentOperation::Forget { slot } => {
+                output.push(2);
+                put_string(output, slot.as_str());
+            }
+        }
+    }
+}
+
+pub(crate) fn decode_queued_intent(input: &mut Cursor<&[u8]>) -> Result<QueuedIntent, String> {
+    let namespace = take_u64(input)?;
+    let next_temporary = take_u32(input)?;
+    let precondition_count = take_u32(input)? as usize;
+    let mut preconditions = Vec::with_capacity(precondition_count);
+    for _ in 0..precondition_count {
+        preconditions.push(match take_u8(input)? {
+            0 => IntentPrecondition::ExpectedWorld(WorldId::new(take_u64(input)?)),
+            1 => {
+                let slot = SlotId::new(take_string(input)?);
+                let expected = match take_u8(input)? {
+                    0 => None,
+                    1 => Some(decode_fact(input)?),
+                    tag => return Err(format!("invalid expected-fact tag {tag}")),
+                };
+                IntentPrecondition::ExpectedSlot { slot, expected }
+            }
+            tag => return Err(format!("invalid intent precondition tag {tag}")),
+        });
+    }
+    let operation_count = take_u32(input)? as usize;
+    let mut operations = Vec::with_capacity(operation_count);
+    for _ in 0..operation_count {
+        operations.push(match take_u8(input)? {
+            0 => IntentOperation::AllocateEntity {
+                temporary: decode_temporary(input)?,
+            },
+            1 => IntentOperation::Define {
+                slot: SlotId::new(take_string(input)?),
+                fact: decode_intent_fact(input)?,
+            },
+            2 => IntentOperation::Forget {
+                slot: SlotId::new(take_string(input)?),
+            },
+            tag => return Err(format!("invalid intent operation tag {tag}")),
+        });
+    }
+    NEXT_INTENT_NAMESPACE.fetch_max(namespace.saturating_add(1), Ordering::Relaxed);
+    Ok(QueuedIntent {
+        namespace,
+        next_temporary,
+        preconditions,
+        operations,
+    })
+}
+
+fn encode_temporary(output: &mut Vec<u8>, temporary: TempEntity) {
+    put_u64(output, temporary.namespace);
+    put_u32(output, temporary.index);
+}
+
+fn decode_temporary(input: &mut Cursor<&[u8]>) -> Result<TempEntity, String> {
+    Ok(TempEntity {
+        namespace: take_u64(input)?,
+        index: take_u32(input)?,
+    })
+}
+
+fn encode_intent_fact(output: &mut Vec<u8>, fact: &IntentFact) {
+    encode_intent_atom(output, &fact.subject);
+    put_string(output, fact.predicate.as_str());
+    encode_intent_atom(output, &fact.object);
+}
+
+fn decode_intent_fact(input: &mut Cursor<&[u8]>) -> Result<IntentFact, String> {
+    Ok(IntentFact {
+        subject: decode_intent_atom(input)?,
+        predicate: Predicate::new(take_string(input)?),
+        object: decode_intent_atom(input)?,
+    })
+}
+
+fn encode_intent_atom(output: &mut Vec<u8>, atom: &IntentAtom) {
+    match atom {
+        IntentAtom::Entity(entity) => {
+            output.push(0);
+            put_u64(output, entity.value());
+        }
+        IntentAtom::Temporary(temporary) => {
+            output.push(1);
+            encode_temporary(output, *temporary);
+        }
+        IntentAtom::Literal(literal) => {
+            output.push(2);
+            put_string(output, literal.as_str());
+        }
+    }
+}
+
+fn decode_intent_atom(input: &mut Cursor<&[u8]>) -> Result<IntentAtom, String> {
+    match take_u8(input)? {
+        0 => Ok(IntentAtom::Entity(EntityId::new(take_u64(input)?))),
+        1 => Ok(IntentAtom::Temporary(decode_temporary(input)?)),
+        2 => Ok(IntentAtom::Literal(Literal::new(take_string(input)?))),
+        tag => Err(format!("invalid intent atom tag {tag}")),
+    }
+}
+
+fn encode_fact(output: &mut Vec<u8>, fact: &Fact) {
+    encode_atom(output, &fact.subject);
+    put_string(output, fact.predicate.as_str());
+    encode_atom(output, &fact.object);
+}
+
+fn decode_fact(input: &mut Cursor<&[u8]>) -> Result<Fact, String> {
+    Ok(Fact::new(
+        decode_atom(input)?,
+        Predicate::new(take_string(input)?),
+        decode_atom(input)?,
+    ))
+}
+
+fn encode_atom(output: &mut Vec<u8>, atom: &Atom) {
+    match atom {
+        Atom::Entity(entity) => {
+            output.push(0);
+            put_u64(output, entity.value());
+        }
+        Atom::Literal(literal) => {
+            output.push(1);
+            put_string(output, literal.as_str());
+        }
+    }
+}
+
+fn decode_atom(input: &mut Cursor<&[u8]>) -> Result<Atom, String> {
+    match take_u8(input)? {
+        0 => Ok(Atom::Entity(EntityId::new(take_u64(input)?))),
+        1 => Ok(Atom::Literal(Literal::new(take_string(input)?))),
+        tag => Err(format!("invalid fact atom tag {tag}")),
+    }
+}
+
+fn put_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_string(output: &mut Vec<u8>, value: &str) {
+    put_u32(output, value.len() as u32);
+    output.extend_from_slice(value.as_bytes());
+}
+
+fn take_u8(input: &mut Cursor<&[u8]>) -> Result<u8, String> {
+    let mut bytes = [0; 1];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes[0])
+}
+
+fn take_u32(input: &mut Cursor<&[u8]>) -> Result<u32, String> {
+    let mut bytes = [0; 4];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn take_u64(input: &mut Cursor<&[u8]>) -> Result<u64, String> {
+    let mut bytes = [0; 8];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn take_string(input: &mut Cursor<&[u8]>) -> Result<String, String> {
+    let length = take_u32(input)? as usize;
+    let start = input.position() as usize;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| "intent string length overflow".to_owned())?;
+    let bytes = input.get_ref();
+    if end > bytes.len() {
+        return Err("truncated intent string".to_owned());
+    }
+    let value = std::str::from_utf8(&bytes[start..end])
+        .map_err(|error| error.to_string())?
+        .to_owned();
+    input.set_position(end as u64);
+    Ok(value)
 }
 
 #[derive(Debug)]
@@ -380,10 +611,7 @@ pub fn derive_epoch(
                     entities,
                 }));
             }
-            Err(error) => outcomes.push(EpochOutcome::Rejected(RejectedIntent {
-                position,
-                error,
-            })),
+            Err(error) => outcomes.push(EpochOutcome::Rejected(RejectedIntent { position, error })),
         }
     }
 
@@ -395,18 +623,173 @@ pub fn derive_epoch(
     }
 }
 
+/// Construct one immutable successor world for an ordered admission epoch.
+///
+/// Intents are still evaluated in ingress order against a private evolving
+/// candidate so preconditions, allocation, and independent rejection retain
+/// their established meaning. Accepted operations are then collapsed into one
+/// canonical frame rooted at the published predecessor. Every accepted ticket
+/// observes the same epoch world; no intermediate private candidate is
+/// externally publishable.
+pub fn derive_epoch_world(
+    base: Arc<World>,
+    intents: Vec<QueuedIntent>,
+    validators: &[Validator],
+) -> EpochPlan {
+    enum WorkspaceOutcome {
+        Accepted {
+            position: usize,
+            entities: BTreeMap<TempEntity, EntityId>,
+        },
+        Rejected(RejectedIntent),
+    }
+
+    // The workspace owns the only evolving semantic state for the epoch. Each
+    // intent gets a trial candidate so rejection remains isolated, but an
+    // accepted candidate is moved back into the workspace rather than being
+    // wrapped in a World, linked into history, and cloned again by the next
+    // intent. The synthetic id/version chain retains predecessor-relative
+    // precondition and validator behavior until the epoch is collapsed.
+    let mut predecessor_id = base.id;
+    let mut predecessor_version = base.version;
+    let mut next_entity = base.next_entity;
+    let mut operation_count = base.operation_count;
+    let mut kernel = base.kernel.clone();
+    let mut operations = Vec::new();
+    let mut accepted_count = 0usize;
+    let mut workspace_outcomes = Vec::with_capacity(intents.len());
+
+    for (position, intent) in intents.into_iter().enumerate() {
+        let result = (|| {
+            check_workspace_preconditions(predecessor_id, &kernel, &intent.preconditions)?;
+            let (intent_operations, entities) =
+                resolve_operations_from(next_entity, intent.namespace, intent.operations)?;
+            let candidate = CandidateWorld::construct_from_state(
+                predecessor_id,
+                predecessor_version,
+                next_entity,
+                operation_count,
+                &kernel,
+                intent_operations,
+            )
+            .map_err(IntentRejection::Candidate)?;
+            for validator in validators {
+                validator(&candidate).map_err(IntentRejection::Validation)?;
+            }
+            Ok((candidate, entities))
+        })();
+
+        match result {
+            Ok((candidate, entities)) => {
+                let accepted_operations;
+                (
+                    predecessor_id,
+                    predecessor_version,
+                    next_entity,
+                    operation_count,
+                    accepted_operations,
+                    kernel,
+                ) = candidate.into_materialized_state();
+                operations.extend(accepted_operations.iter().cloned());
+                accepted_count += 1;
+                workspace_outcomes.push(WorkspaceOutcome::Accepted { position, entities });
+            }
+            Err(error) => workspace_outcomes.push(WorkspaceOutcome::Rejected(RejectedIntent {
+                position,
+                error,
+            })),
+        }
+    }
+
+    if accepted_count == 0 {
+        return EpochPlan {
+            base: base.clone(),
+            tail: base,
+            outcomes: workspace_outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    WorkspaceOutcome::Rejected(rejected) => EpochOutcome::Rejected(rejected),
+                    WorkspaceOutcome::Accepted { .. } => unreachable!(),
+                })
+                .collect(),
+            frames: Vec::new(),
+        };
+    }
+
+    // Materialization already updated the kernel and indexes incrementally.
+    // Build only the externally visible epoch candidate and world here; do not
+    // replay all accepted operations against the base a second time.
+    let version = base.version + 1;
+    let id = calculate_world_id(base.id, version, next_entity, &operations);
+    let candidate = CandidateWorld {
+        base_world: base.id,
+        base_version: base.version,
+        id,
+        version,
+        next_entity,
+        base_operation_count: base.operation_count,
+        operations: Arc::from(operations),
+        kernel,
+    };
+    let frame = candidate.commit_frame();
+    let world = Arc::new(candidate.into_world(frame.clone(), base.history.clone()));
+    let outcomes = workspace_outcomes
+        .into_iter()
+        .map(|outcome| match outcome {
+            WorkspaceOutcome::Accepted { position, entities } => {
+                EpochOutcome::Accepted(AcceptedIntent {
+                    position,
+                    world: world.clone(),
+                    frame: frame.clone(),
+                    entities,
+                })
+            }
+            WorkspaceOutcome::Rejected(rejected) => EpochOutcome::Rejected(rejected),
+        })
+        .collect();
+
+    EpochPlan {
+        base,
+        tail: world,
+        outcomes,
+        frames: vec![frame],
+    }
+}
+
+fn check_workspace_preconditions(
+    predecessor_id: WorldId,
+    kernel: &ForthDb,
+    preconditions: &[IntentPrecondition],
+) -> Result<(), IntentRejection> {
+    for precondition in preconditions {
+        match precondition {
+            IntentPrecondition::ExpectedWorld(expected) if *expected != predecessor_id => {
+                return Err(IntentRejection::WorldPrecondition {
+                    expected: *expected,
+                    actual: predecessor_id,
+                });
+            }
+            IntentPrecondition::ExpectedWorld(_) => {}
+            IntentPrecondition::ExpectedSlot { slot, expected } => {
+                let actual = kernel.resolve(slot).cloned();
+                if actual != *expected {
+                    return Err(IntentRejection::SlotPrecondition {
+                        slot: slot.clone(),
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn derive_intent(
     predecessor: Arc<World>,
     intent: QueuedIntent,
     validators: &[Validator],
-) -> Result<
-    (
-        Arc<World>,
-        Arc<CommitFrame>,
-        BTreeMap<TempEntity, EntityId>,
-    ),
-    IntentRejection,
-> {
+) -> Result<(Arc<World>, Arc<CommitFrame>, BTreeMap<TempEntity, EntityId>), IntentRejection> {
     check_preconditions(&predecessor, &intent.preconditions)?;
     let (operations, entities) =
         resolve_operations(&predecessor, intent.namespace, intent.operations)?;
@@ -453,7 +836,14 @@ fn resolve_operations(
     namespace: u64,
     intent_operations: Vec<IntentOperation>,
 ) -> Result<(Vec<Operation>, BTreeMap<TempEntity, EntityId>), IntentRejection> {
-    let mut next_entity = predecessor.next_entity();
+    resolve_operations_from(predecessor.next_entity(), namespace, intent_operations)
+}
+
+fn resolve_operations_from(
+    mut next_entity: u64,
+    namespace: u64,
+    intent_operations: Vec<IntentOperation>,
+) -> Result<(Vec<Operation>, BTreeMap<TempEntity, EntityId>), IntentRejection> {
     let mut entities = BTreeMap::new();
     let mut operations = Vec::with_capacity(intent_operations.len());
 
@@ -587,7 +977,9 @@ mod tests {
                 Operation::Forget { slot } => transaction.forget(slot.clone()),
             }
         }
-        database.commit(transaction).expect("oracle commit succeeds")
+        database
+            .commit(transaction)
+            .expect("oracle commit succeeds")
     }
 
     #[test]
@@ -673,7 +1065,11 @@ mod tests {
         assert_eq!(plan.tail().next_entity(), 3);
         let last = plan.outcomes()[2].accepted().expect("last accepted");
         assert_eq!(last.entity(last_entity), Some(EntityId::new(2)));
-        assert!(plan.tail().resolve(&SlotId::new("rejected/state")).is_none());
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("rejected/state"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -722,7 +1118,11 @@ mod tests {
         ));
         assert!(plan.outcomes()[2].accepted().is_some());
         assert_eq!(plan.tail().resolve(&slot), Some(&updated));
-        assert!(plan.tail().resolve(&SlotId::new("should/not/exist")).is_none());
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("should/not/exist"))
+                .is_none()
+        );
         assert!(plan.tail().resolve(&SlotId::new("should/exist")).is_some());
     }
 
@@ -768,6 +1168,282 @@ mod tests {
         ));
         assert!(plan.outcomes()[1].accepted().is_some());
         assert_eq!(plan.tail().version(), 1);
+    }
+
+    #[test]
+    fn epoch_workspace_preserves_ordered_semantics_and_publishes_one_world() {
+        let slot = SlotId::new("workspace/state");
+        let initial = state_fact(EntityId::new(1), "initial");
+        let updated = state_fact(EntityId::new(1), "updated");
+        let database = Database::new(MemoryCommitStore::new()).expect("genesis valid");
+        let mut setup = database.begin();
+        assert_eq!(setup.entity(), EntityId::new(1));
+        setup.define(slot.clone(), initial.clone());
+        let base = database.commit(setup).expect("setup commits");
+
+        let mut first = QueuedIntent::new();
+        first.expect_value(slot.clone(), initial.clone());
+        first.define_fact(slot.clone(), updated.clone());
+
+        let mut rejected = QueuedIntent::new();
+        rejected.expect_value(slot.clone(), initial);
+        let rejected_entity = rejected.entity();
+        rejected.define(
+            SlotId::new("workspace/rejected"),
+            intent_state_fact(rejected_entity, "never"),
+        );
+
+        let mut last = QueuedIntent::new();
+        last.expect_value(slot.clone(), updated.clone());
+        let last_entity = last.entity();
+        last.define(
+            SlotId::new("workspace/accepted"),
+            intent_state_fact(last_entity, "ready"),
+        );
+
+        let mut validator_rejected = QueuedIntent::new();
+        let validator_rejected_entity = validator_rejected.entity();
+        validator_rejected.define(
+            SlotId::new("workspace/validator-rejected"),
+            intent_state_fact(validator_rejected_entity, "never"),
+        );
+        let validator: Validator = Arc::new(|candidate| {
+            if candidate
+                .resolve(&SlotId::new("workspace/validator-rejected"))
+                .is_some()
+            {
+                Err("deliberate rejection".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+
+        let plan = derive_epoch_world(
+            base.clone(),
+            vec![first, rejected, validator_rejected, last],
+            &[validator],
+        );
+        assert!(plan.outcomes()[0].accepted().is_some());
+        assert!(matches!(
+            plan.outcomes()[1].rejected().expect("rejected").error(),
+            IntentRejection::SlotPrecondition { .. }
+        ));
+        assert!(matches!(
+            plan.outcomes()[2].rejected().expect("rejected").error(),
+            IntentRejection::Validation(_)
+        ));
+        let accepted = plan.outcomes()[3].accepted().expect("last accepted");
+        assert_eq!(accepted.entity(last_entity), Some(EntityId::new(2)));
+        assert_eq!(accepted.world().id(), plan.tail().id());
+        assert_eq!(plan.frames().len(), 1);
+        assert_eq!(plan.tail().version(), base.version() + 1);
+        assert_eq!(plan.frames()[0].parent_world(), base.id());
+        assert_eq!(plan.frames()[0].parent_version(), base.version());
+        assert_eq!(plan.tail().resolve(&slot), Some(&updated));
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("workspace/rejected"))
+                .is_none()
+        );
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("workspace/validator-rejected"))
+                .is_none()
+        );
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("workspace/accepted"))
+                .is_some()
+        );
+        let mut frames = base.frames();
+        frames.extend(plan.frames().iter().cloned());
+        let reconstructed = World::reconstruct(&frames).expect("epoch frame reconstructs");
+        assert_eq!(reconstructed.id(), plan.tail().id());
+        assert_eq!(reconstructed.next_entity(), plan.tail().next_entity());
+    }
+
+    #[test]
+    fn empty_accepted_intent_still_materializes_an_epoch_world() {
+        let base = Arc::new(World::genesis());
+        let plan = derive_epoch_world(base.clone(), vec![QueuedIntent::new()], &[]);
+        assert!(plan.outcomes()[0].accepted().is_some());
+        assert_eq!(plan.frames().len(), 1);
+        assert_eq!(plan.tail().version(), 1);
+        assert_ne!(plan.tail().id(), base.id());
+    }
+
+    #[test]
+    fn all_rejected_epoch_keeps_the_base_and_emits_no_frame() {
+        let base = Arc::new(World::genesis());
+        let mut intent = QueuedIntent::new();
+        intent.expect_world(WorldId::new(7));
+        intent.define_fact(
+            SlotId::new("rejected/all"),
+            Fact::new(
+                Atom::Literal(Literal::new("no")),
+                Predicate::new("state"),
+                Atom::Literal(Literal::new("never")),
+            ),
+        );
+        let plan = derive_epoch_world(base.clone(), vec![intent], &[]);
+        assert!(plan.outcomes()[0].rejected().is_some());
+        assert!(plan.frames().is_empty());
+        assert_eq!(plan.tail().id(), base.id());
+        assert!(plan.tail().resolve(&SlotId::new("rejected/all")).is_none());
+    }
+
+    #[test]
+    fn epoch_workspace_keeps_private_predecessor_identity_for_expected_world() {
+        let base = Arc::new(World::genesis());
+        let mut first = QueuedIntent::new();
+        first.define_fact(
+            SlotId::new("private/first"),
+            Fact::new(
+                Atom::Literal(Literal::new("first")),
+                Predicate::new("state"),
+                Atom::Literal(Literal::new("ready")),
+            ),
+        );
+        let private_first = derive_epoch(base.clone(), vec![first.clone()], &[]).tail();
+
+        let mut second = QueuedIntent::new();
+        second.expect_world(private_first.id());
+        second.define_fact(
+            SlotId::new("private/second"),
+            Fact::new(
+                Atom::Literal(Literal::new("second")),
+                Predicate::new("state"),
+                Atom::Literal(Literal::new("ready")),
+            ),
+        );
+
+        let plan = derive_epoch_world(base, vec![first, second], &[]);
+        assert!(
+            plan.outcomes()
+                .iter()
+                .all(|outcome| outcome.accepted().is_some())
+        );
+        assert_eq!(plan.frames().len(), 1);
+        let first = plan.outcomes()[0].accepted().unwrap();
+        let second = plan.outcomes()[1].accepted().unwrap();
+        assert_eq!(first.world().id(), second.world().id());
+        assert_eq!(first.frame(), second.frame());
+    }
+
+    #[test]
+    fn epoch_workspace_validators_observe_the_sequential_candidate_chain() {
+        use std::sync::Mutex;
+
+        type Observation = (WorldId, WorldId, u64, u64, Vec<Operation>);
+
+        fn recording_validator(observations: Arc<Mutex<Vec<Observation>>>) -> Validator {
+            Arc::new(move |candidate| {
+                observations.lock().unwrap().push((
+                    candidate.base_world(),
+                    candidate.id(),
+                    candidate.version(),
+                    candidate.next_entity(),
+                    candidate.operations().to_vec(),
+                ));
+                Ok(())
+            })
+        }
+
+        let mut intents = Vec::new();
+        for index in 0..3 {
+            let mut intent = QueuedIntent::new();
+            let entity = intent.entity();
+            intent.define(
+                SlotId::new(format!("validator/{index}")),
+                intent_state_fact(entity, &index.to_string()),
+            );
+            intents.push(intent);
+        }
+
+        let expected = Arc::new(Mutex::new(Vec::new()));
+        derive_epoch(
+            Arc::new(World::genesis()),
+            intents.clone(),
+            &[recording_validator(expected.clone())],
+        );
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        derive_epoch_world(
+            Arc::new(World::genesis()),
+            intents,
+            &[recording_validator(actual.clone())],
+        );
+
+        assert_eq!(*actual.lock().unwrap(), *expected.lock().unwrap());
+    }
+
+    #[test]
+    fn epoch_workspace_matches_the_legacy_sequential_collapse() {
+        let base = Arc::new(World::genesis());
+        let mut seed = 0xbb67_ae85_84ca_a73b_u64;
+        let mut intents = Vec::with_capacity(512);
+        for index in 0..512_u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let mut intent = QueuedIntent::new();
+            if index % 19 == 0 {
+                intent.expect_world(WorldId::new(7));
+            }
+            if index % 3 == 0 {
+                let entity = intent.entity();
+                intent.define(
+                    SlotId::new(format!("differential/entity/{index}")),
+                    intent_state_fact(entity, &seed.to_string()),
+                );
+            }
+            let slot = SlotId::new(format!("differential/slot/{}", seed % 41));
+            if seed & 7 == 0 {
+                intent.forget(slot);
+            } else {
+                intent.define_fact(
+                    slot,
+                    Fact::new(
+                        Atom::Literal(Literal::new("differential")),
+                        Predicate::new("value"),
+                        Atom::Literal(Literal::new(format!("{index}:{seed}"))),
+                    ),
+                );
+            }
+            intents.push(intent);
+        }
+
+        let sequential = derive_epoch(base.clone(), intents.clone(), &[]);
+        let operations = sequential
+            .frames()
+            .iter()
+            .flat_map(|frame| frame.operations().iter().cloned())
+            .collect();
+        let reference_candidate = CandidateWorld::construct(base.as_ref(), operations).unwrap();
+        let reference_frame = reference_candidate.commit_frame();
+        let reference_world =
+            Arc::new(reference_candidate.into_world(reference_frame.clone(), base.history.clone()));
+
+        let workspace = derive_epoch_world(base, intents, &[]);
+        assert_eq!(workspace.frames(), &[reference_frame]);
+        assert_eq!(workspace.tail().id(), reference_world.id());
+        assert_eq!(
+            workspace.tail().next_entity(),
+            reference_world.next_entity()
+        );
+        assert_eq!(workspace.outcomes().len(), sequential.outcomes().len());
+        for (actual, expected) in workspace.outcomes().iter().zip(sequential.outcomes()) {
+            assert_eq!(actual.accepted().is_some(), expected.accepted().is_some());
+            if let (Some(actual), Some(expected)) = (actual.accepted(), expected.accepted()) {
+                assert_eq!(actual.entities(), expected.entities());
+            }
+        }
+        for slot in 0..41 {
+            let slot = SlotId::new(format!("differential/slot/{slot}"));
+            assert_eq!(
+                workspace.tail().resolve(&slot),
+                reference_world.resolve(&slot)
+            );
+        }
     }
 
     #[test]
@@ -875,11 +1551,16 @@ mod tests {
                         Operation::Forget { slot } => transaction.forget(slot.clone()),
                     }
                 }
-                database.commit(transaction).expect("strict commit succeeds");
+                database
+                    .commit(transaction)
+                    .expect("strict commit succeeds");
             }
         }
 
-        assert_eq!(fs::read(&queued_path).unwrap(), fs::read(&strict_path).unwrap());
+        assert_eq!(
+            fs::read(&queued_path).unwrap(),
+            fs::read(&strict_path).unwrap()
+        );
         let _ = fs::remove_file(queued_path);
         let _ = fs::remove_file(strict_path);
     }

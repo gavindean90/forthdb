@@ -12,6 +12,7 @@ This workspace contains the Rust semantic kernel and committed-world engine.
 6. Bounded ingress and commit tickets
 7. Ordinary-file durability epochs
 8. Opt-in speculative io_uring durability overlap
+9. Durable admission journal with immutable epoch worlds
 
 All stores implement the same `CommitStore` contract. Strict transactions derive and validate a private candidate, append its canonical `CommitFrame`, wait for required durability, and only then publish the immutable successor.
 
@@ -25,12 +26,46 @@ Milestone 6B adds `FileEpochStore` and `DurableQueuedIntentController`. The pair
 
 Milestone 6C tested three synchronous Linux io_uring epoch transports. None outperformed the ordinary-file epoch control, so those transports were retired. The remaining opt-in io_uring controller uses one contiguous `WRITE` plus `FSYNC(DATASYNC)` to overlap durability of epoch N with private preparation of epoch N+1. The ordinary-file per-epoch transport remains the default.
 
+The current draft direction separates durable admission from semantic publication. Ordered intents are encoded into one checksummed admission epoch and become durable through one io_uring `WRITE -> DATASYNC`. The admitted epoch is then evaluated deterministically and publishes at most one immutable world. Recovery replays admission epochs rather than requiring a second synchronized outcome log. Multiple accepted intents in one epoch share the same published world and preserve individual accepted or rejected outcomes.
+
+`AdmissionEpochController::open_with_window` makes the durable-to-applied bound
+explicit. The existing `open` API keeps the one-epoch default. Larger windows
+allow the journal to acknowledge several durable epochs before semantic
+publication catches up, while applying backpressure at the configured bound and
+never exposing provisional worlds.
+
+The admission-window benchmark measures the raw gated journal ceiling, steady
+admission and publication rates, maximum lag, and catch-up time:
+
+```console
+cargo run --release --manifest-path rust/Cargo.toml \
+  -p forthdb-bench --bin admission_window
+```
+
+The library package also includes a ramped circulation comparison. It seeds
+10,000 works, 20,000 copies, 5,000 patrons, and eight branches, then applies the
+same deterministic 512-intent trace as interactive one-intent epochs and as
+16-intent branch-rush epochs. The trace covers checkout contention, holds,
+moves, loss and recovery, patron renames, and returns. Its JSON report records
+throughput and latency, syncs per intent, semantic lag, query latency, history
+growth, and exact recovery. Run it on Linux with:
+
+```console
+cargo run --release --manifest-path rust/Cargo.toml -p forthdb-library --bin ramped
+```
+
+`FORTHDB_RAMPED_WORKS`, `FORTHDB_RAMPED_COPIES`,
+`FORTHDB_RAMPED_PATRONS`, `FORTHDB_RAMPED_BRANCHES`, and
+`FORTHDB_RAMPED_CYCLES` can reduce or expand the hosted profile without changing
+its semantics.
+
 Design and evidence:
 
 - [`STRUCTURAL_SHARING.md`](STRUCTURAL_SHARING.md)
 - [`QUEUED_DURABILITY.md`](QUEUED_DURABILITY.md)
 - [`FILE_EPOCHS.md`](FILE_EPOCHS.md)
 - [`IO_URING_EPOCHS.md`](IO_URING_EPOCHS.md)
+- [`ADMISSION_EPOCH_WORLDS.md`](ADMISSION_EPOCH_WORLDS.md)
 - [`FILE_FORMAT.md`](../FILE_FORMAT.md)
 - [`WORLD_CONTRACT.md`](../WORLD_CONTRACT.md)
 
@@ -66,6 +101,9 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
 
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin queued_io_uring_epoch
+
+cargo run --quiet --release --manifest-path rust/Cargo.toml \
+  -p forthdb-library -- /tmp/forthdb-library.fdb
 ```
 
 The speculative io_uring controller is Linux-only and reports unavailability when ring creation is denied by the running kernel or security policy.

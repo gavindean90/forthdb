@@ -299,27 +299,56 @@ impl fmt::Debug for CandidateWorld {
 
 impl CandidateWorld {
     fn construct(base: &World, operations: Vec<Operation>) -> Result<Self, CandidateError> {
-        let mut kernel = base.kernel.clone();
-        let mut next_entity = base.next_entity;
+        Self::construct_from_state(
+            base.id,
+            base.version,
+            base.next_entity,
+            base.operation_count,
+            &base.kernel,
+            operations,
+        )
+    }
+
+    pub(crate) fn construct_from_state(
+        base_world: WorldId,
+        base_version: u64,
+        base_next_entity: u64,
+        base_operation_count: usize,
+        base_kernel: &ForthDb,
+        operations: Vec<Operation>,
+    ) -> Result<Self, CandidateError> {
+        let mut kernel = base_kernel.clone();
+        let mut next_entity = base_next_entity;
         for operation in &operations {
             apply_operation(&mut kernel, &mut next_entity, operation)?;
         }
-        kernel
-            .validate()
-            .map_err(CandidateError::KernelInvariant)?;
+        kernel.validate().map_err(CandidateError::KernelInvariant)?;
 
-        let version = base.version + 1;
-        let id = calculate_world_id(base.id, version, next_entity, &operations);
+        let version = base_version + 1;
+        let id = calculate_world_id(base_world, version, next_entity, &operations);
         Ok(Self {
-            base_world: base.id,
-            base_version: base.version,
+            base_world,
+            base_version,
             id,
             version,
             next_entity,
-            base_operation_count: base.operation_count,
+            base_operation_count,
             operations: Arc::from(operations),
             kernel,
         })
+    }
+
+    pub(crate) fn into_materialized_state(
+        self,
+    ) -> (WorldId, u64, u64, usize, Arc<[Operation]>, ForthDb) {
+        (
+            self.id,
+            self.version,
+            self.next_entity,
+            self.base_operation_count + self.operations.len(),
+            self.operations,
+            self.kernel,
+        )
     }
 
     pub fn base_world(&self) -> WorldId {
@@ -445,10 +474,7 @@ impl Transaction {
         self.define(
             ForthDb::symbol_slot(namespace, &symbol),
             Fact::new(
-                Atom::Literal(Literal::new(format!(
-                    "{namespace}:{}",
-                    symbol.as_str()
-                ))),
+                Atom::Literal(Literal::new(format!("{namespace}:{}", symbol.as_str()))),
                 Predicate::new("resolves_to"),
                 Atom::Entity(entity),
             ),
@@ -617,7 +643,9 @@ impl<E: Error + 'static> fmt::Display for CommitError<E> {
                 "transaction is based on stale world {based_on}; current world is {current}"
             ),
             Self::Candidate(error) => write!(formatter, "candidate construction failed: {error}"),
-            Self::Validation(message) => write!(formatter, "candidate validation failed: {message}"),
+            Self::Validation(message) => {
+                write!(formatter, "candidate validation failed: {message}")
+            }
             Self::Store(error) => write!(formatter, "commit store append failed: {error}"),
         }
     }
@@ -842,9 +870,7 @@ mod tests {
         );
 
         database.commit(first).expect("first writer commits");
-        let error = database
-            .commit(stale)
-            .expect_err("stale writer must abort");
+        let error = database.commit(stale).expect_err("stale writer must abort");
         assert!(matches!(error, CommitError::StaleTransaction { .. }));
         assert_eq!(database.snapshot().version(), 1);
         assert_eq!(database.frame_count(), 1);
@@ -863,7 +889,9 @@ mod tests {
         let mut update = database.begin();
         update.define(slot.clone(), state_fact(entity, "v2"));
         update.forget(slot.clone());
-        let candidate = update.candidate().expect("candidate should read staged writes");
+        let candidate = update
+            .candidate()
+            .expect("candidate should read staged writes");
         assert_eq!(
             candidate.resolve(&slot).map(|fact| &fact.object),
             Some(&Atom::Literal(Literal::new("v1")))
@@ -876,8 +904,7 @@ mod tests {
     #[test]
     fn identical_histories_produce_identical_frames_and_world_ids() {
         fn run() -> (WorldId, Vec<Arc<CommitFrame>>) {
-            let database =
-                Database::new(MemoryCommitStore::new()).expect("empty store is valid");
+            let database = Database::new(MemoryCommitStore::new()).expect("empty store is valid");
             let mut transaction = database.begin();
             let entity = transaction.entity();
             transaction.define(
