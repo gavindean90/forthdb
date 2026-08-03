@@ -8,16 +8,19 @@ use serde::Serialize;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const RETAINED_DEFINITIONS: usize = 100_000;
 const CAPACITY: usize = 256;
-const MAX_BATCH: usize = 16;
 const PRODUCERS: usize = 4;
-const INTENTS_PER_PRODUCER: usize = 512;
+const BATCH_ONE_INTENTS_PER_PRODUCER: usize = 128;
+const BATCH_SIXTEEN_INTENTS_PER_PRODUCER: usize = 512;
 const RETRY_PAUSE: Duration = Duration::from_micros(10);
+
+static PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize)]
 struct Environment {
@@ -29,6 +32,7 @@ struct Environment {
 #[derive(Serialize)]
 struct Measurement {
     policy: &'static str,
+    max_batch: usize,
     intents: usize,
     producers: usize,
     elapsed_ns: u128,
@@ -50,9 +54,7 @@ struct Report {
     status: &'static str,
     retained_definitions: usize,
     capacity: usize,
-    max_batch: usize,
     producers: usize,
-    intents_per_producer: usize,
     environment: Environment,
     measurements: Vec<Measurement>,
     total_elapsed_ms: u128,
@@ -87,24 +89,26 @@ fn build_base_frames() -> Vec<Arc<forthdb_world::CommitFrame>> {
     database.frames()
 }
 
-fn temp_path(policy: FileEpochSyncPolicy) -> PathBuf {
+fn temp_path(policy: FileEpochSyncPolicy, max_batch: usize) -> PathBuf {
     let name = match policy {
         FileEpochSyncPolicy::PerFrame => "per-frame",
         FileEpochSyncPolicy::PerEpoch => "per-epoch",
     };
+    let sequence = PATH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "forthdb-m6b-{name}-{}-{}.db",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        "forthdb-m6b-{name}-k{max_batch}-{}-{sequence}.db",
+        std::process::id()
     ))
 }
 
 fn run_policy(
     base_frames: &[Arc<forthdb_world::CommitFrame>],
     policy: FileEpochSyncPolicy,
+    max_batch: usize,
+    intents_per_producer: usize,
 ) -> Measurement {
     assert!(ForthDb::drain_reaper(Duration::from_secs(30)));
-    let path = temp_path(policy);
+    let path = temp_path(policy, max_batch);
     let mut store = FileEpochStore::open(&path, policy).expect("file epoch store opens");
     store
         .append_epoch(base_frames)
@@ -112,13 +116,13 @@ fn run_policy(
     let database = Arc::new(Database::new(store).expect("durable database reconstructs"));
     let base_version = database.snapshot().version();
     let controller = Arc::new(
-        DurableQueuedIntentController::new(database.clone(), CAPACITY, MAX_BATCH)
+        DurableQueuedIntentController::new(database.clone(), CAPACITY, max_batch)
             .expect("durable controller starts"),
     );
     let start_gate = Arc::new(Barrier::new(PRODUCERS + 1));
     let (ticket_tx, ticket_rx) = mpsc::channel();
     let mut producers = Vec::new();
-    let total = PRODUCERS * INTENTS_PER_PRODUCER;
+    let total = PRODUCERS * intents_per_producer;
 
     for producer in 0..PRODUCERS {
         let controller = controller.clone();
@@ -126,8 +130,8 @@ fn run_policy(
         let ticket_tx = ticket_tx.clone();
         producers.push(thread::spawn(move || {
             start_gate.wait();
-            for local in 0..INTENTS_PER_PRODUCER {
-                let sequence = producer * INTENTS_PER_PRODUCER + local;
+            for local in 0..intents_per_producer {
+                let sequence = producer * intents_per_producer + local;
                 let mut intent = QueuedIntent::new();
                 intent.define_fact(
                     SlotId::new(format!("queued/{producer}/{local}")),
@@ -193,11 +197,13 @@ fn run_policy(
     assert!(ForthDb::drain_reaper(Duration::from_secs(30)));
 
     let elapsed_ns = elapsed.as_nanos();
+    let data_syncs = store_metrics.data_syncs.saturating_sub(1);
     Measurement {
         policy: match policy {
             FileEpochSyncPolicy::PerFrame => "per_frame",
             FileEpochSyncPolicy::PerEpoch => "per_epoch",
         },
+        max_batch,
         intents: total,
         producers: PRODUCERS,
         elapsed_ns,
@@ -206,8 +212,8 @@ fn run_policy(
         epochs: controller_metrics.epochs,
         average_batch: total as f64 / controller_metrics.epochs as f64,
         data_writes: store_metrics.data_writes,
-        data_syncs: store_metrics.data_syncs.saturating_sub(1),
-        syncs_per_intent: store_metrics.data_syncs.saturating_sub(1) as f64 / total as f64,
+        data_syncs,
+        syncs_per_intent: data_syncs as f64 / total as f64,
         backpressure_events: controller_metrics.backpressured,
         final_version,
         final_frame_count,
@@ -219,16 +225,36 @@ fn main() {
     let total_started = Instant::now();
     let base_frames = build_base_frames();
     let measurements = vec![
-        run_policy(&base_frames, FileEpochSyncPolicy::PerFrame),
-        run_policy(&base_frames, FileEpochSyncPolicy::PerEpoch),
+        run_policy(
+            &base_frames,
+            FileEpochSyncPolicy::PerFrame,
+            1,
+            BATCH_ONE_INTENTS_PER_PRODUCER,
+        ),
+        run_policy(
+            &base_frames,
+            FileEpochSyncPolicy::PerEpoch,
+            1,
+            BATCH_ONE_INTENTS_PER_PRODUCER,
+        ),
+        run_policy(
+            &base_frames,
+            FileEpochSyncPolicy::PerFrame,
+            16,
+            BATCH_SIXTEEN_INTENTS_PER_PRODUCER,
+        ),
+        run_policy(
+            &base_frames,
+            FileEpochSyncPolicy::PerEpoch,
+            16,
+            BATCH_SIXTEEN_INTENTS_PER_PRODUCER,
+        ),
     ];
     let report = Report {
         status: "observed",
         retained_definitions: RETAINED_DEFINITIONS,
         capacity: CAPACITY,
-        max_batch: MAX_BATCH,
         producers: PRODUCERS,
-        intents_per_producer: INTENTS_PER_PRODUCER,
         environment: Environment {
             os: env::consts::OS,
             architecture: env::consts::ARCH,
