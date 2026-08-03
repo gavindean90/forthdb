@@ -1,0 +1,61 @@
+name: Milestone 6D Lifecycle Safety
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Falsify lifecycle and writer ownership
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: /tmp/forthdb-m6d-cargo-target
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run process crash and writer-lock tests
+        run: |
+          cargo test --manifest-path rust/Cargo.toml \
+            -p forthdb-world \
+            --features fault-injection \
+            --test lifecycle_process \
+            -- --nocapture
+
+      - name: Run complete Rust tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Publish lifecycle summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          # Milestone 6D Lifecycle Safety
+
+          The dedicated process harness tests:
+
+          - exclusive process-scoped writer ownership
+          - operating-system lock release after `SIGKILL`
+          - cold recovery before persistence
+          - cold recovery after durable persistence but before publication
+          - cold recovery after publication but before ticket delivery
+          - successful writable restart after each crash window
+          EOF
+
+      - name: Verify repository remains clean
+        run: |
+          status="$(git status --porcelain)"
+          if [[ -n "$status" ]]; then
+            echo "$status"
+            echo "Milestone 6D execution modified the checkout." >&2
+            exit 1
+          fi
