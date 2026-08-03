@@ -17,7 +17,7 @@ The existing committer thread remains the sole ring owner. For one epoch it:
 5. returns to the established repair state machine on any failure
 6. publishes the epoch tail and resolves tickets only after success
 
-Only one durability epoch is in flight. A dedicated reactor, multiple epochs in flight, registered files or buffers, `SQPOLL`, and overlap between candidate preparation and durability are deferred until this isolated transport comparison produces evidence that they are worthwhile.
+Only one durability epoch is in flight. A dedicated reactor, multiple epochs in flight, registered files or buffers, `SQPOLL`, and overlap between candidate preparation and durability remain deferred.
 
 ## Transport matrix
 
@@ -63,9 +63,11 @@ A successful epoch requires:
 - each write result to equal its expected byte length
 - exactly one synchronization completion
 - synchronization result zero
-- no duplicate, unknown, or missing completion identifiers
+- no duplicate, unknown, out-of-range, or missing completion identifiers
 
-Any submission error, missing CQE, short write, failed write, or failed synchronization discards and recreates the ring before the existing file-epoch repair logic truncates and verifies the known-good checkpoint.
+Any submission error, missing CQE, short write, failed write, failed synchronization, or malformed completion batch discards and recreates the ring before the existing file-epoch repair logic truncates and verifies the known-good checkpoint.
+
+Completion validation is a pure tested boundary. Tests cover out-of-order valid CQEs, missing completions, duplicate writes, unknown identifiers, short writes, negative write results, and negative synchronization results.
 
 ## Metrics
 
@@ -84,9 +86,39 @@ These metrics are accumulated by `FileEpochStore` beside the established repair 
 
 ## Benchmark control
 
-The dedicated gate runs the ordinary-file per-epoch transport and all three ring strategies through the same durable queued controller over a 100,000-definition base. It tests maximum batch sizes one and sixteen across four rotating rounds, so every transport occupies every warm-up and filesystem-order position once. Every sample reopens through `FileCommitStore` and verifies the exact final frame count.
+The dedicated gate ran the ordinary-file per-epoch transport and all three ring strategies through the same durable queued controller over a 100,000-definition base. It tested maximum batch sizes one and sixteen across four rotating rounds, so every transport occupied every warm-up and filesystem-order position once. Every sample reopened through `FileCommitStore` and verified the exact final frame count.
 
-Batch size one is the no-amortization control. At batch size sixteen the transport metrics distinguish one arena write, one vectored write, and true multi-write queue depth while preserving one durability barrier per epoch.
+All runs used four producers, ingress capacity 256, a 64-entry ring, cooperative retry after immediate backpressure, and release builds on a shared Linux x86-64 runner.
+
+## Accepted result
+
+GitHub Actions run `30791692940` produced:
+
+| Variant | Max batch | Median batch | Median intents/s | Writes | Syncs | Submits | CQEs | Max writes in flight |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ordinary per-epoch | 1 | 1.00 | 1,779 | 512 | 512 | 0 | 0 | 0 |
+| io_uring contiguous `WRITE` | 1 | 1.00 | 1,631 | 512 | 512 | 512 | 1,024 | 1 |
+| io_uring `WRITEV` | 1 | 1.00 | 1,762 | 512 | 512 | 512 | 1,024 | 1 |
+| io_uring positional writes | 1 | 1.00 | 1,670 | 512 | 512 | 512 | 1,024 | 1 |
+| Ordinary per-epoch | 16 | 16.00 | **8,183** | 128 | 128 | 0 | 0 | 0 |
+| io_uring contiguous `WRITE` | 16 | 15.88 | 8,010 | 129 | 129 | 129 | 258 | 1 |
+| io_uring `WRITEV` | 16 | 15.88 | 7,978 | 129 | 129 | 129 | 258 | 1 |
+| io_uring positional writes | 16 | 15.88 | 7,425 | 2,048 | 129 | 129 | 2,177 | 16 |
+
+The result is negative but decisive:
+
+- ordinary positional write plus `fdatasync` remained the fastest transport in the one-epoch-at-a-time committer
+- the contiguous ring variant was about 2 percent slower at batch sixteen
+- `WRITEV` eliminated approximately 275 KB of arena copying per round but was about 2.5 percent slower, proving that the copy was not the bottleneck
+- true QD=16 worked and was measured honestly, but the additional SQEs and CQE processing made it about 9 percent slower than the ordinary contiguous epoch
+
+The io_uring variants remain valid interoperable transports. They produce the same version-1 bytes, pass the same recovery parser, preserve ticket ordering, and reuse the Milestone 6B repair and poisoning state machine. They are not the default because this experiment found no performance dividend under the tested ownership model.
+
+## Architectural conclusion
+
+A dedicated completion reactor is not justified by this result. Adding a second thread now would introduce another queue, wakeups, buffer-lifetime transfer, and scheduling noise around transports that do not outperform the synchronous ordinary-file control.
+
+The next io_uring experiment, if pursued, must change the concurrency proposition rather than merely the syscall shape—for example, preparing epoch N+1 while epoch N is durable, using registered resources, or testing substantially larger records. Such work requires its own semantic and ownership milestone and must retain the ordinary-file epoch as the control.
 
 ## Falsification boundaries
 
@@ -99,4 +131,4 @@ Milestone 6C fails if any transport:
 - loses, duplicates, or misattributes a CQE
 - represents linked serial writes as queue depth greater than one
 
-The benchmark must compare all three ring variants against the same ordinary-file per-epoch controller and include a batch-size-one no-amortization control.
+All boundaries passed. The performance hypothesis—that io_uring submission shape alone would outperform the ordinary-file epoch—did not.
