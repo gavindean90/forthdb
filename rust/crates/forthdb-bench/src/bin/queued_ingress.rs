@@ -149,20 +149,26 @@ fn run_workload(
 
     let started = Instant::now();
     start_gate.wait();
+
+    // Observe completions while producers are still submitting. This prevents
+    // the benchmark from manufacturing a large backlog of resolved Arc<World>
+    // values that a normal caller would have consumed promptly.
+    let mut observed = 0usize;
+    for ticket in ticket_rx {
+        match ticket.wait().expect("admitted ticket resolves") {
+            TicketOutcome::Accepted { .. } => observed += 1,
+            TicketOutcome::Rejected(error) => panic!("benchmark intent rejected: {error}"),
+        }
+    }
     for worker in workers {
         worker.join().expect("producer does not panic");
     }
-
-    if !abandon {
-        let tickets: Vec<_> = ticket_rx.into_iter().collect();
-        assert_eq!(tickets.len(), total);
-        for ticket in tickets {
-            match ticket.wait().expect("admitted ticket resolves") {
-                TicketOutcome::Accepted { .. } => {}
-                TicketOutcome::Rejected(error) => panic!("benchmark intent rejected: {error}"),
-            }
-        }
+    if abandon {
+        assert_eq!(observed, 0);
+    } else {
+        assert_eq!(observed, total);
     }
+
     controller.flush().expect("controller drains");
     let elapsed = started.elapsed();
     let metrics = controller.metrics();
