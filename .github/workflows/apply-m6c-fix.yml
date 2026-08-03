@@ -1,0 +1,30 @@
+name: Apply Milestone 6C Fix
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    name: Apply benchmark fix bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out head branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: true
+
+      - name: Apply and commit fix
+        run: |
+          base64 -d .m6c/bench-fix.tar.gz.b64 > "$RUNNER_TEMP/m6c-fix.tar.gz"
+          tar -xzf "$RUNNER_TEMP/m6c-fix.tar.gz"
+          rm -rf .m6c
+          rm .github/workflows/apply-m6c-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix io_uring epoch benchmark trait import"
+          git push origin "HEAD:${{ github.head_ref }}"
