@@ -1,0 +1,91 @@
+name: Milestone 6B File Epochs
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  file-epochs:
+    name: Falsify ordinary-file durability epochs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /tmp/forthdb-m6b-cargo-target
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run complete Rust tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Run paired file-epoch benchmark
+        run: |
+          mkdir -p "$RUNNER_TEMP/forthdb-m6b-artifacts"
+          FORTHDB_FILE_EPOCH_REPORT="$RUNNER_TEMP/forthdb-m6b-artifacts/rust-file-epoch-benchmarks.json" \
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin queued_file_epoch
+
+      - name: Publish file-epoch summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "forthdb-m6b-artifacts" / "rust-file-epoch-benchmarks.json"
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("# Milestone 6B Ordinary-File Epochs\n\n")
+              if not report.exists():
+                  handle.write("No file-epoch benchmark report was produced.\n")
+                  raise SystemExit(0)
+              data = json.loads(report.read_text())
+              handle.write(
+                  f"Complete durable controller over {data['retained_definitions']:,} retained definitions, "
+                  f"capacity {data['capacity']}, maximum batch {data['max_batch']}.\n\n"
+              )
+              handle.write("| Policy | Intents | Epochs | Avg batch | Intents/s | Data syncs | Syncs/intent | Backpressure |\n")
+              handle.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+              for item in data["measurements"]:
+                  handle.write(
+                      f"| {item['policy']} | {item['intents']} | {item['epochs']} | "
+                      f"{item['average_batch']:.2f} | {item['intents_per_second']:.0f} | "
+                      f"{item['data_syncs']} | {item['syncs_per_intent']:.4f} | "
+                      f"{item['backpressure_events']} |\n"
+                  )
+              handle.write(
+                  "\nBoth arms use the same ingress, ticket, semantic derivation, publication, "
+                  "canonical frame, and recovery paths. Only synchronization policy differs.\n"
+              )
+          PY
+
+      - name: Upload Milestone 6B evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: forthdb-milestone-6b-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/forthdb-m6b-artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Verify repository remains clean
+        if: always()
+        run: |
+          status="$(git status --porcelain)"
+          if [[ -n "$status" ]]; then
+            echo "$status"
+            echo "Milestone 6B execution modified the checkout." >&2
+            exit 1
+          fi
