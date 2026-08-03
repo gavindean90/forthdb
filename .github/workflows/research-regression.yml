@@ -84,11 +84,6 @@ jobs:
             -p forthdb-bench \
             --bin mmap \
             > "$FORTHDB_REPORT_DIR/rust-mmap-benchmarks.json"
-          cargo run --quiet --release \
-            --manifest-path rust/Cargo.toml \
-            -p forthdb-bench \
-            --bin io_uring \
-            > "$FORTHDB_REPORT_DIR/rust-io-uring-benchmarks.json"
           python research_regression.py --output-dir "$FORTHDB_REPORT_DIR"
 
       - name: Publish regression summary
@@ -128,10 +123,6 @@ jobs:
               (
                   "rust-mmap-benchmarks.json",
                   "Rust MmapCommitStore benchmark observation",
-              ),
-              (
-                  "rust-io-uring-benchmarks.json",
-                  "Rust IoUringCommitStore benchmark observation",
               ),
           ]
 

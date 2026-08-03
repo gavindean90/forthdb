@@ -7,12 +7,11 @@ This workspace contains the Rust semantic kernel and committed-world engine.
 1. `MemoryCommitStore`
 2. `FileCommitStore`
 3. `MmapCommitStore`
-4. `IoUringCommitStore`
-5. Structurally shared worlds
-6. Queued-intent semantic epoch control
-7. Bounded ingress and commit tickets
-8. Ordinary-file durability epochs
-9. io_uring durability transport comparison
+4. Structurally shared worlds
+5. Queued-intent semantic epoch control
+6. Bounded ingress and commit tickets
+7. Ordinary-file durability epochs
+8. Opt-in speculative io_uring durability overlap
 
 All stores implement the same `CommitStore` contract. Strict transactions derive and validate a private candidate, append its canonical `CommitFrame`, wait for required durability, and only then publish the immutable successor.
 
@@ -24,7 +23,7 @@ Milestone 6A.2 adds a fixed-capacity MPSC ingress and one in-memory committer th
 
 Milestone 6B adds `FileEpochStore` and `DurableQueuedIntentController`. The paired ordinary-file transport can either synchronize every frame or encode a contiguous frame arena and synchronize once per epoch. An accepted durable ticket resolves only after the file synchronization succeeds and the reader head advances to the epoch tail. Observed failures enter verified repair; any uncertain repair permanently poisons the live handle.
 
-Milestone 6C adds three interoperable Linux io_uring epoch transports: contiguous `WRITE`, `WRITEV`, and independent positional writes followed by an `IO_DRAIN` data-synchronization barrier. The existing committer thread owns the ring and reaps every CQE before publication. The experiment preserved the complete 6B contract but found that none of the ring submission shapes outperformed the ordinary-file epoch control.
+Milestone 6C tested three synchronous Linux io_uring epoch transports. None outperformed the ordinary-file epoch control, so those transports were retired. The remaining opt-in io_uring controller uses one contiguous `WRITE` plus `FSYNC(DATASYNC)` to overlap durability of epoch N with private preparation of epoch N+1. The ordinary-file per-epoch transport remains the default.
 
 Design and evidence:
 
@@ -51,9 +50,6 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin file
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin mmap
-cargo run --quiet --release --manifest-path rust/Cargo.toml \
-  -p forthdb-bench --bin io_uring
-
 FORTHDB_M5_MILLION=1 \
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin structural_isolated
@@ -72,7 +68,7 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin queued_io_uring_epoch
 ```
 
-`IoUringCommitStore` is Linux-only and reports unavailability when ring creation is denied by the running kernel or security policy.
+The speculative io_uring controller is Linux-only and reports unavailability when ring creation is denied by the running kernel or security policy.
 
 ## Milestone 5 result
 
@@ -144,16 +140,26 @@ The accepted four-round rotating benchmark used the same complete durable contro
 | io_uring `WRITEV` | 16 | 7,978 | 129 | 129 | 258 | 1 |
 | io_uring positional writes | 16 | 7,425 | 2,048 | 129 | 2,177 | 16 |
 
-`WRITEV` removed the contiguous arena copy but did not improve throughput. The pipelined form achieved genuine QD=16, yet its SQE and CQE overhead made it about 9 percent slower than one ordinary contiguous epoch write. The ordinary-file per-epoch transport therefore remains the default. A dedicated reactor and multiple epochs in flight are not justified by this result.
+`WRITEV` removed the contiguous arena copy but did not improve throughput. The pipelined form achieved genuine QD=16, yet its SQE and CQE overhead made it about 9 percent slower than one ordinary contiguous epoch write. The ordinary-file per-epoch transport therefore remains the default. These synchronous ring implementations have been removed; their results remain in [`IO_URING_EPOCHS.md`](IO_URING_EPOCHS.md) as a historical falsification record.
+
+## Speculative io_uring result
+
+The one-epoch-ahead experiment changed the concurrency proposition rather than
+the write syscall. On GitHub Actions run `30838953811`, it prepared every
+possible successor with no rederivation and reached median throughput of 2,566
+versus 2,007 intents/s at batch size one, and 9,288 versus 6,915 at batch size
+sixteen. The gain is consistent with overlapping semantic preparation with
+durability. Ordinary `write` plus `fdatasync` remains the simpler default and
+control; speculative io_uring remains opt-in.
 
 ## Correctness gates
 
 The shared and legacy semantic kernels remain under differential testing. Milestone 6 adds sequential-versus-queued world and frame parity, byte-for-byte file parity, temporary-entity scope enforcement, predecessor-relative preconditions, independent rejection, one-tail publication, a deterministic 10,000-intent differential sequence, multi-producer admission/ticket stress, ordinary-file repair/poisoning tests, exhaustive byte-boundary failure injection, subprocess crash-prefix recovery, io_uring byte parity, explicit CQE correlation, malformed-completion rejection, and true-QD transport metrics.
 
-The existing world, file, mmap, io_uring, conformance, recovery, and canonical-byte suites remain mandatory. Milestones 6B and 6C add epoch transports without changing `CommitFrame`, version 1 encoding, `FileCommitStore`, `MmapCommitStore`, or the original queue-depth-one `IoUringCommitStore`.
+The existing world, file, mmap, conformance, recovery, canonical-byte, and speculative io_uring suites remain mandatory. The epoch transports do not change `CommitFrame`, version 1 encoding, `FileCommitStore`, or `MmapCommitStore`.
 
 ## Current boundaries
 
 The engine does not yet implement dwell-time batching, adaptive batch policy, multiple durability epochs in flight, a dedicated completion reactor, registered io_uring resources, checkpoints, compaction, true power-loss fault injection, worker restart, or cross-process writer coordination.
 
-Milestone 6C found no reason to replace the ordinary-file epoch control merely by changing submission shape. Any later ring experiment must test a different concurrency proposition—such as overlapping preparation with durability—behind a separately specified ownership and publication contract.
+The opt-in [one-epoch-ahead io_uring experiment](SPECULATIVE_IO_URING.md) overlaps private preparation with durability while leaving ordinary per-epoch durability as the default and control.

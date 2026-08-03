@@ -454,6 +454,8 @@ pub struct DurableQueuedControllerMetrics {
     pub shutdown_before_claim: u64,
     pub worker_failed: u64,
     pub epochs: u64,
+    pub speculative_epochs_prepared: u64,
+    pub speculative_epochs_rederived: u64,
     pub abandoned_tickets: u64,
     pub completion_delivery_failures: u64,
     pub queue_depth: u64,
@@ -492,6 +494,8 @@ struct DurableControllerMetricsInner {
     shutdown_before_claim: AtomicU64,
     worker_failed: AtomicU64,
     epochs: AtomicU64,
+    speculative_epochs_prepared: AtomicU64,
+    speculative_epochs_rederived: AtomicU64,
     abandoned_tickets: AtomicU64,
     completion_delivery_failures: AtomicU64,
     queue_depth: AtomicU64,
@@ -599,6 +603,8 @@ impl DurableControllerMetricsInner {
             shutdown_before_claim: self.shutdown_before_claim.load(Ordering::Relaxed),
             worker_failed: self.worker_failed.load(Ordering::Relaxed),
             epochs: self.epochs.load(Ordering::Relaxed),
+            speculative_epochs_prepared: self.speculative_epochs_prepared.load(Ordering::Relaxed),
+            speculative_epochs_rederived: self.speculative_epochs_rederived.load(Ordering::Relaxed),
             abandoned_tickets: self.abandoned_tickets.load(Ordering::Relaxed),
             completion_delivery_failures: self.completion_delivery_failures.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Acquire),
@@ -664,6 +670,49 @@ impl DurableQueuedIntentController<StdEpochFileIo> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl DurableQueuedIntentController<IoUringEpochFileIo> {
+    /// Starts the one-epoch-ahead io_uring experiment.
+    ///
+    /// The ordinary per-epoch controller remains the default. This opt-in
+    /// controller submits one contiguous WRITE + DATASYNC epoch, derives at
+    /// most one successor while durability is in flight, and publishes in
+    /// durable order.
+    pub fn new_speculative(
+        database: Arc<Database<FileEpochStore<IoUringEpochFileIo>>>,
+        capacity: usize,
+        max_batch: usize,
+    ) -> Result<Self, DurableControllerConfigError> {
+        Self::new_with_runner(
+            database,
+            capacity,
+            max_batch,
+            None,
+            run_speculative_io_uring_worker,
+        )
+    }
+
+    pub fn open_owned_speculative(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        max_batch: usize,
+        ring_entries: u32,
+    ) -> Result<Self, DurableControllerOpenError> {
+        let path = path.as_ref();
+        let lease = WriterLease::acquire(path)?;
+        let store = IoUringEpochFileIo::open_store_with_entries(path, ring_entries)?;
+        let database = Arc::new(Database::new(store)?);
+        Self::new_with_runner(
+            database,
+            capacity,
+            max_batch,
+            Some(lease),
+            run_speculative_io_uring_worker,
+        )
+        .map_err(Into::into)
+    }
+}
+
 impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
     /// Starts a controller without acquiring a process writer lease.
     ///
@@ -684,6 +733,32 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
         max_batch: usize,
         lease: Option<WriterLease>,
     ) -> Result<Self, DurableControllerConfigError> {
+        Self::new_with_runner(
+            database,
+            capacity,
+            max_batch,
+            lease,
+            run_durable_worker::<I>,
+        )
+    }
+
+    fn new_with_runner<F>(
+        database: Arc<Database<FileEpochStore<I>>>,
+        capacity: usize,
+        max_batch: usize,
+        lease: Option<WriterLease>,
+        runner: F,
+    ) -> Result<Self, DurableControllerConfigError>
+    where
+        F: FnOnce(
+                Arc<Database<FileEpochStore<I>>>,
+                Receiver<DurableControllerCommand>,
+                usize,
+                Arc<DurableControllerMetricsInner>,
+                Arc<Mutex<Option<SyncSender<DurableControllerCommand>>>>,
+            ) + Send
+            + 'static,
+    {
         if capacity == 0 {
             return Err(DurableControllerConfigError::ZeroCapacity);
         }
@@ -701,7 +776,7 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
         let worker = thread::Builder::new()
             .name("forthdb-file-epoch-committer".to_owned())
             .spawn(move || {
-                run_durable_worker(
+                runner(
                     worker_database,
                     receiver,
                     max_batch,
@@ -941,6 +1016,433 @@ fn run_durable_worker<I: EpochFileIo + 'static>(
         metrics.set_state(DurableControllerState::Closed);
     }
     metrics.worker_alive.store(false, Ordering::Release);
+}
+
+#[cfg(target_os = "linux")]
+type DurableRoute = (
+    mpsc::Sender<DurableTicketOutcome>,
+    Arc<DurableTicketLifecycle>,
+);
+
+#[cfg(target_os = "linux")]
+struct UnplannedDurableBatch {
+    intents: Vec<QueuedIntent>,
+    routes: Vec<DurableRoute>,
+    epoch_started: Instant,
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedDurableBatch {
+    source: UnplannedDurableBatch,
+    plan: EpochPlan,
+}
+
+#[cfg(target_os = "linux")]
+fn run_speculative_io_uring_worker(
+    database: Arc<Database<FileEpochStore<IoUringEpochFileIo>>>,
+    receiver: Receiver<DurableControllerCommand>,
+    max_batch: usize,
+    metrics: Arc<DurableControllerMetricsInner>,
+    sender: Arc<Mutex<Option<SyncSender<DurableControllerCommand>>>>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        run_speculative_io_uring_worker_loop(&database, &receiver, max_batch, &metrics, &sender)
+    }));
+    if let Err(payload) = result {
+        let reason = metrics.poison(format!(
+            "speculative durability worker panicked: {}",
+            panic_message(payload)
+        ));
+        metrics.worker_failed.fetch_add(1, Ordering::Relaxed);
+        poison_store(&database, &reason);
+        sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drain_receiver(&receiver, DrainReason::WorkerFailed(reason), &metrics);
+    }
+    if metrics.state() == DurableControllerState::Running {
+        let reason =
+            metrics.poison("speculative durability worker exited while controller was running");
+        poison_store(&database, &reason);
+    } else if metrics.state() == DurableControllerState::Draining {
+        metrics.set_state(DurableControllerState::Closed);
+    }
+    metrics.worker_alive.store(false, Ordering::Release);
+}
+
+#[cfg(target_os = "linux")]
+fn run_speculative_io_uring_worker_loop(
+    database: &Arc<Database<FileEpochStore<IoUringEpochFileIo>>>,
+    receiver: &Receiver<DurableControllerCommand>,
+    max_batch: usize,
+    metrics: &Arc<DurableControllerMetricsInner>,
+    sender: &Arc<Mutex<Option<SyncSender<DurableControllerCommand>>>>,
+) {
+    let mut pending = VecDeque::new();
+    loop {
+        let command = match pending.pop_front() {
+            Some(command) => command,
+            None => match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
+
+        match metrics.state() {
+            DurableControllerState::Draining | DurableControllerState::Closed => {
+                reject_command(command, DrainReason::Shutdown, metrics);
+                drain_pending_and_receiver(&mut pending, receiver, DrainReason::Shutdown, metrics);
+                break;
+            }
+            DurableControllerState::Poisoned => {
+                let reason = metrics
+                    .reason()
+                    .unwrap_or_else(|| "durable controller is poisoned".to_owned());
+                reject_command(command, DrainReason::WorkerFailed(reason.clone()), metrics);
+                drain_pending_and_receiver(
+                    &mut pending,
+                    receiver,
+                    DrainReason::WorkerFailed(reason),
+                    metrics,
+                );
+                break;
+            }
+            DurableControllerState::Starting | DurableControllerState::Running => {}
+        }
+
+        match command {
+            DurableControllerCommand::Intent(first) => {
+                let batch = claim_batch(first, receiver, &mut pending, max_batch, metrics);
+                if let Err(reason) = process_speculative_pipeline(
+                    database,
+                    batch,
+                    receiver,
+                    &mut pending,
+                    max_batch,
+                    metrics,
+                ) {
+                    let reason = metrics.poison(reason);
+                    poison_store(database, &reason);
+                    sender
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    drain_pending_and_receiver(
+                        &mut pending,
+                        receiver,
+                        DrainReason::WorkerFailed(reason),
+                        metrics,
+                    );
+                    break;
+                }
+            }
+            DurableControllerCommand::Barrier(completed) => {
+                let _ = completed.send(Ok(()));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn claim_batch(
+    first: DurableStagedIntent,
+    receiver: &Receiver<DurableControllerCommand>,
+    pending: &mut VecDeque<DurableControllerCommand>,
+    max_batch: usize,
+    metrics: &DurableControllerMetricsInner,
+) -> Vec<DurableStagedIntent> {
+    let mut batch = Vec::with_capacity(max_batch);
+    claim(first, metrics, &mut batch);
+    while batch.len() < max_batch && metrics.state() == DurableControllerState::Running {
+        match receiver.try_recv() {
+            Ok(DurableControllerCommand::Intent(staged)) => claim(staged, metrics, &mut batch),
+            Ok(command @ DurableControllerCommand::Barrier(_)) => {
+                pending.push_back(command);
+                break;
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    batch
+}
+
+#[cfg(target_os = "linux")]
+fn try_claim_successor_batch(
+    receiver: &Receiver<DurableControllerCommand>,
+    pending: &mut VecDeque<DurableControllerCommand>,
+    max_batch: usize,
+    metrics: &DurableControllerMetricsInner,
+) -> Option<Vec<DurableStagedIntent>> {
+    if metrics.state() != DurableControllerState::Running {
+        return None;
+    }
+    match receiver.try_recv() {
+        Ok(DurableControllerCommand::Intent(first)) => {
+            Some(claim_batch(first, receiver, pending, max_batch, metrics))
+        }
+        Ok(command @ DurableControllerCommand::Barrier(_)) => {
+            pending.push_back(command);
+            None
+        }
+        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unplan_batch(
+    batch: Vec<DurableStagedIntent>,
+    metrics: &DurableControllerMetricsInner,
+) -> UnplannedDurableBatch {
+    metrics
+        .in_flight
+        .fetch_add(batch.len() as u64, Ordering::AcqRel);
+    let mut intents = Vec::with_capacity(batch.len());
+    let mut routes = Vec::with_capacity(batch.len());
+    for staged in batch {
+        intents.push(staged.intent);
+        routes.push((staged.completion, staged.lifecycle));
+    }
+    UnplannedDurableBatch {
+        intents,
+        routes,
+        epoch_started: Instant::now(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn derive_prepared_batch(
+    source: UnplannedDurableBatch,
+    base: Arc<World>,
+    validators: &[Validator],
+    metrics: &DurableControllerMetricsInner,
+) -> Result<PreparedDurableBatch, (UnplannedDurableBatch, String)> {
+    let derive_started = Instant::now();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        derive_epoch(base, source.intents.clone(), validators)
+    }));
+    metrics
+        .derive_nanos
+        .fetch_add(nanos(derive_started.elapsed()), Ordering::Relaxed);
+    match result {
+        Ok(plan) => Ok(PreparedDurableBatch { source, plan }),
+        Err(payload) => Err((
+            source,
+            format!(
+                "speculative epoch derivation failed: {}",
+                panic_message(payload)
+            ),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_speculative_pipeline(
+    database: &Database<FileEpochStore<IoUringEpochFileIo>>,
+    first: Vec<DurableStagedIntent>,
+    receiver: &Receiver<DurableControllerCommand>,
+    pending_commands: &mut VecDeque<DurableControllerCommand>,
+    max_batch: usize,
+    metrics: &DurableControllerMetricsInner,
+) -> Result<(), String> {
+    let _commit_guard = database
+        .commit_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let validators = database
+        .validators
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let source = unplan_batch(first, metrics);
+    let mut prepared =
+        match derive_prepared_batch(source, database.snapshot(), &validators, metrics) {
+            Ok(prepared) => prepared,
+            Err((source, reason)) => {
+                finish_stopped_batch(source, &reason, metrics);
+                return Err(reason);
+            }
+        };
+
+    loop {
+        if prepared.plan.is_empty() {
+            publish_and_route_success(database, prepared, metrics);
+            let Some(batch) =
+                try_claim_successor_batch(receiver, pending_commands, max_batch, metrics)
+            else {
+                return Ok(());
+            };
+            let source = unplan_batch(batch, metrics);
+            prepared =
+                match derive_prepared_batch(source, database.snapshot(), &validators, metrics) {
+                    Ok(prepared) => prepared,
+                    Err((source, reason)) => {
+                        finish_stopped_batch(source, &reason, metrics);
+                        return Err(reason);
+                    }
+                };
+            continue;
+        }
+
+        let mut store = database
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let file_epoch = match store.prepare_epoch(prepared.plan.frames()) {
+            Ok(file_epoch) => file_epoch,
+            Err(error) => {
+                drop(store);
+                finish_failed_batch(prepared, &error, metrics);
+                return Ok(());
+            }
+        };
+        let persist_started = Instant::now();
+        let pending_io = match store
+            .io_mut()
+            .submit_contiguous_epoch(file_epoch.start_offset(), file_epoch.records())
+        {
+            Ok(pending_io) => pending_io,
+            Err(error) => {
+                let result = store.finish_prepared_epoch(file_epoch, Err(error));
+                drop(store);
+                match result {
+                    Ok(()) => unreachable!("failed submission cannot finish successfully"),
+                    Err(error) => finish_failed_batch(prepared, &error, metrics),
+                }
+                return Ok(());
+            }
+        };
+
+        // Only validation and private world construction overlap the kernel's
+        // WRITE + DATASYNC. The file store and commit lock remain exclusively
+        // owned here; no successor bytes are submitted before this completion.
+        let successor = try_claim_successor_batch(receiver, pending_commands, max_batch, metrics)
+            .map(|batch| {
+                metrics
+                    .speculative_epochs_prepared
+                    .fetch_add(1, Ordering::Relaxed);
+                let source = unplan_batch(batch, metrics);
+                derive_prepared_batch(source, prepared.plan.tail(), &validators, metrics)
+            });
+
+        let (transport_metrics, io_result) = store.io_mut().complete_contiguous_epoch(pending_io);
+        store.record_transport_metrics(transport_metrics);
+        let persist_result = store.finish_prepared_epoch(file_epoch, io_result);
+        metrics
+            .persist_nanos
+            .fetch_add(nanos(persist_started.elapsed()), Ordering::Relaxed);
+        drop(store);
+
+        let persisted = persist_result.is_ok();
+        match persist_result {
+            Ok(()) => publish_and_route_success(database, prepared, metrics),
+            Err(error) => finish_failed_batch(prepared, &error, metrics),
+        }
+
+        let Some(successor) = successor else {
+            return Ok(());
+        };
+        prepared = match successor {
+            Ok(prepared) if persisted => prepared,
+            Ok(prepared) => {
+                metrics
+                    .speculative_epochs_rederived
+                    .fetch_add(1, Ordering::Relaxed);
+                let source = prepared.source;
+                match derive_prepared_batch(source, database.snapshot(), &validators, metrics) {
+                    Ok(prepared) => prepared,
+                    Err((source, reason)) => {
+                        finish_stopped_batch(source, &reason, metrics);
+                        return Err(reason);
+                    }
+                }
+            }
+            Err((source, reason)) => {
+                finish_stopped_batch(source, &reason, metrics);
+                return Err(reason);
+            }
+        };
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_and_route_success(
+    database: &Database<FileEpochStore<IoUringEpochFileIo>>,
+    prepared: PreparedDurableBatch,
+    metrics: &DurableControllerMetricsInner,
+) {
+    let publish_started = Instant::now();
+    *database
+        .current
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = prepared.plan.tail();
+    metrics
+        .publish_nanos
+        .fetch_add(nanos(publish_started.elapsed()), Ordering::Relaxed);
+    let delivery_started = Instant::now();
+    route_success(prepared.source.routes, &prepared.plan, metrics);
+    finish_batch_metrics(
+        prepared.source.intents.len(),
+        prepared.source.epoch_started,
+        delivery_started,
+        metrics,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn finish_failed_batch(
+    prepared: PreparedDurableBatch,
+    error: &FileEpochStoreError,
+    metrics: &DurableControllerMetricsInner,
+) {
+    let delivery_started = Instant::now();
+    route_failure(prepared.source.routes, &prepared.plan, error, metrics);
+    finish_batch_metrics(
+        prepared.source.intents.len(),
+        prepared.source.epoch_started,
+        delivery_started,
+        metrics,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn finish_stopped_batch(
+    source: UnplannedDurableBatch,
+    reason: &str,
+    metrics: &DurableControllerMetricsInner,
+) {
+    let delivery_started = Instant::now();
+    route_stopped(
+        source.routes,
+        DurableTicketStopReason::WorkerFailed(reason.to_owned()),
+        metrics,
+    );
+    metrics.worker_failed.fetch_add(1, Ordering::Relaxed);
+    finish_batch_metrics(
+        source.intents.len(),
+        source.epoch_started,
+        delivery_started,
+        metrics,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn finish_batch_metrics(
+    intents: usize,
+    epoch_started: Instant,
+    delivery_started: Instant,
+    metrics: &DurableControllerMetricsInner,
+) {
+    metrics
+        .delivery_nanos
+        .fetch_add(nanos(delivery_started.elapsed()), Ordering::Relaxed);
+    metrics.epochs.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .in_flight
+        .fetch_sub(intents as u64, Ordering::AcqRel);
+    metrics
+        .epoch_total_nanos
+        .fetch_add(nanos(epoch_started.elapsed()), Ordering::Relaxed);
 }
 
 fn run_durable_worker_loop<I: EpochFileIo + 'static>(
@@ -1644,6 +2146,98 @@ mod tests {
             .expect("derive and persist timings exist");
         assert!((1.0..=2.0).contains(&ceiling));
         controller.shutdown();
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn speculative_io_uring_prepares_a_successor_before_publication() {
+        use std::sync::Condvar;
+        use std::time::{Duration, Instant};
+
+        let path = temp_path("speculative-io-uring");
+        let store = match IoUringEpochFileIo::open_store_with_entries(&path, 64) {
+            Ok(store) => store,
+            Err(FileEpochStoreError::Io { source, .. })
+                if matches!(source.raw_os_error(), Some(1 | 38 | 95)) =>
+            {
+                let _ = fs::remove_file(path);
+                return;
+            }
+            Err(error) => panic!("io_uring epoch store should open: {error}"),
+        };
+        let database = Arc::new(Database::new(store).expect("database opens"));
+        let entered = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let release = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let block_first = Arc::new(AtomicBool::new(true));
+        let validator_entered = entered.clone();
+        let validator_release = release.clone();
+        let validator_block_first = block_first.clone();
+        database.register_validator(move |_| {
+            if validator_block_first.swap(false, Ordering::SeqCst) {
+                let (lock, signal) = &*validator_entered;
+                *lock.lock().expect("entered lock") = true;
+                signal.notify_all();
+                let (lock, signal) = &*validator_release;
+                let mut released = lock.lock().expect("release lock");
+                while !*released {
+                    released = signal.wait(released).expect("release wait");
+                }
+            }
+            Ok(())
+        });
+
+        let controller = DurableQueuedIntentController::new_speculative(database.clone(), 16, 1)
+            .expect("speculative controller starts");
+        let first = controller
+            .submit(intent("speculative/0", "zero"))
+            .expect("first admitted");
+
+        let (lock, signal) = &*entered;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = lock.lock().expect("entered lock");
+        while !*observed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "validator was never entered");
+            let (next, timeout) = signal
+                .wait_timeout(observed, remaining)
+                .expect("entered wait");
+            observed = next;
+            assert!(
+                !timeout.timed_out() || *observed,
+                "validator entry timed out"
+            );
+        }
+        drop(observed);
+
+        let second = controller
+            .submit(intent("speculative/1", "one"))
+            .expect("second admitted");
+        let third = controller
+            .submit(intent("speculative/2", "two"))
+            .expect("third admitted");
+        let (lock, signal) = &*release;
+        *lock.lock().expect("release lock") = true;
+        signal.notify_all();
+
+        for ticket in [first, second, third] {
+            assert!(matches!(
+                ticket.wait().expect("ticket resolves"),
+                DurableTicketOutcome::Accepted { .. }
+            ));
+        }
+        controller.flush().expect("pipeline drains");
+        let metrics = controller.metrics();
+        assert!(metrics.speculative_epochs_prepared >= 1);
+        assert_eq!(metrics.speculative_epochs_rederived, 0);
+        assert_eq!(database.snapshot().version(), 3);
+        assert_eq!(database.frame_count(), 3);
+        assert_eq!(controller.store_metrics().data_syncs, 3);
+        controller.shutdown();
+        drop(controller);
+        drop(database);
+        let reopened = FileCommitStore::open(&path).expect("history reopens");
+        assert_eq!(reopened.len(), 3);
         let _ = fs::remove_file(path);
     }
 }
