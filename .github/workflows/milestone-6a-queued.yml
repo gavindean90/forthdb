@@ -1,0 +1,94 @@
+name: Milestone 6A Queued Intents
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  queued-intents:
+    name: Verify queued-intent epoch semantics
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /tmp/forthdb-m6a-cargo-target
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run complete Rust tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Run queued epoch semantic benchmark
+        env:
+          FORTHDB_M6_RETAINED_DEFINITIONS: "100000"
+        run: |
+          mkdir -p "$RUNNER_TEMP/forthdb-m6a-artifacts"
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin queued_epoch \
+            > "$RUNNER_TEMP/forthdb-m6a-artifacts/rust-queued-epoch-benchmarks.json"
+
+      - name: Publish queued epoch summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "forthdb-m6a-artifacts" / "rust-queued-epoch-benchmarks.json"
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("# Milestone 6A Queued Intents\n\n")
+              if not report.exists():
+                  handle.write("No queued-epoch benchmark report was produced.\n")
+                  raise SystemExit(0)
+              data = json.loads(report.read_text())
+              handle.write(
+                  f"Private epoch derivation over a base containing "
+                  f"{data['retained_definitions']:,} definitions. "
+                  "Intent construction and background reclamation are outside the timer.\n\n"
+              )
+              handle.write("| Batch | Median epoch | Median per intent | Intents/s |\n")
+              handle.write("| ---: | ---: | ---: | ---: |\n")
+              for item in data["measurements"]:
+                  handle.write(
+                      f"| {item['batch_size']} | "
+                      f"{item['median_ns_per_epoch'] / 1_000:.2f} µs | "
+                      f"{item['median_ns_per_intent'] / 1_000:.2f} µs | "
+                      f"{item['median_intents_per_second']:.0f} |\n"
+                  )
+              handle.write(
+                  "\nThese are shared-runner observations for the semantic control, "
+                  "not durability-throughput claims.\n"
+              )
+          PY
+
+      - name: Upload Milestone 6A evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: forthdb-milestone-6a-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/forthdb-m6a-artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Verify repository remains clean
+        if: always()
+        run: |
+          status="$(git status --porcelain)"
+          if [[ -n "$status" ]]; then
+            echo "$status"
+            echo "Milestone 6A execution modified the checkout." >&2
+            exit 1
+          fi
