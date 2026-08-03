@@ -1,0 +1,91 @@
+name: Patch Milestone 6D README
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out head branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: true
+
+      - name: Document lifecycle milestone
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("rust/README.md")
+          text = path.read_text()
+
+          text = text.replace(
+              "9. io_uring durability transport comparison\n",
+              "9. io_uring durability transport comparison\n10. Lifecycle and process-scoped writer safety\n",
+              1,
+          )
+
+          marker = "Milestone 6C adds three interoperable Linux io_uring epoch transports: contiguous `WRITE`, `WRITEV`, and independent positional writes followed by an `IO_DRAIN` data-synchronization barrier. The existing committer thread owns the ring and reaps every CQE before publication. The experiment preserved the complete 6B contract but found that none of the ring submission shapes outperformed the ordinary-file epoch control.\n"
+          addition = marker + "\nMilestone 6D makes the durable controller lifecycle explicit, resolves every admitted ticket during shutdown, poisons the live handle after worker failure, and adds Linux process-scoped writer ownership. Subprocess tests prove kernel-lock release after `SIGKILL` and truthful recovery at the derive/persist, persist/publish, and publish/delivery crash boundaries. Phase timing now bounds the value of any future speculative pipeline.\n"
+          if marker not in text:
+              raise SystemExit("Milestone 6C overview marker missing")
+          text = text.replace(marker, addition, 1)
+
+          text = text.replace(
+              "- [`IO_URING_EPOCHS.md`](IO_URING_EPOCHS.md)\n",
+              "- [`IO_URING_EPOCHS.md`](IO_URING_EPOCHS.md)\n- [`LIFECYCLE_SAFETY.md`](LIFECYCLE_SAFETY.md)\n",
+              1,
+          )
+
+          run_marker = "cargo run --quiet --release --manifest-path rust/Cargo.toml \\\n  -p forthdb-bench --bin queued_io_uring_epoch\n"
+          run_addition = run_marker + "\ncargo run --quiet --release --manifest-path rust/Cargo.toml \\\n  -p forthdb-bench --bin lifecycle_timing\n"
+          if run_marker not in text:
+              raise SystemExit("io_uring run command marker missing")
+          text = text.replace(run_marker, run_addition, 1)
+
+          result_marker = "## Correctness gates\n"
+          result = '''## Milestone 6D result
+
+The exact-head lifecycle observation used 100,000 retained definitions, 2,048 intents, four producers, ingress capacity 256, and maximum batch 16.
+
+| Metric | Result |
+| --- | ---: |
+| Throughput | 5,350 intents/s |
+| Average batch | 15.88 |
+| Derive per epoch | 2.228 ms |
+| Persist per epoch | 0.633 ms |
+| Complete epoch | 2.962 ms |
+| Ideal full-pipeline ceiling | 1.272× |
+
+Process tests prove exclusive writable ownership, operating-system lease release after `SIGKILL`, recovery of zero frames before persistence, recovery of one frame after synchronized persistence, and successful writable restart after every tested crash window. Graceful shutdown finishes the claimed epoch, resolves queued intents as `ShutdownBeforeClaim`, and releases ownership only after worker exit.
+
+'''
+          if result_marker not in text:
+              raise SystemExit("correctness marker missing")
+          text = text.replace(result_marker, result + result_marker, 1)
+
+          old_boundary = "The engine does not yet implement dwell-time batching, adaptive batch policy, multiple durability epochs in flight, a dedicated completion reactor, registered io_uring resources, checkpoints, compaction, true power-loss fault injection, worker restart, or cross-process writer coordination.\n"
+          new_boundary = "The engine does not yet implement dwell-time batching, adaptive batch policy, multiple durability epochs in flight, a dedicated completion reactor, registered io_uring resources, checkpoints, compaction, true device power-loss simulation, automatic worker restart, or non-Linux process-scoped writer ownership.\n"
+          if old_boundary not in text:
+              raise SystemExit("current boundary marker missing")
+          text = text.replace(old_boundary, new_boundary, 1)
+
+          tail = "Milestone 6C found no reason to replace the ordinary-file epoch control merely by changing submission shape. Any later ring experiment must test a different concurrency proposition—such as overlapping preparation with durability—behind a separately specified ownership and publication contract."
+          replacement = "Milestone 6D found that perfect overlap between derivation and persistence could improve the observed complete epoch path by no more than about 27% on its accepted workload. Any speculative pipeline remains a separate, workload-dependent experiment and must preserve the established lifecycle, writer-ownership, recovery, ticket, and poisoning contracts."
+          if tail not in text:
+              raise SystemExit("README tail marker missing")
+          text = text.replace(tail, replacement, 1)
+
+          path.write_text(text)
+          PY
+          rm .github/workflows/patch-m6d-readme.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Document Milestone 6D lifecycle safety"
+          git push origin "HEAD:${{ github.head_ref }}"
