@@ -8,7 +8,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const SAMPLES: usize = 3;
+const SAMPLES: usize = 11;
 const DEFAULT_RETAINED_DEFINITIONS: u64 = 100_000;
 
 #[derive(Serialize)]
@@ -35,14 +35,14 @@ struct Environment {
 #[derive(Serialize)]
 struct Measurement {
     batch_size: usize,
-    iterations_per_sample: usize,
-    samples: usize,
+    epochs_measured: usize,
     median_ns_per_epoch: f64,
     median_ns_per_intent: f64,
+    p95_ns_per_intent: f64,
     min_ns_per_intent: f64,
     max_ns_per_intent: f64,
     median_intents_per_second: f64,
-    sample_elapsed_ns: Vec<u64>,
+    epoch_elapsed_ns: Vec<u64>,
     checksum: u64,
     notes: String,
 }
@@ -106,70 +106,63 @@ fn build_base(retained_definitions: u64) -> Arc<World> {
 }
 
 fn measure_batch(base: Arc<World>, batch_size: usize) -> Measurement {
-    let iterations = match batch_size {
-        1..=4 => 200,
-        5..=16 => 100,
-        17..=32 => 50,
-        _ => 25,
-    };
     let mut elapsed = Vec::with_capacity(SAMPLES);
     let mut checksum = 0_u64;
 
     for sample in 0..SAMPLES {
-        ForthDb::drain_reaper(Duration::from_secs(30));
-        let batches: Vec<Vec<QueuedIntent>> = (0..iterations)
-            .map(|iteration| build_intents(sample, iteration, batch_size))
-            .collect();
-        let mut retained_plans = Vec::with_capacity(iterations);
-
-        let began = Instant::now();
-        for intents in batches {
-            let plan = black_box(derive_epoch(base.clone(), intents, &[]));
-            checksum = checksum
-                .wrapping_add(plan.tail().id().value())
-                .wrapping_add(plan.accepted_count() as u64);
-            retained_plans.push(plan);
-        }
-        elapsed.push(nanos(began.elapsed()));
-
-        drop(retained_plans);
         assert!(
             ForthDb::drain_reaper(Duration::from_secs(30)),
-            "semantic-kernel reaper must drain between samples"
+            "semantic-kernel reaper must be empty before a sample"
+        );
+        let intents = build_intents(sample, batch_size);
+
+        let began = Instant::now();
+        let plan = black_box(derive_epoch(base.clone(), intents, &[]));
+        let duration = nanos(began.elapsed());
+        checksum = checksum
+            .wrapping_add(plan.tail().id().value())
+            .wrapping_add(plan.accepted_count() as u64);
+        black_box(plan.outcomes());
+        elapsed.push(duration);
+
+        drop(plan);
+        assert!(
+            ForthDb::drain_reaper(Duration::from_secs(30)),
+            "semantic-kernel reaper must drain after a sample"
         );
     }
 
     elapsed.sort_unstable();
-    let intents_per_sample = iterations * batch_size;
     let ns_per_intent: Vec<f64> = elapsed
         .iter()
-        .map(|value| *value as f64 / intents_per_sample as f64)
+        .map(|value| *value as f64 / batch_size as f64)
         .collect();
-    let median_per_intent = ns_per_intent[SAMPLES / 2];
-    let median_per_epoch = elapsed[SAMPLES / 2] as f64 / iterations as f64;
+    let median_index = SAMPLES / 2;
+    let p95_index = ((SAMPLES as f64 * 0.95).ceil() as usize - 1).min(SAMPLES - 1);
+    let median_per_intent = ns_per_intent[median_index];
 
     Measurement {
         batch_size,
-        iterations_per_sample: iterations,
-        samples: SAMPLES,
-        median_ns_per_epoch: median_per_epoch,
+        epochs_measured: SAMPLES,
+        median_ns_per_epoch: elapsed[median_index] as f64,
         median_ns_per_intent: median_per_intent,
+        p95_ns_per_intent: ns_per_intent[p95_index],
         min_ns_per_intent: ns_per_intent[0],
         max_ns_per_intent: ns_per_intent[SAMPLES - 1],
         median_intents_per_second: 1_000_000_000.0 / median_per_intent,
-        sample_elapsed_ns: elapsed,
+        epoch_elapsed_ns: elapsed,
         checksum,
-        notes: "Intent construction occurs before timing; candidate worlds remain live until the timer stops; background reaping is drained before and after each sample.".to_owned(),
+        notes: "Each observation times one complete epoch. Intent construction is complete before timing; every intermediate world remains live until timing stops; the semantic-kernel reaper is drained before and after each observation.".to_owned(),
     }
 }
 
-fn build_intents(sample: usize, iteration: usize, batch_size: usize) -> Vec<QueuedIntent> {
+fn build_intents(sample: usize, batch_size: usize) -> Vec<QueuedIntent> {
     (0..batch_size)
         .map(|position| {
             let mut intent = QueuedIntent::new();
             let entity = intent.entity();
             intent.define(
-                SlotId::new(format!("epoch/{sample}/{iteration}/{position}")),
+                SlotId::new(format!("epoch/{sample}/{position}")),
                 IntentFact::new(
                     entity,
                     Predicate::new("state"),
