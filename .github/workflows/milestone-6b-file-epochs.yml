@@ -27,7 +27,7 @@ jobs:
       - name: Run complete Rust tests
         run: cargo test --manifest-path rust/Cargo.toml
 
-      - name: Run paired file-epoch benchmark
+      - name: Run repeated paired file-epoch benchmark
         run: |
           mkdir -p "$RUNNER_TEMP/forthdb-m6b-artifacts"
           FORTHDB_FILE_EPOCH_REPORT="$RUNNER_TEMP/forthdb-m6b-artifacts/rust-file-epoch-benchmarks.json" \
@@ -53,22 +53,25 @@ jobs:
                   raise SystemExit(0)
               data = json.loads(report.read_text())
               handle.write(
-                  f"Complete durable controller over {data['retained_definitions']:,} retained definitions "
-                  f"with ingress capacity {data['capacity']}.\n\n"
+                  f"Complete durable controller over {data['retained_definitions']:,} retained definitions, "
+                  f"{data['rounds']} alternating rounds, ingress capacity {data['capacity']}.\n\n"
               )
-              handle.write("| Policy | Max batch | Intents | Epochs | Avg batch | Intents/s | Data syncs | Syncs/intent | Backpressure |\n")
-              handle.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
-              for item in data["measurements"]:
+              handle.write("| Policy | Max batch | Intents/round | Median batch | Median intents/s | Median syncs | Syncs/intent | Throughput range |\n")
+              handle.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+              for item in data["aggregates"]:
                   handle.write(
-                      f"| {item['policy']} | {item['max_batch']} | {item['intents']} | "
-                      f"{item['epochs']} | {item['average_batch']:.2f} | "
-                      f"{item['intents_per_second']:.0f} | {item['data_syncs']} | "
-                      f"{item['syncs_per_intent']:.4f} | {item['backpressure_events']} |\n"
+                      f"| {item['policy']} | {item['max_batch']} | "
+                      f"{item['intents_per_round']} | {item['median_average_batch']:.2f} | "
+                      f"{item['median_intents_per_second']:.0f} | "
+                      f"{item['median_data_syncs']:.0f} | "
+                      f"{item['median_syncs_per_intent']:.4f} | "
+                      f"{item['minimum_intents_per_second']:.0f}–{item['maximum_intents_per_second']:.0f} |\n"
                   )
               handle.write(
-                  "\nBatch size one is the no-amortization control. At larger batches, both arms "
-                  "use the same ingress, ticket, semantic derivation, publication, canonical frame, "
-                  "and recovery paths; only synchronization policy differs.\n"
+                  "\nBatch size one is the no-amortization control. Run order alternates between "
+                  "policies and batch sizes. At larger batches, both arms use the same ingress, ticket, "
+                  "semantic derivation, publication, canonical frame, and recovery paths; only "
+                  "synchronization policy differs.\n"
               )
           PY
 
