@@ -3,10 +3,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{
-    self, Receiver, RecvError, SendError, SyncSender, TryRecvError, TrySendError,
-};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 const PHASE_QUEUED: u8 = 0;
@@ -194,17 +192,14 @@ impl TicketOutcome {
 }
 
 #[derive(Debug)]
-pub enum TicketWaitError {
-    ControllerStopped,
-}
+pub struct TicketWaitError;
 
 impl fmt::Display for TicketWaitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ControllerStopped => {
-                write!(formatter, "queued-intent controller stopped before resolving ticket")
-            }
-        }
+        write!(
+            formatter,
+            "queued-intent controller stopped before resolving ticket"
+        )
     }
 }
 
@@ -242,9 +237,7 @@ impl CommitTicket {
             .receiver
             .take()
             .expect("commit ticket receiver can be consumed only once");
-        let result = receiver
-            .recv()
-            .map_err(|RecvError| TicketWaitError::ControllerStopped);
+        let result = receiver.recv().map_err(|_| TicketWaitError);
         self.observed = true;
         result
     }
@@ -257,12 +250,14 @@ impl CommitTicket {
         match receiver.try_recv() {
             Ok(outcome) => {
                 self.observed = true;
+                self.receiver.take();
                 Ok(Some(outcome))
             }
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 self.observed = true;
-                Err(TicketWaitError::ControllerStopped)
+                self.receiver.take();
+                Err(TicketWaitError)
             }
         }
     }
@@ -375,25 +370,28 @@ struct ControllerMetricsInner {
 }
 
 impl ControllerMetricsInner {
-    fn snapshot(&self, capacity: usize, max_batch: usize) -> QueuedControllerMetrics {
-        QueuedControllerMetrics {
-            capacity,
-            max_batch,
-            submitted: self.submitted.load(Ordering::Relaxed),
-            backpressured: self.backpressured.load(Ordering::Relaxed),
-            claimed: self.claimed.load(Ordering::Relaxed),
-            accepted: self.accepted.load(Ordering::Relaxed),
-            rejected: self.rejected.load(Ordering::Relaxed),
-            epochs: self.epochs.load(Ordering::Relaxed),
-            abandoned_tickets: self.abandoned_tickets.load(Ordering::Relaxed),
-            completion_delivery_failures: self
-                .completion_delivery_failures
-                .load(Ordering::Relaxed),
-            queue_depth: self.queue_depth.load(Ordering::Relaxed),
-            maximum_queue_depth: self.maximum_queue_depth.load(Ordering::Relaxed),
-            in_flight: self.in_flight.load(Ordering::Relaxed),
-            worker_alive: self.worker_alive.load(Ordering::Acquire),
+    fn reserve_ingress(&self, capacity: usize) -> Option<u64> {
+        let capacity = capacity as u64;
+        let mut current = self.queue_depth.load(Ordering::Acquire);
+        loop {
+            if current >= capacity {
+                return None;
+            }
+            match self.queue_depth.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(current + 1),
+                Err(actual) => current = actual,
+            }
         }
+    }
+
+    fn release_ingress(&self) {
+        let previous = self.queue_depth.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "ingress reservation counter underflow");
     }
 
     fn observe_queue_depth(&self, depth: u64) {
@@ -408,6 +406,27 @@ impl ControllerMetricsInner {
                 Ok(_) => break,
                 Err(actual) => previous = actual,
             }
+        }
+    }
+
+    fn snapshot(&self, capacity: usize, max_batch: usize) -> QueuedControllerMetrics {
+        QueuedControllerMetrics {
+            capacity,
+            max_batch,
+            submitted: self.submitted.load(Ordering::Relaxed),
+            backpressured: self.backpressured.load(Ordering::Relaxed),
+            claimed: self.claimed.load(Ordering::Relaxed),
+            accepted: self.accepted.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+            epochs: self.epochs.load(Ordering::Relaxed),
+            abandoned_tickets: self.abandoned_tickets.load(Ordering::Relaxed),
+            completion_delivery_failures: self
+                .completion_delivery_failures
+                .load(Ordering::Relaxed),
+            queue_depth: self.queue_depth.load(Ordering::Acquire),
+            maximum_queue_depth: self.maximum_queue_depth.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Acquire),
+            worker_alive: self.worker_alive.load(Ordering::Acquire),
         }
     }
 }
@@ -489,6 +508,14 @@ impl QueuedIntentController {
     }
 
     pub fn submit(&self, intent: QueuedIntent) -> Result<CommitTicket, SubmitError> {
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(SubmitError::Closed(intent));
+        };
+        let Some(depth) = self.metrics.reserve_ingress(self.capacity) else {
+            self.metrics.backpressured.fetch_add(1, Ordering::Relaxed);
+            return Err(SubmitError::Full(intent));
+        };
+
         let lifecycle = Arc::new(TicketLifecycle::new());
         let (completion, receiver) = mpsc::channel();
         let command = ControllerCommand::Intent(StagedIntent {
@@ -497,16 +524,8 @@ impl QueuedIntentController {
             lifecycle: lifecycle.clone(),
         });
 
-        let Some(sender) = self.sender.as_ref() else {
-            let ControllerCommand::Intent(staged) = command else {
-                unreachable!()
-            };
-            return Err(SubmitError::Closed(staged.intent));
-        };
-
         match sender.try_send(command) {
             Ok(()) => {
-                let depth = self.metrics.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
                 self.metrics.observe_queue_depth(depth);
                 self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
                 Ok(CommitTicket {
@@ -518,10 +537,12 @@ impl QueuedIntentController {
                 })
             }
             Err(TrySendError::Full(ControllerCommand::Intent(staged))) => {
+                self.metrics.release_ingress();
                 self.metrics.backpressured.fetch_add(1, Ordering::Relaxed);
                 Err(SubmitError::Full(staged.intent))
             }
             Err(TrySendError::Disconnected(ControllerCommand::Intent(staged))) => {
+                self.metrics.release_ingress();
                 Err(SubmitError::Closed(staged.intent))
             }
             Err(TrySendError::Full(ControllerCommand::Barrier(_)))
@@ -538,8 +559,8 @@ impl QueuedIntentController {
         let (completed, receiver) = mpsc::channel();
         sender
             .send(ControllerCommand::Barrier(completed))
-            .map_err(|SendError(_)| ControllerStopped)?;
-        receiver.recv().map_err(|RecvError| ControllerStopped)
+            .map_err(|_| ControllerStopped)?;
+        receiver.recv().map_err(|_| ControllerStopped)
     }
 
     pub fn metrics(&self) -> QueuedControllerMetrics {
@@ -556,13 +577,11 @@ impl Drop for QueuedIntentController {
     }
 }
 
-struct WorkerLiveness {
-    metrics: Arc<ControllerMetricsInner>,
-}
+struct WorkerLiveness(Arc<ControllerMetricsInner>);
 
 impl Drop for WorkerLiveness {
     fn drop(&mut self) {
-        self.metrics.worker_alive.store(false, Ordering::Release);
+        self.0.worker_alive.store(false, Ordering::Release);
     }
 }
 
@@ -572,9 +591,7 @@ fn run_worker(
     max_batch: usize,
     metrics: Arc<ControllerMetricsInner>,
 ) {
-    let _liveness = WorkerLiveness {
-        metrics: metrics.clone(),
-    };
+    let _liveness = WorkerLiveness(metrics.clone());
     let mut pending = VecDeque::new();
 
     loop {
@@ -590,7 +607,6 @@ fn run_worker(
             ControllerCommand::Intent(first) => {
                 let mut batch = Vec::with_capacity(max_batch);
                 claim(first, &metrics, &mut batch);
-
                 while batch.len() < max_batch {
                     match receiver.try_recv() {
                         Ok(ControllerCommand::Intent(staged)) => {
@@ -603,7 +619,6 @@ fn run_worker(
                         Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                     }
                 }
-
                 process_batch(&database, batch, &metrics);
             }
             ControllerCommand::Barrier(completed) => {
@@ -618,7 +633,7 @@ fn claim(
     metrics: &ControllerMetricsInner,
     batch: &mut Vec<StagedIntent>,
 ) {
-    metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    metrics.release_ingress();
     metrics.claimed.fetch_add(1, Ordering::Relaxed);
     staged.lifecycle.claim();
     batch.push(staged);
@@ -640,9 +655,8 @@ fn process_batch(
         routes.push((staged.completion, staged.lifecycle));
     }
 
-    // `commit_queued_epoch` returns only after every accepted frame is appended
-    // to the in-memory control store and the global reader head is swapped once
-    // to the epoch tail. Ticket resolution therefore cannot precede publication.
+    // The memory control returns only after accepted frames are appended and
+    // the reader head is swapped once to the epoch tail.
     let plan = database.commit_queued_epoch(intents);
     debug_assert_eq!(plan.outcomes().len(), routes.len());
 
@@ -671,7 +685,6 @@ fn process_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
     fn state_fact(entity: EntityId, value: &str) -> Fact {
@@ -725,9 +738,8 @@ mod tests {
         let second = controller
             .submit(QueuedIntent::new())
             .expect("second intent fills bounded queue");
-        let third = QueuedIntent::new();
         let error = controller
-            .submit(third)
+            .submit(QueuedIntent::new())
             .expect_err("third intent must receive immediate backpressure");
         assert!(matches!(error, SubmitError::Full(_)));
 
@@ -742,6 +754,7 @@ mod tests {
         assert_eq!(metrics.claimed, 2);
         assert_eq!(metrics.accepted, 2);
         assert_eq!(metrics.queue_depth, 0);
+        assert!(metrics.maximum_queue_depth <= metrics.capacity as u64);
     }
 
     #[test]
@@ -801,8 +814,13 @@ mod tests {
 
         let mut first = QueuedIntent::new();
         first.define_fact(slot.clone(), state_fact(EntityId::new(1), "one"));
-        let first = controller.submit(first).expect("first submitted");
-        let first_world = accepted_world(first.wait().expect("first resolves"));
+        let first_world = accepted_world(
+            controller
+                .submit(first)
+                .expect("first submitted")
+                .wait()
+                .expect("first resolves"),
+        );
         assert_eq!(first_world.version(), 1);
 
         let mut rejected = QueuedIntent::new();
@@ -820,9 +838,8 @@ mod tests {
         );
         let third = controller.submit(third).expect("third submitted");
 
-        let rejection = rejected.wait().expect("rejection is delivered");
         assert!(matches!(
-            rejection,
+            rejected.wait().expect("rejection is delivered"),
             TicketOutcome::Rejected(TicketRejection::SlotPrecondition { .. })
         ));
         let third_world = accepted_world(third.wait().expect("third resolves"));
@@ -853,9 +870,47 @@ mod tests {
         let mut intent = QueuedIntent::new();
         intent.define_fact(slot.clone(), state_fact(EntityId::new(7), "visible"));
 
-        let ticket = controller.submit(intent).expect("intent submitted");
-        let world = accepted_world(ticket.wait().expect("ticket resolves"));
+        let world = accepted_world(
+            controller
+                .submit(intent)
+                .expect("intent submitted")
+                .wait()
+                .expect("ticket resolves"),
+        );
         assert_eq!(database.snapshot().id(), world.id());
         assert!(database.snapshot().resolve(&slot).is_some());
+    }
+
+    #[test]
+    fn fast_claims_never_underflow_ingress_accounting() {
+        let database = Arc::new(
+            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
+        );
+        let controller =
+            QueuedIntentController::new(database, 4, 4).expect("controller starts");
+
+        for _ in 0..1_000 {
+            let ticket = loop {
+                match controller.submit(QueuedIntent::new()) {
+                    Ok(ticket) => break ticket,
+                    Err(SubmitError::Full(intent)) => {
+                        thread::yield_now();
+                        match controller.submit(intent) {
+                            Ok(ticket) => break ticket,
+                            Err(SubmitError::Full(_)) => continue,
+                            Err(SubmitError::Closed(_)) => panic!("controller closed"),
+                        }
+                    }
+                    Err(SubmitError::Closed(_)) => panic!("controller closed"),
+                }
+            };
+            accepted_world(ticket.wait().expect("ticket resolves"));
+        }
+        controller.flush().expect("controller drains");
+        let metrics = controller.metrics();
+        assert_eq!(metrics.queue_depth, 0);
+        assert!(metrics.maximum_queue_depth <= metrics.capacity as u64);
+        assert_eq!(metrics.submitted, 1_000);
+        assert_eq!(metrics.claimed, 1_000);
     }
 }
