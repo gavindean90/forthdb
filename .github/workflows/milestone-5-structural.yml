@@ -1,0 +1,113 @@
+name: Milestone 5 Structural Sharing
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  structural-sharing:
+    name: Falsify structural-sharing topology
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /tmp/forthdb-m5-cargo-target
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run complete Rust tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Run million-definition structural benchmark
+        env:
+          FORTHDB_M5_MILLION: "1"
+        run: |
+          mkdir -p "$RUNNER_TEMP/forthdb-m5-artifacts"
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin structural \
+            > "$RUNNER_TEMP/forthdb-m5-artifacts/rust-structural-benchmarks.json"
+
+      - name: Publish structural summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "forthdb-m5-artifacts" / "rust-structural-benchmarks.json"
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("# Milestone 5 Structural Sharing\n\n")
+              if not report.exists():
+                  handle.write("No structural benchmark report was produced.\n")
+                  raise SystemExit(0)
+              data = json.loads(report.read_text())
+              handle.write("## Shared candidate scaling\n\n")
+              handle.write("| Retained definitions | Median candidate | Allocated bytes/candidate | Allocations/candidate |\n")
+              handle.write("| ---: | ---: | ---: | ---: |\n")
+              for item in data["candidate_scaling"]:
+                  handle.write(
+                      f"| {item['retained_definitions']:,} | "
+                      f"{item['median_ns_per_candidate'] / 1_000:.2f} µs | "
+                      f"{item['median_allocated_bytes_per_candidate']:.0f} | "
+                      f"{item['median_allocations_per_candidate']:.1f} |\n"
+                  )
+              handle.write("\n## Legacy controls\n\n")
+              handle.write("| Retained definitions | Median candidate | Allocated bytes/candidate |\n")
+              handle.write("| ---: | ---: | ---: |\n")
+              for item in data["legacy_control"]:
+                  handle.write(
+                      f"| {item['retained_definitions']:,} | "
+                      f"{item['median_ns_per_candidate'] / 1_000:.2f} µs | "
+                      f"{item['median_allocated_bytes_per_candidate']:.0f} |\n"
+                  )
+              handle.write("\n## Current-head reads\n\n")
+              handle.write("| Retained definitions | Median resolve |\n")
+              handle.write("| ---: | ---: |\n")
+              for item in data["read_scaling"]:
+                  handle.write(
+                      f"| {item['retained_definitions']:,} | "
+                      f"{item['median_ns_per_resolve']:.2f} ns |\n"
+                  )
+              retirement = data["snapshot_retirement"]
+              handle.write("\n## Snapshot retirement\n\n")
+              handle.write(
+                  f"Foreground P50/P95/P99/max: "
+                  f"{retirement['p50_ns']} / {retirement['p95_ns']} / "
+                  f"{retirement['p99_ns']} / {retirement['max_ns']} ns.\n\n"
+              )
+              handle.write(
+                  f"Final database drop: {retirement['final_database_drop_ns']} ns.\n"
+              )
+          PY
+
+      - name: Upload Milestone 5 evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: forthdb-milestone-5-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/forthdb-m5-artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Verify repository remains clean
+        if: always()
+        run: |
+          status="$(git status --porcelain)"
+          if [[ -n "$status" ]]; then
+            echo "$status"
+            echo "Milestone 5 execution modified the checkout." >&2
+            exit 1
+          fi
