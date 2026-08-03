@@ -40,22 +40,19 @@ jobs:
 
           controller = Path("rust/crates/forthdb-world/src/file_epoch_controller.rs")
           text = controller.read_text()
-          old = '''        let metrics = controller.metrics();
-          assert!(metrics.queue_wait_nanos > 0);'''
-          new = '''        controller.flush().expect("timing barrier completes");
-          let metrics = controller.metrics();
-          assert!(metrics.queue_wait_nanos > 0);'''
-          if old not in text:
-              raise SystemExit("timing test patch target missing")
-          controller.write_text(text.replace(old, new, 1))
+          needle = "        let metrics = controller.metrics();"
+          index = text.rfind(needle)
+          if index < 0:
+              raise SystemExit("timing metrics read target missing")
+          insertion = '        controller.flush().expect("timing barrier completes");\n'
+          controller.write_text(text[:index] + insertion + text[index:])
 
           writer_lock = Path("rust/crates/forthdb-world/src/writer_lock.rs")
           text = writer_lock.read_text()
-          old = '''    if matches!(source.raw_os_error(), Some(libc::EWOULDBLOCK) | Some(libc::EAGAIN)) {'''
-          new = '''    if matches!(source.raw_os_error(), Some(libc::EWOULDBLOCK)) {'''
+          old = "Some(libc::EWOULDBLOCK) | Some(libc::EAGAIN)"
           if old not in text:
               raise SystemExit("writer-lock errno patch target missing")
-          writer_lock.write_text(text.replace(old, new, 1))
+          writer_lock.write_text(text.replace(old, "Some(libc::EWOULDBLOCK)", 1))
           PY
           rm -rf .m6d
           rm .github/workflows/export-m6d-source.yml
