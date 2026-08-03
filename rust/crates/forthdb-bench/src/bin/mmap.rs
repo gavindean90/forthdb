@@ -78,6 +78,7 @@ fn main() {
         mmap_open_measurement(10_000),
         paired_file_open_measurement(1_000),
         mapped_byte_scan_measurement(10_000, 1_000),
+        mapped_record_lookup_measurement(10_000, 1_000_000),
         mmap_durable_noop_sequence_measurement(100),
         incomplete_tail_recovery_measurement(100),
     ];
@@ -212,6 +213,34 @@ fn mapped_byte_scan_measurement(frame_count: u64, scans: u64) -> Measurement {
             total
         },
         "Sequentially consumes every mapped byte without copying the file into an owned input buffer.",
+    )
+}
+
+fn mapped_record_lookup_measurement(frame_count: u64, lookups: u64) -> Measurement {
+    measure_with_setup(
+        "mapped_record_lookup_10000_frames",
+        "lookup",
+        lookups,
+        move || {
+            let temp = prepare_noop_file(frame_count, "record-lookup");
+            let store = MmapCommitStore::open(temp.path()).expect("mmap history opens");
+            (temp, store)
+        },
+        move |(_temp, store)| {
+            let frame_count = store.mapped_frame_count();
+            let mut total = 0_u64;
+            for index in 0..lookups {
+                let record = store
+                    .mapped_record(index as usize % frame_count)
+                    .expect("mapped record exists");
+                total = total
+                    .wrapping_add(record.len() as u64)
+                    .wrapping_add(u64::from(record[0]))
+                    .wrapping_add(u64::from(record[record.len() - 1]));
+            }
+            total
+        },
+        "Uses the mapped frame-offset directory to return borrowed record slices without allocation or payload decoding.",
     )
 }
 
