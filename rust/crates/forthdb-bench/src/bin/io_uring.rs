@@ -1,7 +1,7 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use forthdb_core::{Atom, Fact, Literal, Predicate, SlotId};
-    use forthdb_world::{Database, FileCommitStore, IoUringCommitStore};
+    use forthdb_world::{CommitStore, Database, FileCommitStore, IoUringCommitStore};
     use serde::Serialize;
     use std::env;
     use std::fs;
