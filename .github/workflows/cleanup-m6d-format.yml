@@ -1,0 +1,50 @@
+name: Clean Milestone 6D Diff
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out head branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Restore unrelated files and commit
+        run: |
+          git fetch origin main
+          git checkout origin/main -- \
+            rust/crates/forthdb-bench/src/bin/queued_epoch.rs \
+            rust/crates/forthdb-bench/src/bin/queued_file_epoch.rs \
+            rust/crates/forthdb-bench/src/bin/queued_ingress.rs \
+            rust/crates/forthdb-bench/src/bin/queued_io_uring_epoch.rs \
+            rust/crates/forthdb-bench/src/bin/structural_isolated.rs \
+            rust/crates/forthdb-bench/src/bin/world.rs \
+            rust/crates/forthdb-bench/src/main.rs \
+            rust/crates/forthdb-conformance/src/executor.rs \
+            rust/crates/forthdb-conformance/src/lib.rs \
+            rust/crates/forthdb-conformance/src/main.rs \
+            rust/crates/forthdb-core/src/shared_wrapper.rs \
+            rust/crates/forthdb-core/tests/structural_parity.rs \
+            rust/crates/forthdb-world/src/file_store.rs \
+            rust/crates/forthdb-world/src/io_uring_epoch_io.rs \
+            rust/crates/forthdb-world/src/io_uring_store.rs \
+            rust/crates/forthdb-world/src/mmap_store.rs \
+            rust/crates/forthdb-world/src/queued.rs \
+            rust/crates/forthdb-world/src/queued_controller.rs \
+            rust/crates/forthdb-world/tests/file_epoch_faults.rs \
+            rust/crates/forthdb-world/tests/file_epoch_parity.rs \
+            rust/crates/forthdb-world/tests/queued_ingress.rs
+          rm .github/workflows/cleanup-m6d-format.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Remove unrelated formatting changes"
+          git push origin "HEAD:${{ github.head_ref }}"
