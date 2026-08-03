@@ -1,6 +1,7 @@
 name: Export Milestone 6D Source
 
 on:
+  pull_request:
   push:
     branches:
       - milestone-6d-lifecycle-safety
