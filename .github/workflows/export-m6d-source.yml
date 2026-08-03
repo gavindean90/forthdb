@@ -1,0 +1,24 @@
+name: Export Milestone 6D Source
+
+on:
+  push:
+    branches:
+      - milestone-6d-lifecycle-safety
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Archive source
+        run: |
+          mkdir -p "$RUNNER_TEMP/forthdb-source"
+          tar --exclude=.git -czf "$RUNNER_TEMP/forthdb-source/forthdb-m6d-source.tar.gz" .
+      - uses: actions/upload-artifact@v6
+        with:
+          name: forthdb-m6d-source
+          path: ${{ runner.temp }}/forthdb-source/forthdb-m6d-source.tar.gz
+          retention-days: 3
