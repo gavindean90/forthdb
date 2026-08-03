@@ -10,3 +10,4 @@ path = "src/wrapper.rs"
 
 [dependencies]
 forthdb-core = { path = "../forthdb-core" }
+memmap2 = "0.9"
