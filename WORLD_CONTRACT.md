@@ -65,15 +65,19 @@ A Commit Store records Commit Frames. Storage technology—memory, ordinary file
 
 A fallible epoch store must publish nothing after an observed epoch failure. It may accept later writes only after rollback has been synchronized and verified against recovery. If repair cannot be verified, the store must enter a poisoned state and reject subsequent writes.
 
+A poisoned physical store does not retroactively invalidate immutable Worlds and Commit Frames that were verified and published before the failure. It must fence later writes and any operation that claims to inspect or extend the uncertain physical tail.
+
 ## Recovery
 
 Recovery reconstructs the newest valid World from committed history, ignoring incomplete frames and never inventing state.
 
 Unless a future format adds an explicit atomic epoch envelope, crash recovery may expose the longest sound Commit Frame prefix of an interrupted epoch. That is truthful prefix recovery, not all-or-none epoch recovery.
 
+A complete malformed frame, checksum mismatch, or nonlinear history is corruption and must not be silently discarded as an incomplete tail.
+
 ## Derived Structures
 
-Indexes, caches, compiled queries, persistent-node topology, reaper metadata, ingress accounting, ticket metadata, and storage-specific directories are derived state and must remain reconstructible from committed history.
+Indexes, caches, compiled queries, persistent-node topology, reaper metadata, ingress accounting, ticket metadata, epoch arenas, repair checkpoints, and storage-specific directories are derived state and must remain reconstructible from committed history.
 
 ## Historical Truth
 
@@ -88,5 +92,9 @@ History is authoritative. Rollback creates a new World rather than erasing prior
 5. Structurally shared worlds and background semantic-kernel retirement
 6. Queued-intent semantic epoch control
 7. Bounded ingress and commit-ticket lifecycle
+8. Ordinary-file durability epochs with verified repair and poisoning
 
-Detailed Milestone 6 contract: [`rust/QUEUED_DURABILITY.md`](rust/QUEUED_DURABILITY.md).
+Detailed Milestone 6 contracts:
+
+- [`rust/QUEUED_DURABILITY.md`](rust/QUEUED_DURABILITY.md)
+- [`rust/FILE_EPOCHS.md`](rust/FILE_EPOCHS.md)
