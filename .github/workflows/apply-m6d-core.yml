@@ -35,6 +35,28 @@ jobs:
           base64 -d "$RUNNER_TEMP/m6d-core-bundle.b64" > "$RUNNER_TEMP/m6d-core-bundle.tar.gz"
           echo "82f2a60897e04a768f5e37e094a8ab6873dfd8c14fe88a514fd1098925b82c6c  $RUNNER_TEMP/m6d-core-bundle.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/m6d-core-bundle.tar.gz"
+          python - <<'PY'
+          from pathlib import Path
+
+          controller = Path("rust/crates/forthdb-world/src/file_epoch_controller.rs")
+          text = controller.read_text()
+          old = '''        let metrics = controller.metrics();
+          assert!(metrics.queue_wait_nanos > 0);'''
+          new = '''        controller.flush().expect("timing barrier completes");
+          let metrics = controller.metrics();
+          assert!(metrics.queue_wait_nanos > 0);'''
+          if old not in text:
+              raise SystemExit("timing test patch target missing")
+          controller.write_text(text.replace(old, new, 1))
+
+          writer_lock = Path("rust/crates/forthdb-world/src/writer_lock.rs")
+          text = writer_lock.read_text()
+          old = '''    if matches!(source.raw_os_error(), Some(libc::EWOULDBLOCK) | Some(libc::EAGAIN)) {'''
+          new = '''    if matches!(source.raw_os_error(), Some(libc::EWOULDBLOCK)) {'''
+          if old not in text:
+              raise SystemExit("writer-lock errno patch target missing")
+          writer_lock.write_text(text.replace(old, new, 1))
+          PY
           rm -rf .m6d
           rm .github/workflows/export-m6d-source.yml
           rm .github/workflows/apply-m6d-core.yml
