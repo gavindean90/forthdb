@@ -82,6 +82,12 @@ The transport reports:
 
 These metrics are accumulated by `FileEpochStore` beside the established repair and commit counters.
 
+## Benchmark control
+
+The dedicated gate runs the ordinary-file per-epoch transport and all three ring strategies through the same durable queued controller over a 100,000-definition base. It tests maximum batch sizes one and sixteen across four rotating rounds, so every transport occupies every warm-up and filesystem-order position once. Every sample reopens through `FileCommitStore` and verifies the exact final frame count.
+
+Batch size one is the no-amortization control. At batch size sixteen the transport metrics distinguish one arena write, one vectored write, and true multi-write queue depth while preserving one durability barrier per epoch.
+
 ## Falsification boundaries
 
 Milestone 6C fails if any transport:
