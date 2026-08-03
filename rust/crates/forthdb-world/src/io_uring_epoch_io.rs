@@ -213,109 +213,23 @@ impl IoUringEpochFileIo {
             return Err((EpochIoPhase::EpochWrite, reset.unwrap_or(error)));
         }
 
-        let mut write_results = vec![None; expected_writes.len()];
-        let mut fsync_result = None;
-        let mut unexpected = None;
+        let mut completions = Vec::with_capacity(expected_cqes);
         {
             let ring = self
                 .require_ring()
                 .map_err(|error| (EpochIoPhase::EpochWrite, error))?;
             let mut completion = ring.completion();
             while let Some(entry) = completion.next() {
-                metrics.completion_events += 1;
-                let user_data = entry.user_data();
-                if user_data == FSYNC_USER_DATA {
-                    if fsync_result.replace(entry.result()).is_some() {
-                        unexpected = Some("duplicate fsync completion".to_owned());
-                    }
-                    continue;
-                }
-                if user_data & WRITE_USER_DATA_MASK == WRITE_USER_DATA_TAG {
-                    let index = (user_data & 0xffff_ffff) as usize;
-                    if let Some(slot) = write_results.get_mut(index) {
-                        if slot.replace(entry.result()).is_some() {
-                            unexpected = Some(format!("duplicate write completion {index}"));
-                        }
-                    } else {
-                        unexpected = Some(format!("out-of-range write completion {index}"));
-                    }
-                } else {
-                    unexpected = Some(format!("unknown completion user_data {user_data:#x}"));
-                }
+                completions.push((entry.user_data(), entry.result()));
             }
         }
+        metrics.completion_events += completions.len() as u64;
 
-        let fail = |phase: EpochIoPhase, message: String| {
-            (
-                phase,
-                std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )
-        };
-
-        if let Some(message) = unexpected {
-            let _ = self.discard_and_recreate_ring();
-            return Err(fail(EpochIoPhase::EpochWrite, message));
-        }
-        if metrics.completion_events as usize != expected_cqes {
-            let actual = metrics.completion_events;
-            let _ = self.discard_and_recreate_ring();
-            return Err(fail(
-                EpochIoPhase::EpochWrite,
-                format!("expected {expected_cqes} CQEs, observed {actual}"),
-            ));
-        }
-
-        for (index, ((_, expected), result)) in expected_writes
-            .iter()
-            .zip(write_results.into_iter())
-            .enumerate()
-        {
-            let result = result.ok_or_else(|| {
-                fail(
-                    EpochIoPhase::EpochWrite,
-                    format!("missing write completion {index}"),
-                )
-            })?;
-            if result < 0 {
-                let _ = self.discard_and_recreate_ring();
-                return Err((
-                    EpochIoPhase::EpochWrite,
-                    std::io::Error::from_raw_os_error(-result),
-                ));
-            }
-            if result as usize != *expected {
-                let _ = self.discard_and_recreate_ring();
-                return Err((
-                    EpochIoPhase::EpochWrite,
-                    std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        format!(
-                            "io_uring write {index} completed {result} of {expected} bytes"
-                        ),
-                    ),
-                ));
-            }
-        }
-
-        let fsync_result = fsync_result.ok_or_else(|| {
-            fail(
-                EpochIoPhase::EpochSync,
-                "missing data-synchronization completion".to_owned(),
-            )
-        })?;
-        if fsync_result < 0 {
-            let _ = self.discard_and_recreate_ring();
-            return Err((
-                EpochIoPhase::EpochSync,
-                std::io::Error::from_raw_os_error(-fsync_result),
-            ));
-        }
-        if fsync_result != 0 {
-            let _ = self.discard_and_recreate_ring();
-            return Err(fail(
-                EpochIoPhase::EpochSync,
-                format!("io_uring fsync returned unexpected result {fsync_result}"),
-            ));
+        if let Err(error) = validate_completion_batch(expected_writes, expected_cqes, &completions) {
+            let reset = self.discard_and_recreate_ring().err();
+            return Err(reset
+                .map(|source| (EpochIoPhase::EpochWrite, source))
+                .unwrap_or(error));
         }
         Ok(())
     }
@@ -492,6 +406,119 @@ impl IoUringEpochFileIo {
         self.submit_entries(&entries, &expected, entries.len(), metrics)
     }
 }
+
+fn invalid_completion(phase: EpochIoPhase, message: impl Into<String>) -> (EpochIoPhase, std::io::Error) {
+    (
+        phase,
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()),
+    )
+}
+
+fn validate_completion_batch(
+    expected_writes: &[(u64, usize)],
+    expected_cqes: usize,
+    completions: &[(u64, i32)],
+) -> Result<(), (EpochIoPhase, std::io::Error)> {
+    if completions.len() != expected_cqes {
+        return Err(invalid_completion(
+            EpochIoPhase::EpochWrite,
+            format!(
+                "expected {expected_cqes} CQEs, observed {}",
+                completions.len()
+            ),
+        ));
+    }
+
+    let mut write_results = vec![None; expected_writes.len()];
+    let mut fsync_result = None;
+    for (user_data, result) in completions.iter().copied() {
+        if user_data == FSYNC_USER_DATA {
+            if fsync_result.replace(result).is_some() {
+                return Err(invalid_completion(
+                    EpochIoPhase::EpochSync,
+                    "duplicate fsync completion",
+                ));
+            }
+            continue;
+        }
+        if user_data & WRITE_USER_DATA_MASK != WRITE_USER_DATA_TAG {
+            return Err(invalid_completion(
+                EpochIoPhase::EpochWrite,
+                format!("unknown completion user_data {user_data:#x}"),
+            ));
+        }
+        let index = (user_data & 0xffff_ffff) as usize;
+        let slot = write_results.get_mut(index).ok_or_else(|| {
+            invalid_completion(
+                EpochIoPhase::EpochWrite,
+                format!("out-of-range write completion {index}"),
+            )
+        })?;
+        if slot.replace(result).is_some() {
+            return Err(invalid_completion(
+                EpochIoPhase::EpochWrite,
+                format!("duplicate write completion {index}"),
+            ));
+        }
+    }
+
+    for (index, ((expected_user_data, expected_length), result)) in expected_writes
+        .iter()
+        .zip(write_results.into_iter())
+        .enumerate()
+    {
+        if *expected_user_data != write_user_data(index) {
+            return Err(invalid_completion(
+                EpochIoPhase::EpochWrite,
+                format!("noncanonical expected write identifier at index {index}"),
+            ));
+        }
+        let result = result.ok_or_else(|| {
+            invalid_completion(
+                EpochIoPhase::EpochWrite,
+                format!("missing write completion {index}"),
+            )
+        })?;
+        if result < 0 {
+            return Err((
+                EpochIoPhase::EpochWrite,
+                std::io::Error::from_raw_os_error(-result),
+            ));
+        }
+        if result as usize != *expected_length {
+            return Err((
+                EpochIoPhase::EpochWrite,
+                std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!(
+                        "io_uring write {index} completed {result} of {expected_length} bytes"
+                    ),
+                ),
+            ));
+        }
+    }
+
+    let fsync_result = fsync_result.ok_or_else(|| {
+        invalid_completion(
+            EpochIoPhase::EpochSync,
+            "missing data-synchronization completion",
+        )
+    })?;
+    if fsync_result < 0 {
+        return Err((
+            EpochIoPhase::EpochSync,
+            std::io::Error::from_raw_os_error(-fsync_result),
+        ));
+    }
+    if fsync_result != 0 {
+        return Err(invalid_completion(
+            EpochIoPhase::EpochSync,
+            format!("io_uring fsync returned unexpected result {fsync_result}"),
+        ));
+    }
+    Ok(())
+}
+
 
 fn write_user_data(index: usize) -> u64 {
     WRITE_USER_DATA_TAG | index as u64
@@ -687,6 +714,73 @@ mod tests {
             database.commit(transaction).expect("memory commit succeeds");
         }
         database.frames()
+    }
+
+    #[test]
+    fn completion_validation_rejects_missing_duplicate_unknown_short_and_failed_cqes() {
+        let expected = vec![(write_user_data(0), 11), (write_user_data(1), 17)];
+        let valid = vec![
+            (write_user_data(1), 17),
+            (FSYNC_USER_DATA, 0),
+            (write_user_data(0), 11),
+        ];
+        validate_completion_batch(&expected, 3, &valid)
+            .expect("out-of-order valid completions are accepted");
+
+        let missing = vec![(write_user_data(0), 11), (FSYNC_USER_DATA, 0)];
+        assert!(matches!(
+            validate_completion_batch(&expected, 3, &missing),
+            Err((EpochIoPhase::EpochWrite, _))
+        ));
+
+        let duplicate = vec![
+            (write_user_data(0), 11),
+            (write_user_data(0), 11),
+            (FSYNC_USER_DATA, 0),
+        ];
+        assert!(matches!(
+            validate_completion_batch(&expected, 3, &duplicate),
+            Err((EpochIoPhase::EpochWrite, _))
+        ));
+
+        let unknown = vec![
+            (write_user_data(0), 11),
+            (0xdead_beef, 17),
+            (FSYNC_USER_DATA, 0),
+        ];
+        assert!(matches!(
+            validate_completion_batch(&expected, 3, &unknown),
+            Err((EpochIoPhase::EpochWrite, _))
+        ));
+
+        let short = vec![
+            (write_user_data(0), 10),
+            (write_user_data(1), 17),
+            (FSYNC_USER_DATA, 0),
+        ];
+        let (_, short_error) =
+            validate_completion_batch(&expected, 3, &short).expect_err("short write fails");
+        assert_eq!(short_error.kind(), std::io::ErrorKind::WriteZero);
+
+        let failed_write = vec![
+            (write_user_data(0), -5),
+            (write_user_data(1), 17),
+            (FSYNC_USER_DATA, 0),
+        ];
+        let (phase, failed_write_error) = validate_completion_batch(&expected, 3, &failed_write)
+            .expect_err("negative write result fails");
+        assert_eq!(phase, EpochIoPhase::EpochWrite);
+        assert_eq!(failed_write_error.raw_os_error(), Some(5));
+
+        let failed_sync = vec![
+            (write_user_data(0), 11),
+            (write_user_data(1), 17),
+            (FSYNC_USER_DATA, -5),
+        ];
+        let (phase, failed_sync_error) = validate_completion_batch(&expected, 3, &failed_sync)
+            .expect_err("negative sync result fails");
+        assert_eq!(phase, EpochIoPhase::EpochSync);
+        assert_eq!(failed_sync_error.raw_os_error(), Some(5));
     }
 
     #[test]
