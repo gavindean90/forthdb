@@ -53,21 +53,22 @@ jobs:
                   raise SystemExit(0)
               data = json.loads(report.read_text())
               handle.write(
-                  f"Complete durable controller over {data['retained_definitions']:,} retained definitions, "
-                  f"capacity {data['capacity']}, maximum batch {data['max_batch']}.\n\n"
+                  f"Complete durable controller over {data['retained_definitions']:,} retained definitions "
+                  f"with ingress capacity {data['capacity']}.\n\n"
               )
-              handle.write("| Policy | Intents | Epochs | Avg batch | Intents/s | Data syncs | Syncs/intent | Backpressure |\n")
-              handle.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+              handle.write("| Policy | Max batch | Intents | Epochs | Avg batch | Intents/s | Data syncs | Syncs/intent | Backpressure |\n")
+              handle.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
               for item in data["measurements"]:
                   handle.write(
-                      f"| {item['policy']} | {item['intents']} | {item['epochs']} | "
-                      f"{item['average_batch']:.2f} | {item['intents_per_second']:.0f} | "
-                      f"{item['data_syncs']} | {item['syncs_per_intent']:.4f} | "
-                      f"{item['backpressure_events']} |\n"
+                      f"| {item['policy']} | {item['max_batch']} | {item['intents']} | "
+                      f"{item['epochs']} | {item['average_batch']:.2f} | "
+                      f"{item['intents_per_second']:.0f} | {item['data_syncs']} | "
+                      f"{item['syncs_per_intent']:.4f} | {item['backpressure_events']} |\n"
                   )
               handle.write(
-                  "\nBoth arms use the same ingress, ticket, semantic derivation, publication, "
-                  "canonical frame, and recovery paths. Only synchronization policy differs.\n"
+                  "\nBatch size one is the no-amortization control. At larger batches, both arms "
+                  "use the same ingress, ticket, semantic derivation, publication, canonical frame, "
+                  "and recovery paths; only synchronization policy differs.\n"
               )
           PY
 
