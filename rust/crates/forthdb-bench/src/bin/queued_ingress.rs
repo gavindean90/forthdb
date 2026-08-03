@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 const RETAINED_DEFINITIONS: usize = 100_000;
 const CAPACITY: usize = 256;
 const MAX_BATCH: usize = 16;
+const BACKPRESSURE_PAUSE: Duration = Duration::from_micros(10);
 
 #[derive(Serialize)]
 struct Environment {
@@ -44,6 +45,7 @@ struct Report {
     retained_definitions: usize,
     capacity: usize,
     max_batch: usize,
+    backpressure_pause_ns: u128,
     environment: Environment,
     measurements: Vec<Measurement>,
     total_elapsed_ms: u128,
@@ -135,7 +137,7 @@ fn run_workload(
                         }
                         Err(SubmitError::Full(returned)) => {
                             intent = returned;
-                            thread::yield_now();
+                            thread::sleep(BACKPRESSURE_PAUSE);
                         }
                         Err(SubmitError::Closed(_)) => panic!("controller closed"),
                     }
@@ -217,6 +219,7 @@ fn main() {
         retained_definitions: RETAINED_DEFINITIONS,
         capacity: CAPACITY,
         max_batch: MAX_BATCH,
+        backpressure_pause_ns: BACKPRESSURE_PAUSE.as_nanos(),
         environment: Environment {
             os: env::consts::OS,
             architecture: env::consts::ARCH,
