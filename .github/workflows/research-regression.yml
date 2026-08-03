@@ -84,6 +84,11 @@ jobs:
             -p forthdb-bench \
             --bin mmap \
             > "$FORTHDB_REPORT_DIR/rust-mmap-benchmarks.json"
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin io_uring \
+            > "$FORTHDB_REPORT_DIR/rust-io-uring-benchmarks.json"
           python research_regression.py --output-dir "$FORTHDB_REPORT_DIR"
 
       - name: Publish regression summary
@@ -124,6 +129,10 @@ jobs:
                   "rust-mmap-benchmarks.json",
                   "Rust MmapCommitStore benchmark observation",
               ),
+              (
+                  "rust-io-uring-benchmarks.json",
+                  "Rust IoUringCommitStore benchmark observation",
+              ),
           ]
 
           with summary.open("a", encoding="utf-8") as handle:
@@ -136,6 +145,11 @@ jobs:
                   handle.write(
                       "Hosted-runner timings are observations, not merge thresholds or cross-system claims.\n\n"
                   )
+                  if data.get("status") == "unavailable":
+                      handle.write(
+                          f"Unavailable on this runner: `{data.get('availability_error', 'unknown error')}`.\n"
+                      )
+                      continue
                   handle.write(
                       "| Workload | Median ns/op | Median ops/s | Operations/sample |\n"
                   )
