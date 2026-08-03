@@ -45,6 +45,16 @@ impl ReaperCounters {
     }
 }
 
+struct WorkerLiveness {
+    counters: Arc<ReaperCounters>,
+}
+
+impl Drop for WorkerLiveness {
+    fn drop(&mut self) {
+        self.counters.alive.store(false, Ordering::Release);
+    }
+}
+
 struct KernelReaper {
     queue: Arc<ArrayQueue<engine::ForthDb>>,
     overflow: Arc<SegQueue<engine::ForthDb>>,
@@ -70,9 +80,14 @@ impl KernelReaper {
         let worker_counters = counters.clone();
         thread::Builder::new()
             .name("forthdb-world-reaper".to_owned())
-            .spawn(move || loop {
-                let _ = receiver.recv_timeout(Duration::from_millis(10));
-                drain_available(&worker_queue, &worker_overflow, &worker_counters);
+            .spawn(move || {
+                let _liveness = WorkerLiveness {
+                    counters: worker_counters.clone(),
+                };
+                loop {
+                    let _ = receiver.recv_timeout(Duration::from_millis(10));
+                    drain_available(&worker_queue, &worker_overflow, &worker_counters);
+                }
             })
             .expect("ForthDB world reaper thread must start");
 
@@ -102,7 +117,7 @@ impl KernelReaper {
         let started = Instant::now();
         let _ = self.wake.try_send(());
         while self.counters.queued.load(Ordering::Acquire) != 0 {
-            if started.elapsed() >= timeout {
+            if !self.counters.alive.load(Ordering::Acquire) || started.elapsed() >= timeout {
                 return false;
             }
             thread::sleep(Duration::from_micros(100));
