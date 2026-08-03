@@ -25,6 +25,7 @@ pub struct MmapCommitStore {
     file: File,
     mapping: Option<Mmap>,
     frames: Vec<Arc<CommitFrame>>,
+    spans: Vec<FrameSpan>,
     recovered_tail_bytes: u64,
     writer: Option<FileCommitStore>,
     last_remap_error: Option<String>,
@@ -59,7 +60,7 @@ impl MmapCommitStore {
         }
 
         let mut mapping = map_file(&file)?;
-        let (frames, last_good_offset) = decode_file(&mapping)?;
+        let (frames, spans, last_good_offset) = decode_file(&mapping)?;
         let recovered_tail_bytes = mapping.len().saturating_sub(last_good_offset) as u64;
 
         if recovered_tail_bytes != 0 {
@@ -77,6 +78,7 @@ impl MmapCommitStore {
             file,
             mapping: Some(mapping),
             frames,
+            spans,
             recovered_tail_bytes,
             writer: None,
             last_remap_error: None,
@@ -110,6 +112,26 @@ impl MmapCommitStore {
         }
     }
 
+    pub fn mapped_frame_count(&self) -> usize {
+        if self.mapping.is_some() {
+            self.spans.len()
+        } else {
+            0
+        }
+    }
+
+    pub fn mapped_record(&self, index: usize) -> Option<&[u8]> {
+        let mapping = self.mapping.as_ref()?;
+        let span = self.spans.get(index)?;
+        Some(&mapping[span.record_start..span.record_end])
+    }
+
+    pub fn mapped_payload(&self, index: usize) -> Option<&[u8]> {
+        let mapping = self.mapping.as_ref()?;
+        let span = self.spans.get(index)?;
+        Some(&mapping[span.payload_start..span.payload_end])
+    }
+
     pub fn last_remap_error(&self) -> Option<&str> {
         self.last_remap_error.as_deref()
     }
@@ -117,6 +139,17 @@ impl MmapCommitStore {
     pub fn refresh_mapping(&mut self) -> Result<(), MmapCommitStoreError> {
         self.mapping.take();
         let mapping = map_file(&self.file)?;
+        let (frames, spans, last_good_offset) = decode_file(&mapping)?;
+        if last_good_offset != mapping.len() {
+            return Err(FileCommitStoreError::CorruptFrame {
+                offset: last_good_offset as u64,
+                reason: "refresh found an incomplete tail".to_owned(),
+            });
+        }
+        World::reconstruct(&frames).map_err(FileCommitStoreError::History)?;
+        self.frames = frames;
+        self.spans = spans;
+        self.writer = None;
         self.mapping = Some(mapping);
         self.last_remap_error = None;
         Ok(())
@@ -153,13 +186,19 @@ impl MmapCommitStore {
         Ok(())
     }
 
-    fn remap_after_durable_append(&mut self) {
+    fn remap_after_durable_append(&mut self, record_start: usize) {
         self.mapping.take();
         match map_file(&self.file) {
-            Ok(mapping) => {
-                self.mapping = Some(mapping);
-                self.last_remap_error = None;
-            }
+            Ok(mapping) => match decode_complete_span(&mapping, record_start) {
+                Ok(span) => {
+                    self.spans.push(span);
+                    self.mapping = Some(mapping);
+                    self.last_remap_error = None;
+                }
+                Err(error) => {
+                    self.last_remap_error = Some(error.to_string());
+                }
+            },
             Err(error) => {
                 self.last_remap_error = Some(error.to_string());
             }
@@ -173,6 +212,8 @@ impl CommitStore for MmapCommitStore {
     fn append(&mut self, frame: Arc<CommitFrame>) -> Result<(), Self::Error> {
         self.validate_append(&frame)?;
 
+        let record_start = self.file_len()? as usize;
+
         if self.writer.is_none() {
             self.writer = Some(FileCommitStore::open(&self.path)?);
         }
@@ -183,7 +224,7 @@ impl CommitStore for MmapCommitStore {
 
         self.frames.push(frame);
         self.recovered_tail_bytes = 0;
-        self.remap_after_durable_append();
+        self.remap_after_durable_append(record_start);
         Ok(())
     }
 
@@ -272,6 +313,10 @@ mod mmap_tests {
         let store = MmapCommitStore::open(temp.path()).expect("mmap store opens");
         assert_eq!(store.len(), 1);
         assert!(store.mapping_is_current());
+        assert_eq!(store.mapped_frame_count(), 1);
+        assert!(store.mapped_record(0).expect("record").starts_with(FRAME_MAGIC));
+        assert!(store.mapped_record(0).expect("record").ends_with(FRAME_TRAILER));
+        assert!(!store.mapped_payload(0).expect("payload").is_empty());
         assert_eq!(&store.mapped_bytes().expect("mapping")[..8], FILE_MAGIC);
         let database = Database::new(store).expect("mapped history reconstructs");
         assert_eq!(database.snapshot().id(), world_id);
