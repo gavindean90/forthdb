@@ -41,6 +41,18 @@ pub enum FileEpochSyncPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EpochPersistMetrics {
+    pub data_writes: u64,
+    pub data_syncs: u64,
+    pub bytes_written: u64,
+    pub submission_calls: u64,
+    pub completion_events: u64,
+    pub maximum_in_flight_writes: u64,
+    pub iovecs_submitted: u64,
+    pub arena_bytes_copied: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FileEpochMetrics {
     pub epoch_attempts: u64,
     pub epochs_committed: u64,
@@ -51,6 +63,26 @@ pub struct FileEpochMetrics {
     pub repairs_succeeded: u64,
     pub repairs_failed: u64,
     pub bytes_written: u64,
+    pub submission_calls: u64,
+    pub completion_events: u64,
+    pub maximum_in_flight_writes: u64,
+    pub iovecs_submitted: u64,
+    pub arena_bytes_copied: u64,
+}
+
+impl FileEpochMetrics {
+    fn record_persist(&mut self, metrics: EpochPersistMetrics) {
+        self.data_writes += metrics.data_writes;
+        self.data_syncs += metrics.data_syncs;
+        self.bytes_written += metrics.bytes_written;
+        self.submission_calls += metrics.submission_calls;
+        self.completion_events += metrics.completion_events;
+        self.maximum_in_flight_writes = self
+            .maximum_in_flight_writes
+            .max(metrics.maximum_in_flight_writes);
+        self.iovecs_submitted += metrics.iovecs_submitted;
+        self.arena_bytes_copied += metrics.arena_bytes_copied;
+    }
 }
 
 /// Narrow syscall boundary used by the ordinary-file epoch state machine.
@@ -58,6 +90,24 @@ pub struct FileEpochMetrics {
 /// Production delegates to a real `std::fs::File`. Tests wrap the same real
 /// file and inject deterministic outcomes at named semantic phases.
 pub trait EpochFileIo: Send {
+    /// Optional whole-epoch transport hook.
+    ///
+    /// Implementations such as io_uring receive the independently encoded
+    /// canonical records before the ordinary-file control copies or writes
+    /// them. Returning `None` selects the established `write_at`/`sync_data`
+    /// path. Returning `Some` must not return until every submitted operation
+    /// has completed and all borrowed record buffers are no longer referenced.
+    fn persist_epoch(
+        &mut self,
+        _start_offset: u64,
+        _records: &[Vec<u8>],
+    ) -> Option<(
+        EpochPersistMetrics,
+        Result<(), (EpochIoPhase, std::io::Error)>,
+    )> {
+        None
+    }
+
     fn len(&mut self, phase: EpochIoPhase) -> std::io::Result<u64>;
     fn write_at(
         &mut self,
@@ -356,9 +406,16 @@ impl<I: EpochFileIo> FileEpochStore<I> {
         let checkpoint = self.checkpoint(start_offset);
         self.metrics.epoch_attempts += 1;
 
-        let result = match self.policy {
-            FileEpochSyncPolicy::PerFrame => self.write_per_frame(start_offset, &records),
-            FileEpochSyncPolicy::PerEpoch => self.write_one_epoch(start_offset, &records),
+        let result = if let Some((transport_metrics, result)) =
+            self.io.persist_epoch(start_offset, &records)
+        {
+            self.metrics.record_persist(transport_metrics);
+            result
+        } else {
+            match self.policy {
+                FileEpochSyncPolicy::PerFrame => self.write_per_frame(start_offset, &records),
+                FileEpochSyncPolicy::PerEpoch => self.write_one_epoch(start_offset, &records),
+            }
         };
 
         if let Err((phase, source)) = result {
