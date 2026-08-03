@@ -1,0 +1,30 @@
+name: Apply Milestone 6D Core
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out head branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: true
+
+      - name: Apply lifecycle implementation
+        run: |
+          tar -xzf .m6d/core-bundle.tar.gz
+          rm -rf .m6d
+          rm .github/workflows/export-m6d-source.yml
+          rm .github/workflows/apply-m6d-core.yml
+          cargo fmt --manifest-path rust/Cargo.toml --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Implement controller lifecycle and writer safety"
+          git push origin "HEAD:${{ github.head_ref }}"
