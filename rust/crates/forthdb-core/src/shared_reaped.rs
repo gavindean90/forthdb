@@ -6,10 +6,9 @@ use crate::{
     BoundValue, EntityId, Fact, Pattern, Predicate, QueryOptions, QueryResult, Record, RecordId,
     SlotId, SourceTerm, Symbol,
 };
-use crossbeam_queue::ArrayQueue;
-use std::collections::VecDeque;
+use crossbeam_queue::{ArrayQueue, SegQueue};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,7 +47,7 @@ impl ReaperCounters {
 
 struct KernelReaper {
     queue: Arc<ArrayQueue<engine::ForthDb>>,
-    overflow: Arc<Mutex<VecDeque<engine::ForthDb>>>,
+    overflow: Arc<SegQueue<engine::ForthDb>>,
     wake: mpsc::SyncSender<()>,
     counters: Arc<ReaperCounters>,
 }
@@ -56,7 +55,7 @@ struct KernelReaper {
 impl KernelReaper {
     fn new() -> Self {
         let queue = Arc::new(ArrayQueue::new(REAPER_QUEUE_CAPACITY));
-        let overflow = Arc::new(Mutex::new(VecDeque::new()));
+        let overflow = Arc::new(SegQueue::new());
         let counters = Arc::new(ReaperCounters {
             queued: AtomicUsize::new(0),
             retired: AtomicU64::new(0),
@@ -71,15 +70,9 @@ impl KernelReaper {
         let worker_counters = counters.clone();
         thread::Builder::new()
             .name("forthdb-world-reaper".to_owned())
-            .spawn(move || {
-                loop {
-                    let _ = receiver.recv_timeout(Duration::from_millis(10));
-                    drain_available(
-                        &worker_queue,
-                        &worker_overflow,
-                        &worker_counters,
-                    );
-                }
+            .spawn(move || loop {
+                let _ = receiver.recv_timeout(Duration::from_millis(10));
+                drain_available(&worker_queue, &worker_overflow, &worker_counters);
             })
             .expect("ForthDB world reaper thread must start");
 
@@ -96,10 +89,7 @@ impl KernelReaper {
         self.counters.queued.fetch_add(1, Ordering::Release);
         if let Err(kernel) = self.queue.push(kernel) {
             self.counters.overflow.fetch_add(1, Ordering::Relaxed);
-            self.overflow
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_back(kernel);
+            self.overflow.push(kernel);
         }
         let _ = self.wake.try_send(());
     }
@@ -124,7 +114,7 @@ impl KernelReaper {
 
 fn drain_available(
     queue: &ArrayQueue<engine::ForthDb>,
-    overflow: &Mutex<VecDeque<engine::ForthDb>>,
+    overflow: &SegQueue<engine::ForthDb>,
     counters: &ReaperCounters,
 ) {
     while let Some(kernel) = queue.pop() {
@@ -133,14 +123,7 @@ fn drain_available(
         counters.queued.fetch_sub(1, Ordering::Release);
     }
 
-    loop {
-        let kernel = overflow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pop_front();
-        let Some(kernel) = kernel else {
-            break;
-        };
+    while let Some(kernel) = overflow.pop() {
         drop(kernel);
         counters.reaped.fetch_add(1, Ordering::Relaxed);
         counters.queued.fetch_sub(1, Ordering::Release);
