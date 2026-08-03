@@ -24,6 +24,21 @@ Queued-intent preconditions are evaluated against the private predecessor assign
 
 A rejected intent produces no World or Commit Frame and consumes neither version nor allocator state.
 
+## Bounded Admission and Tickets
+
+Queued ingress is bounded before candidate derivation. A saturated ingress rejects the submission immediately and returns ownership of the unadmitted intent.
+
+Successful admission creates a `CommitTicket` with an observable queued, claimed, and resolved lifecycle. Ticket lifetime does not control intent lifetime.
+
+Dropping or otherwise abandoning a ticket:
+
+- does not remove an admitted intent from ingress
+- does not cancel a claimed intent
+- does not change epoch order
+- does not alter canonical history
+
+After the authoritative transition completes, result delivery may fail because the caller abandoned its ticket. That is a notification failure, not a commit rollback.
+
 ## Candidate World
 
 A Candidate World is private during derivation and validation. It becomes a committed World only after its Commit Frame satisfies the active publication and durability contract; otherwise it is discarded.
@@ -58,7 +73,7 @@ Unless a future format adds an explicit atomic epoch envelope, crash recovery ma
 
 ## Derived Structures
 
-Indexes, caches, compiled queries, persistent-node topology, reaper metadata, and storage-specific directories are derived state and must remain reconstructible from committed history.
+Indexes, caches, compiled queries, persistent-node topology, reaper metadata, ingress accounting, ticket metadata, and storage-specific directories are derived state and must remain reconstructible from committed history.
 
 ## Historical Truth
 
@@ -72,5 +87,6 @@ History is authoritative. Rollback creates a new World rather than erasing prior
 4. `IoUringCommitStore`
 5. Structurally shared worlds and background semantic-kernel retirement
 6. Queued-intent semantic epoch control
+7. Bounded ingress and commit-ticket lifecycle
 
 Detailed Milestone 6 contract: [`rust/QUEUED_DURABILITY.md`](rust/QUEUED_DURABILITY.md).

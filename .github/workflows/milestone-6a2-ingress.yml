@@ -1,0 +1,92 @@
+name: Milestone 6A.2 Ingress and Tickets
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ingress-tickets:
+    name: Falsify bounded ingress and ticket lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: /tmp/forthdb-m6a2-cargo-target
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run complete Rust tests
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Run queued ingress benchmark
+        run: |
+          mkdir -p "$RUNNER_TEMP/forthdb-m6a2-artifacts"
+          FORTHDB_QUEUED_INGRESS_REPORT="$RUNNER_TEMP/forthdb-m6a2-artifacts/rust-queued-ingress-benchmarks.json" \
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin queued_ingress
+
+      - name: Publish ingress summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "forthdb-m6a2-artifacts" / "rust-queued-ingress-benchmarks.json"
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("# Milestone 6A.2 Ingress and Tickets\n\n")
+              if not report.exists():
+                  handle.write("No queued-ingress benchmark report was produced.\n")
+                  raise SystemExit(0)
+              data = json.loads(report.read_text())
+              handle.write(
+                  f"In-memory controller over a {data['retained_definitions']:,}-definition base; "
+                  f"capacity {data['capacity']}, maximum batch {data['max_batch']}.\n\n"
+              )
+              handle.write("| Workload | Intents | Epochs | Avg batch | ns/intent | Intents/s | Backpressure |\n")
+              handle.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+              for item in data["measurements"]:
+                  handle.write(
+                      f"| `{item['name']}` | {item['intents']} | {item['epochs']} | "
+                      f"{item['average_accepted_per_epoch']:.2f} | "
+                      f"{item['ns_per_intent']:.2f} | "
+                      f"{item['intents_per_second']:.0f} | "
+                      f"{item['backpressure_events']} |\n"
+                  )
+              handle.write(
+                  "\nThese are shared-runner observations of admission, planning, memory publication, "
+                  "and ticket routing. They are not durability-throughput claims.\n"
+              )
+          PY
+
+      - name: Upload Milestone 6A.2 evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: forthdb-milestone-6a2-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/forthdb-m6a2-artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Verify repository remains clean
+        if: always()
+        run: |
+          status="$(git status --porcelain)"
+          if [[ -n "$status" ]]; then
+            echo "$status"
+            echo "Milestone 6A.2 execution modified the checkout." >&2
+            exit 1
+          fi
