@@ -157,3 +157,5 @@ The existing world, file, mmap, io_uring, conformance, recovery, and canonical-b
 The engine does not yet implement dwell-time batching, adaptive batch policy, multiple durability epochs in flight, a dedicated completion reactor, registered io_uring resources, checkpoints, compaction, true power-loss fault injection, worker restart, or cross-process writer coordination.
 
 Milestone 6C found no reason to replace the ordinary-file epoch control merely by changing submission shape. Any later ring experiment must test a different concurrency proposition—such as overlapping preparation with durability—behind a separately specified ownership and publication contract.
+
+The opt-in [one-epoch-ahead io_uring experiment](SPECULATIVE_IO_URING.md) now tests that proposition while leaving ordinary per-epoch durability as the default and control.

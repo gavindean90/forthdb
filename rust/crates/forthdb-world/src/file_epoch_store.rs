@@ -247,6 +247,22 @@ struct EpochCheckpoint {
     prefix_digest: u64,
 }
 
+pub(crate) struct PreparedFileEpoch {
+    checkpoint: EpochCheckpoint,
+    frames: Vec<Arc<CommitFrame>>,
+    records: Vec<Vec<u8>>,
+}
+
+impl PreparedFileEpoch {
+    pub(crate) fn start_offset(&self) -> u64 {
+        self.checkpoint.start_offset
+    }
+
+    pub(crate) fn records(&self) -> &[Vec<u8>] {
+        &self.records
+    }
+}
+
 #[derive(Debug)]
 struct FileInspection {
     frames: Vec<Arc<CommitFrame>>,
@@ -394,9 +410,42 @@ impl<I: EpochFileIo> FileEpochStore<I> {
     }
 
     pub fn append_epoch(&mut self, frames: &[Arc<CommitFrame>]) -> Result<(), FileEpochStoreError> {
+        let prepared = self.prepare_epoch(frames)?;
+        if prepared.frames.is_empty() {
+            return Ok(());
+        }
+        let start_offset = prepared.start_offset();
+
+        let result = if let Some((transport_metrics, result)) =
+            self.io.persist_epoch(start_offset, prepared.records())
+        {
+            self.record_transport_metrics(transport_metrics);
+            result
+        } else {
+            match self.policy {
+                FileEpochSyncPolicy::PerFrame => {
+                    self.write_per_frame(start_offset, prepared.records())
+                }
+                FileEpochSyncPolicy::PerEpoch => {
+                    self.write_one_epoch(start_offset, prepared.records())
+                }
+            }
+        };
+
+        self.finish_prepared_epoch(prepared, result)
+    }
+
+    pub(crate) fn prepare_epoch(
+        &mut self,
+        frames: &[Arc<CommitFrame>],
+    ) -> Result<PreparedFileEpoch, FileEpochStoreError> {
         self.ensure_healthy()?;
         if frames.is_empty() {
-            return Ok(());
+            return Ok(PreparedFileEpoch {
+                checkpoint: self.checkpoint(0),
+                frames: Vec::new(),
+                records: Vec::new(),
+            });
         }
         self.validate_epoch(frames)?;
         let records = frames
@@ -410,32 +459,42 @@ impl<I: EpochFileIo> FileEpochStore<I> {
                     phase: EpochIoPhase::EpochStart,
                     source,
                 })?;
-        let checkpoint = self.checkpoint(start_offset);
         self.metrics.epoch_attempts += 1;
+        Ok(PreparedFileEpoch {
+            checkpoint: self.checkpoint(start_offset),
+            frames: frames.to_vec(),
+            records,
+        })
+    }
 
-        let result = if let Some((transport_metrics, result)) =
-            self.io.persist_epoch(start_offset, &records)
-        {
-            self.metrics.record_persist(transport_metrics);
-            result
-        } else {
-            match self.policy {
-                FileEpochSyncPolicy::PerFrame => self.write_per_frame(start_offset, &records),
-                FileEpochSyncPolicy::PerEpoch => self.write_one_epoch(start_offset, &records),
-            }
-        };
+    pub(crate) fn io_mut(&mut self) -> &mut I {
+        &mut self.io
+    }
+
+    pub(crate) fn record_transport_metrics(&mut self, metrics: EpochPersistMetrics) {
+        self.metrics.record_persist(metrics);
+    }
+
+    pub(crate) fn finish_prepared_epoch(
+        &mut self,
+        prepared: PreparedFileEpoch,
+        result: Result<(), (EpochIoPhase, std::io::Error)>,
+    ) -> Result<(), FileEpochStoreError> {
+        if prepared.frames.is_empty() {
+            return Ok(());
+        }
 
         if let Err((phase, source)) = result {
-            return Err(self.handle_primary_failure(checkpoint, phase, source));
+            return Err(self.handle_primary_failure(prepared.checkpoint, phase, source));
         }
 
-        for record in &records {
+        for record in &prepared.records {
             self.prefix_digest = digest_extend(self.prefix_digest, record);
         }
-        self.frames.extend(frames.iter().cloned());
+        self.frames.extend(prepared.frames);
         self.recovered_tail_bytes = 0;
         self.metrics.epochs_committed += 1;
-        self.metrics.frames_committed += frames.len() as u64;
+        self.metrics.frames_committed += prepared.records.len() as u64;
         Ok(())
     }
 

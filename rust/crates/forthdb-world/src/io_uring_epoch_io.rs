@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{IoUring, opcode, squeue, types};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
@@ -60,6 +60,15 @@ impl std::fmt::Debug for IoUringEpochFileIo {
 }
 
 pub type IoUringEpochStore = FileEpochStore<IoUringEpochFileIo>;
+
+#[cfg(target_os = "linux")]
+pub(crate) struct PendingIoUringEpoch {
+    // The SQEs retain this allocation's pointer until both CQEs are reaped.
+    _arena: Vec<u8>,
+    expected_writes: Vec<(u64, usize)>,
+    expected_cqes: usize,
+    metrics: EpochPersistMetrics,
+}
 
 impl IoUringEpochFileIo {
     pub fn open_store(
@@ -180,7 +189,8 @@ impl IoUringEpochFileIo {
                     std::io::ErrorKind::InvalidInput,
                     format!(
                         "io_uring epoch requires {} SQEs but ring has {} entries",
-                        entries.len(), self.ring_entries
+                        entries.len(),
+                        self.ring_entries
                     ),
                 ),
             ));
@@ -225,13 +235,133 @@ impl IoUringEpochFileIo {
         }
         metrics.completion_events += completions.len() as u64;
 
-        if let Err(error) = validate_completion_batch(expected_writes, expected_cqes, &completions) {
+        if let Err(error) = validate_completion_batch(expected_writes, expected_cqes, &completions)
+        {
             let reset = self.discard_and_recreate_ring().err();
             return Err(reset
                 .map(|source| (EpochIoPhase::EpochWrite, source))
                 .unwrap_or(error));
         }
         Ok(())
+    }
+
+    /// Submit one contiguous epoch without waiting for durability.
+    ///
+    /// The returned value owns every buffer referenced by the kernel. Callers
+    /// must pass it to `complete_contiguous_epoch` before it is dropped.
+    pub(crate) fn submit_contiguous_epoch(
+        &mut self,
+        start_offset: u64,
+        records: &[Vec<u8>],
+    ) -> Result<PendingIoUringEpoch, (EpochIoPhase, std::io::Error)> {
+        let total = records.iter().map(Vec::len).sum::<usize>();
+        let length = u32::try_from(total).map_err(|_| {
+            (
+                EpochIoPhase::EpochWrite,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "contiguous epoch exceeds one io_uring write length",
+                ),
+            )
+        })?;
+        let mut arena = Vec::with_capacity(total);
+        for record in records {
+            arena.extend_from_slice(record);
+        }
+
+        let descriptor = self.descriptor();
+        let entries = [
+            opcode::Write::new(descriptor, arena.as_ptr(), length)
+                .offset(start_offset)
+                .build()
+                .flags(squeue::Flags::IO_LINK)
+                .user_data(write_user_data(0)),
+            opcode::Fsync::new(descriptor)
+                .flags(types::FsyncFlags::DATASYNC)
+                .build()
+                .user_data(FSYNC_USER_DATA),
+        ];
+        let submit_result = (|| {
+            let ring = self.require_ring()?;
+            {
+                let mut submission = ring.submission();
+                // SAFETY: `arena` is moved into the returned pending epoch and
+                // retained until completion reaps both CQEs.
+                unsafe {
+                    submission.push_multiple(&entries).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "io_uring submission queue could not accept the epoch",
+                        )
+                    })?;
+                }
+            }
+            // A short submission is not an error: SQEs left in the userspace
+            // queue are submitted by `submit_and_wait` during completion.
+            ring.submit().map(|_| ())
+        })();
+        if let Err(error) = submit_result {
+            let reset = self.discard_and_recreate_ring().err();
+            return Err((EpochIoPhase::EpochWrite, reset.unwrap_or(error)));
+        }
+
+        Ok(PendingIoUringEpoch {
+            _arena: arena,
+            expected_writes: vec![(write_user_data(0), total)],
+            expected_cqes: entries.len(),
+            metrics: EpochPersistMetrics {
+                data_writes: 1,
+                data_syncs: 1,
+                bytes_written: total as u64,
+                submission_calls: 1,
+                maximum_in_flight_writes: 1,
+                arena_bytes_copied: total as u64,
+                ..EpochPersistMetrics::default()
+            },
+        })
+    }
+
+    pub(crate) fn complete_contiguous_epoch(
+        &mut self,
+        mut pending: PendingIoUringEpoch,
+    ) -> (
+        EpochPersistMetrics,
+        Result<(), (EpochIoPhase, std::io::Error)>,
+    ) {
+        let result = (|| {
+            let ring = self
+                .require_ring()
+                .map_err(|error| (EpochIoPhase::EpochWrite, error))?;
+            ring.submit_and_wait(pending.expected_cqes)
+                .map_err(|error| (EpochIoPhase::EpochWrite, error))?;
+
+            let mut completions = Vec::with_capacity(pending.expected_cqes);
+            {
+                let ring = self
+                    .require_ring()
+                    .map_err(|error| (EpochIoPhase::EpochWrite, error))?;
+                let mut completion = ring.completion();
+                while completions.len() < pending.expected_cqes {
+                    let Some(entry) = completion.next() else {
+                        break;
+                    };
+                    completions.push((entry.user_data(), entry.result()));
+                }
+            }
+            pending.metrics.completion_events += completions.len() as u64;
+            validate_completion_batch(
+                &pending.expected_writes,
+                pending.expected_cqes,
+                &completions,
+            )
+        })();
+
+        if result.is_err() {
+            if let Err(reset) = self.discard_and_recreate_ring() {
+                return (pending.metrics, Err((EpochIoPhase::EpochWrite, reset)));
+            }
+        }
+        (pending.metrics, result)
     }
 
     #[cfg(target_os = "linux")]
@@ -407,7 +537,10 @@ impl IoUringEpochFileIo {
     }
 }
 
-fn invalid_completion(phase: EpochIoPhase, message: impl Into<String>) -> (EpochIoPhase, std::io::Error) {
+fn invalid_completion(
+    phase: EpochIoPhase,
+    message: impl Into<String>,
+) -> (EpochIoPhase, std::io::Error) {
     (
         phase,
         std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()),
@@ -490,9 +623,7 @@ fn validate_completion_batch(
                 EpochIoPhase::EpochWrite,
                 std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
-                    format!(
-                        "io_uring write {index} completed {result} of {expected_length} bytes"
-                    ),
+                    format!("io_uring write {index} completed {result} of {expected_length} bytes"),
                 ),
             ));
         }
@@ -518,7 +649,6 @@ fn validate_completion_batch(
     }
     Ok(())
 }
-
 
 fn write_user_data(index: usize) -> u64 {
     WRITE_USER_DATA_TAG | index as u64
@@ -646,8 +776,8 @@ impl EpochFileIo for IoUringEpochFileIo {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -684,10 +814,7 @@ mod tests {
         }
     }
 
-    fn open_or_skip(
-        path: &Path,
-        strategy: IoUringEpochStrategy,
-    ) -> Option<IoUringEpochStore> {
+    fn open_or_skip(path: &Path, strategy: IoUringEpochStrategy) -> Option<IoUringEpochStore> {
         match IoUringEpochFileIo::open_store_with_entries(path, strategy, 64) {
             Ok(store) => Some(store),
             Err(error) if unavailable(&error) => {
@@ -711,7 +838,9 @@ mod tests {
         for index in 0..count {
             let mut transaction = database.begin();
             transaction.define(SlotId::new(format!("slot/{index}")), fact(index));
-            database.commit(transaction).expect("memory commit succeeds");
+            database
+                .commit(transaction)
+                .expect("memory commit succeeds");
         }
         database.frames()
     }
@@ -787,10 +916,9 @@ mod tests {
     fn all_ring_epoch_strategies_match_established_v1_bytes() {
         let frames = frames(3);
         let control = TempFile::new("control");
-        let control_database = Database::new(
-            FileCommitStore::open(control.path()).expect("file control opens"),
-        )
-        .expect("control reconstructs");
+        let control_database =
+            Database::new(FileCommitStore::open(control.path()).expect("file control opens"))
+                .expect("control reconstructs");
         for frame in &frames {
             control_database
                 .store

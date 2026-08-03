@@ -2,16 +2,17 @@
 mod linux {
     use forthdb_core::{Atom, EntityId, Fact, ForthDb, Literal, Predicate, SlotId};
     use forthdb_world::{
-        CommitStore, Database, DurableQueuedIntentController, DurableSubmitError, DurableTicketOutcome,
-        EpochFileIo, FileCommitStore, FileEpochMetrics, FileEpochStore, FileEpochStoreError,
-        FileEpochSyncPolicy, IoUringEpochFileIo, IoUringEpochStrategy, QueuedIntent,
+        CommitStore, Database, DurableQueuedIntentController, DurableSubmitError,
+        DurableTicketOutcome, EpochFileIo, FileCommitStore, FileEpochMetrics, FileEpochStore,
+        FileEpochStoreError, FileEpochSyncPolicy, IoUringEpochFileIo, IoUringEpochStrategy,
+        QueuedIntent,
     };
     use serde::Serialize;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{mpsc, Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -27,14 +28,16 @@ mod linux {
     enum Variant {
         Ordinary,
         RingContiguous,
+        RingSpeculative,
         RingVectored,
         RingPipelined,
     }
 
     impl Variant {
-        const ALL: [Self; 4] = [
+        const ALL: [Self; 5] = [
             Self::Ordinary,
             Self::RingContiguous,
+            Self::RingSpeculative,
             Self::RingVectored,
             Self::RingPipelined,
         ];
@@ -43,6 +46,7 @@ mod linux {
             match self {
                 Self::Ordinary => "ordinary_per_epoch",
                 Self::RingContiguous => "io_uring_contiguous_write",
+                Self::RingSpeculative => "io_uring_speculative_one_ahead",
                 Self::RingVectored => "io_uring_writev",
                 Self::RingPipelined => "io_uring_pipelined_writes",
             }
@@ -94,6 +98,8 @@ mod linux {
         median_arena_bytes_copied: u64,
         median_bytes_written: u64,
         median_backpressure_events: u64,
+        median_speculative_epochs_prepared: u64,
+        median_speculative_epochs_rederived: u64,
         sample_throughput: Vec<f64>,
     }
 
@@ -105,6 +111,8 @@ mod linux {
         average_batch: f64,
         store: FileEpochMetrics,
         backpressure_events: u64,
+        speculative_epochs_prepared: u64,
+        speculative_epochs_rederived: u64,
     }
 
     struct TempFile(PathBuf);
@@ -160,12 +168,8 @@ mod linux {
                 for round in 0..ROUNDS {
                     for offset in 0..Variant::ALL.len() {
                         let variant = Variant::ALL[(round + offset) % Variant::ALL.len()];
-                        let sample = run_sample(
-                            base.path(),
-                            variant,
-                            max_batch,
-                            intents_per_producer,
-                        );
+                        let sample =
+                            run_sample(base.path(), variant, max_batch, intents_per_producer);
                         samples
                             .iter_mut()
                             .find(|(candidate, _)| *candidate == variant)
@@ -202,7 +206,11 @@ mod linux {
             environment: Environment {
                 os: env::consts::OS,
                 architecture: env::consts::ARCH,
-                profile: if cfg!(debug_assertions) { "debug" } else { "release" },
+                profile: if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                },
                 git_sha: env::var("GITHUB_SHA").ok(),
                 github_run_id: env::var("GITHUB_RUN_ID").ok(),
             },
@@ -229,10 +237,9 @@ mod linux {
 
     fn build_base_file() -> TempFile {
         let base = TempFile::new("base");
-        let database = Database::new(
-            FileCommitStore::open(base.path()).expect("base file store opens"),
-        )
-        .expect("base file database reconstructs");
+        let database =
+            Database::new(FileCommitStore::open(base.path()).expect("base file store opens"))
+                .expect("base file database reconstructs");
         let mut transaction = database.begin();
         assert_eq!(transaction.entity(), EntityId::new(1));
         for index in 0..RETAINED_DEFINITIONS {
@@ -282,6 +289,15 @@ mod linux {
                 .expect("contiguous ring epoch store opens");
                 run_controller(temp, store, max_batch, intents_per_producer)
             }
+            Variant::RingSpeculative => {
+                let store = IoUringEpochFileIo::open_store_with_entries(
+                    temp.path(),
+                    IoUringEpochStrategy::ContiguousWrite,
+                    RING_ENTRIES,
+                )
+                .expect("speculative ring epoch store opens");
+                run_speculative_controller(temp, store, max_batch, intents_per_producer)
+            }
             Variant::RingVectored => {
                 let store = IoUringEpochFileIo::open_store_with_entries(
                     temp.path(),
@@ -310,12 +326,36 @@ mod linux {
         intents_per_producer: usize,
     ) -> Sample {
         let database = Arc::new(Database::new(store).expect("epoch database reconstructs"));
-        let base_version = database.snapshot().version();
-        let base_frame_count = database.frame_count();
         let controller = Arc::new(
             DurableQueuedIntentController::new(database.clone(), CAPACITY, max_batch)
                 .expect("durable controller starts"),
         );
+        run_started_controller(temp, database, controller, max_batch, intents_per_producer)
+    }
+
+    fn run_speculative_controller(
+        temp: TempFile,
+        store: FileEpochStore<IoUringEpochFileIo>,
+        max_batch: usize,
+        intents_per_producer: usize,
+    ) -> Sample {
+        let database = Arc::new(Database::new(store).expect("epoch database reconstructs"));
+        let controller = Arc::new(
+            DurableQueuedIntentController::new_speculative(database.clone(), CAPACITY, max_batch)
+                .expect("speculative durable controller starts"),
+        );
+        run_started_controller(temp, database, controller, max_batch, intents_per_producer)
+    }
+
+    fn run_started_controller<I: EpochFileIo + 'static>(
+        temp: TempFile,
+        database: Arc<Database<FileEpochStore<I>>>,
+        controller: Arc<DurableQueuedIntentController<I>>,
+        max_batch: usize,
+        intents_per_producer: usize,
+    ) -> Sample {
+        let base_version = database.snapshot().version();
+        let base_frame_count = database.frame_count();
         let total = PRODUCERS * intents_per_producer;
         let start_gate = Arc::new(Barrier::new(PRODUCERS + 1));
         let (ticket_tx, ticket_rx) = mpsc::channel();
@@ -360,7 +400,9 @@ mod linux {
         let started = Instant::now();
         start_gate.wait();
         for _ in 0..total {
-            let ticket = ticket_rx.recv().expect("every admitted ticket is collected");
+            let ticket = ticket_rx
+                .recv()
+                .expect("every admitted ticket is collected");
             match ticket.wait().expect("durable ticket resolves") {
                 DurableTicketOutcome::Accepted { .. } => {}
                 DurableTicketOutcome::Rejected(error) => panic!("intent rejected: {error}"),
@@ -410,6 +452,8 @@ mod linux {
             average_batch: total as f64 / controller_metrics.epochs as f64,
             store: store_metrics,
             backpressure_events: controller_metrics.backpressured,
+            speculative_epochs_prepared: controller_metrics.speculative_epochs_prepared,
+            speculative_epochs_rederived: controller_metrics.speculative_epochs_rederived,
         }
     }
 
@@ -451,6 +495,8 @@ mod linux {
             median_arena_bytes_copied: median.store.arena_bytes_copied,
             median_bytes_written: median.store.bytes_written,
             median_backpressure_events: median.backpressure_events,
+            median_speculative_epochs_prepared: median.speculative_epochs_prepared,
+            median_speculative_epochs_rederived: median.speculative_epochs_rederived,
             sample_throughput: samples
                 .iter()
                 .map(|sample| sample.intents_per_second)
