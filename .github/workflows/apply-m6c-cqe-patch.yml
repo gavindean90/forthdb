@@ -17,11 +17,10 @@ jobs:
           ref: ${{ github.head_ref }}
           persist-credentials: true
 
-      - name: Apply, format, commit, and remove transfer files
+      - name: Apply, commit, and remove transfer files
         run: |
           git apply --check .m6c/cqe.patch
           git apply .m6c/cqe.patch
-          cargo fmt --manifest-path rust/Cargo.toml
           rm -rf .m6c
           rm .github/workflows/apply-m6c-cqe-patch.yml
           git config user.name "github-actions[bot]"
