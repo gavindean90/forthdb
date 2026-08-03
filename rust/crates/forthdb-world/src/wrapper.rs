@@ -9,6 +9,7 @@ mod io_uring_epoch_io;
 mod mmap_store;
 mod queued;
 mod queued_controller;
+pub mod stack_vm;
 mod writer_lock;
 
 pub use admission_epoch::{

@@ -61,6 +61,14 @@ jobs:
             --bin admission_window \
             -- "$RUNNER_TEMP/forthdb-library-artifacts/admission-window"
 
+      - name: Measure Phase 1 stack VM materialization
+        run: |
+          FORTHDB_STACK_VM_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/stack-vm-phase1.json" \
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin stack_vm_phase1
+
       - name: Publish application summary
         if: always()
         run: |
@@ -174,6 +182,25 @@ jobs:
                           f"\nAdmission benchmark unavailable: "
                           f"`{measured.get('availability_error', 'unknown error')}`.\n"
                       )
+              stack_vm = report.parent / "stack-vm-phase1.json"
+              if stack_vm.exists():
+                  measured = json.loads(stack_vm.read_text())
+                  handle.write("\n## Phase 1 stack VM\n\n")
+                  handle.write(
+                      "| Epoch width | Intents | Current engine | Stack VM | Kernel ratio | Projection parity |\n"
+                  )
+                  handle.write(
+                      "| ---: | ---: | ---: | ---: | ---: | ---: |\n"
+                  )
+                  for case in measured["cases"]:
+                      handle.write(
+                          f"| {case['epoch_width']} | {case['intents']} | "
+                          f"{case['current_engine']['intents_per_second']:.1f}/s | "
+                          f"{case['stack_vm']['intents_per_second']:.1f}/s | "
+                          f"{case['projection_kernel_ratio']:.2f}x | "
+                          f"{case['projection_parity']} |\n"
+                      )
+                  handle.write(f"\nScope: {measured['scope']}\n")
           PY
 
       - name: Upload application database and report

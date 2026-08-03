@@ -86,8 +86,17 @@ The `admission_window` benchmark separates three observations:
    final semantic outcome
 
 The benchmark sweeps unapplied windows of 1, 2, 8, and 32 epochs at 16 intents
-per epoch, plus epoch widths of 1 and 64 at an eight-epoch window. During the
-gated phase it asserts that the reader-visible world remains unchanged.
+per epoch, plus epoch widths of 1, 64, 128, and 256 at an eight-epoch window.
+During the gated phase it asserts that the reader-visible world remains
+unchanged.
+
+## Materialization research
+
+[`STACK_VM_PHASE1.md`](STACK_VM_PHASE1.md) defines an isolated in-memory
+experiment for replacing cloned trial worlds with a framed operand stack, POD
+record arenas, and private trial deltas. It intentionally does not change this
+journal or its recovery contract. Its benchmark ratio covers a reduced
+slot-head projection and must not be reported as complete database throughput.
 
 ## Library reference
 
