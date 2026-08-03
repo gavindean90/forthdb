@@ -428,7 +428,7 @@ pub struct DurableQueuedIntentController<I: EpochFileIo = StdEpochFileIo> {
     max_batch: usize,
 }
 
-impl<I: EpochFileIo> fmt::Debug for DurableQueuedIntentController<I> {
+impl<I: EpochFileIo + 'static> fmt::Debug for DurableQueuedIntentController<I> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DurableQueuedIntentController")
