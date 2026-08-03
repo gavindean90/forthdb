@@ -1,0 +1,29 @@
+name: Export Source
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: Export exact branch source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Archive source
+        run: |
+          tar --exclude=.git -czf "$RUNNER_TEMP/forthdb-source.tar.gz" .
+
+      - name: Upload source
+        uses: actions/upload-artifact@v6
+        with:
+          name: forthdb-source-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/forthdb-source.tar.gz
+          retention-days: 1
