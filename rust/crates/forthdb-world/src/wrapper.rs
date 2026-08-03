@@ -1,6 +1,7 @@
 include!("lib.rs");
 
 mod file_store;
+mod history_lifecycle;
 mod io_uring_store;
 mod mmap_store;
 mod queued;
