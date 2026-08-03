@@ -5,7 +5,7 @@ use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{IoUring, opcode, squeue, types};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
@@ -56,21 +56,32 @@ impl fmt::Display for IoUringCommitStoreError {
             }
             Self::Recovery(error) => write!(formatter, "io_uring store recovery failed: {error}"),
             Self::Io(error) => write!(formatter, "io_uring store I/O failed: {error}"),
-            Self::QueueFull => write!(formatter, "io_uring submission queue could not accept a commit"),
+            Self::QueueFull => write!(
+                formatter,
+                "io_uring submission queue could not accept a commit"
+            ),
             Self::MissingCompletion(operation) => {
-                write!(formatter, "io_uring did not return the {operation} completion")
+                write!(
+                    formatter,
+                    "io_uring did not return the {operation} completion"
+                )
             }
             Self::OperationFailed { operation, error } => {
                 write!(formatter, "io_uring {operation} failed: {error}")
             }
             Self::UnexpectedCompletion { operation, result } => {
-                write!(formatter, "io_uring {operation} returned unexpected result {result}")
+                write!(
+                    formatter,
+                    "io_uring {operation} returned unexpected result {result}"
+                )
             }
             Self::ShortWrite { expected, actual } => write!(
                 formatter,
                 "io_uring write completed only {actual} of {expected} bytes"
             ),
-            Self::NonLinearAppend(message) => write!(formatter, "nonlinear commit append: {message}"),
+            Self::NonLinearAppend(message) => {
+                write!(formatter, "nonlinear commit append: {message}")
+            }
             Self::FrameTooLarge(length) => write!(
                 formatter,
                 "encoded frame record is {length} bytes and cannot be submitted as one io_uring write"
@@ -229,9 +240,10 @@ impl IoUringCommitStore {
                 frame.parent_version()
             )));
         }
-        let expected_resulting_version = expected_parent_version.checked_add(1).ok_or_else(|| {
-            IoUringCommitStoreError::NonLinearAppend("world version overflow".to_owned())
-        })?;
+        let expected_resulting_version =
+            expected_parent_version.checked_add(1).ok_or_else(|| {
+                IoUringCommitStoreError::NonLinearAppend("world version overflow".to_owned())
+            })?;
         if frame.resulting_version() != expected_resulting_version {
             return Err(IoUringCommitStoreError::NonLinearAppend(format!(
                 "expected resulting version {expected_resulting_version}, found {}",
@@ -309,10 +321,11 @@ impl IoUringCommitStore {
             }
         }
 
-        let write_result = write_result
-            .ok_or(IoUringCommitStoreError::MissingCompletion("write"))?;
-        let fsync_result = fsync_result
-            .ok_or(IoUringCommitStoreError::MissingCompletion("data synchronization"))?;
+        let write_result =
+            write_result.ok_or(IoUringCommitStoreError::MissingCompletion("write"))?;
+        let fsync_result = fsync_result.ok_or(IoUringCommitStoreError::MissingCompletion(
+            "data synchronization",
+        ))?;
 
         if write_result < 0 {
             self.rollback_failed_append(start);
@@ -517,10 +530,7 @@ mod tests {
     fn commit_one_world<S: CommitStore>(database: &Database<S>) -> WorldId {
         let mut transaction = database.begin();
         let entity = transaction.entity();
-        transaction.define(
-            SlotId::new("durable/state"),
-            state_fact(entity, "ready"),
-        );
+        transaction.define(SlotId::new("durable/state"), state_fact(entity, "ready"));
         database
             .commit(transaction)
             .expect("durable commit succeeds")
@@ -548,10 +558,9 @@ mod tests {
     #[test]
     fn file_store_history_can_continue_through_io_uring() {
         let temp = TempFile::new("file-to-ring");
-        let file_database = Database::new(
-            FileCommitStore::open(temp.path()).expect("file store opens"),
-        )
-        .expect("empty history is valid");
+        let file_database =
+            Database::new(FileCommitStore::open(temp.path()).expect("file store opens"))
+                .expect("empty history is valid");
         commit_one_world(&file_database);
         drop(file_database);
 
@@ -577,10 +586,9 @@ mod tests {
         let file_temp = TempFile::new("canonical-file");
         let ring_temp = TempFile::new("canonical-ring");
 
-        let file_database = Database::new(
-            FileCommitStore::open(file_temp.path()).expect("file store opens"),
-        )
-        .expect("empty history is valid");
+        let file_database =
+            Database::new(FileCommitStore::open(file_temp.path()).expect("file store opens"))
+                .expect("empty history is valid");
         commit_one_world(&file_database);
         drop(file_database);
 
@@ -636,7 +644,10 @@ mod tests {
 
         assert_eq!(&record[..4], FRAME_MAGIC);
         let payload_len = u64::from_le_bytes(record[4..12].try_into().unwrap()) as usize;
-        assert_eq!(record.len(), FRAME_PREFIX_LEN + payload_len + FRAME_TRAILER_LEN);
+        assert_eq!(
+            record.len(),
+            FRAME_PREFIX_LEN + payload_len + FRAME_TRAILER_LEN
+        );
         assert_eq!(&record[record.len() - 4..], FRAME_TRAILER);
         assert!(record.len() > FILE_HEADER_LEN);
         drop(temp);

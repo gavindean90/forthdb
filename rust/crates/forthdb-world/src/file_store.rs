@@ -30,14 +30,21 @@ impl fmt::Display for FileCommitStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "file commit store I/O failed: {error}"),
-            Self::InvalidHeader(message) => write!(formatter, "invalid ForthDB file header: {message}"),
+            Self::InvalidHeader(message) => {
+                write!(formatter, "invalid ForthDB file header: {message}")
+            }
             Self::UnsupportedFormat(version) => {
-                write!(formatter, "unsupported ForthDB file format version {version}")
+                write!(
+                    formatter,
+                    "unsupported ForthDB file format version {version}"
+                )
             }
             Self::CorruptFrame { offset, reason } => {
                 write!(formatter, "corrupt commit frame at byte {offset}: {reason}")
             }
-            Self::NonLinearAppend(message) => write!(formatter, "nonlinear commit append: {message}"),
+            Self::NonLinearAppend(message) => {
+                write!(formatter, "nonlinear commit append: {message}")
+            }
             Self::History(error) => write!(formatter, "persisted history is invalid: {error}"),
         }
     }
@@ -137,9 +144,10 @@ impl FileCommitStore {
                 frame.parent_version()
             )));
         }
-        let expected_resulting_version = expected_parent_version.checked_add(1).ok_or_else(|| {
-            FileCommitStoreError::NonLinearAppend("world version overflow".to_owned())
-        })?;
+        let expected_resulting_version =
+            expected_parent_version.checked_add(1).ok_or_else(|| {
+                FileCommitStoreError::NonLinearAppend("world version overflow".to_owned())
+            })?;
         if frame.resulting_version() != expected_resulting_version {
             return Err(FileCommitStoreError::NonLinearAppend(format!(
                 "expected resulting version {expected_resulting_version}, found {}",
@@ -408,7 +416,11 @@ fn decode_payload(payload: &[u8]) -> Result<CommitFrame, String> {
             },
             1 => Operation::Define {
                 slot: SlotId::new(decoder.string()?),
-                fact: Fact::new(decoder.atom()?, Predicate::new(decoder.string()?), decoder.atom()?),
+                fact: Fact::new(
+                    decoder.atom()?,
+                    Predicate::new(decoder.string()?),
+                    decoder.atom()?,
+                ),
             },
             2 => Operation::Forget {
                 slot: SlotId::new(decoder.string()?),

@@ -194,7 +194,10 @@ impl fmt::Display for FileEpochStoreError {
         match self {
             Self::File(error) => write!(formatter, "file epoch format failed: {error}"),
             Self::Io { phase, source } => {
-                write!(formatter, "file epoch I/O failed during {phase:?}: {source}")
+                write!(
+                    formatter,
+                    "file epoch I/O failed during {phase:?}: {source}"
+                )
             }
             Self::EpochRepaired { phase, source } => write!(
                 formatter,
@@ -209,8 +212,12 @@ impl fmt::Display for FileEpochStoreError {
                 formatter,
                 "file epoch failed during {primary_phase:?} ({primary}); repair failed during {repair_phase:?} ({repair})"
             ),
-            Self::Verification(message) => write!(formatter, "file epoch verification failed: {message}"),
-            Self::StorePoisoned(reason) => write!(formatter, "file epoch store is poisoned: {reason}"),
+            Self::Verification(message) => {
+                write!(formatter, "file epoch verification failed: {message}")
+            }
+            Self::StorePoisoned(reason) => {
+                write!(formatter, "file epoch store is poisoned: {reason}")
+            }
         }
     }
 }
@@ -220,9 +227,7 @@ impl Error for FileEpochStoreError {
         match self {
             Self::File(error) => Some(error),
             Self::Io { source, .. } | Self::EpochRepaired { source, .. } => Some(source),
-            Self::RepairFailed { .. }
-            | Self::Verification(_)
-            | Self::StorePoisoned(_) => None,
+            Self::RepairFailed { .. } | Self::Verification(_) | Self::StorePoisoned(_) => None,
         }
     }
 }
@@ -303,12 +308,12 @@ impl<I: EpochFileIo> FileEpochStore<I> {
         mut io: I,
         policy: FileEpochSyncPolicy,
     ) -> Result<Self, FileEpochStoreError> {
-        let bytes = io
-            .read_all(EpochIoPhase::VerifyRead)
-            .map_err(|source| FileEpochStoreError::Io {
-                phase: EpochIoPhase::VerifyRead,
-                source,
-            })?;
+        let bytes =
+            io.read_all(EpochIoPhase::VerifyRead)
+                .map_err(|source| FileEpochStoreError::Io {
+                    phase: EpochIoPhase::VerifyRead,
+                    source,
+                })?;
         let inspection = inspect_file(&bytes)?;
         if inspection.last_good_offset != bytes.len() {
             return Err(FileEpochStoreError::Verification(format!(
@@ -355,6 +360,11 @@ impl<I: EpochFileIo> FileEpochStore<I> {
         self.recovered_tail_bytes
     }
 
+    pub(crate) fn poison_external(&mut self, reason: String) {
+        self.state = FileEpochState::Poisoned;
+        self.poison_reason = Some(reason);
+    }
+
     pub fn file_len(&mut self) -> Result<u64, FileEpochStoreError> {
         self.ensure_healthy()?;
         self.io
@@ -383,10 +393,7 @@ impl<I: EpochFileIo> FileEpochStore<I> {
         Ok(inspection.frames)
     }
 
-    pub fn append_epoch(
-        &mut self,
-        frames: &[Arc<CommitFrame>],
-    ) -> Result<(), FileEpochStoreError> {
+    pub fn append_epoch(&mut self, frames: &[Arc<CommitFrame>]) -> Result<(), FileEpochStoreError> {
         self.ensure_healthy()?;
         if frames.is_empty() {
             return Ok(());
@@ -396,13 +403,13 @@ impl<I: EpochFileIo> FileEpochStore<I> {
             .iter()
             .map(|frame| encode_record(frame))
             .collect::<Result<Vec<_>, _>>()?;
-        let start_offset = self
-            .io
-            .len(EpochIoPhase::EpochStart)
-            .map_err(|source| FileEpochStoreError::Io {
-                phase: EpochIoPhase::EpochStart,
-                source,
-            })?;
+        let start_offset =
+            self.io
+                .len(EpochIoPhase::EpochStart)
+                .map_err(|source| FileEpochStoreError::Io {
+                    phase: EpochIoPhase::EpochStart,
+                    source,
+                })?;
         let checkpoint = self.checkpoint(start_offset);
         self.metrics.epoch_attempts += 1;
 
@@ -597,10 +604,7 @@ impl<I: EpochFileIo> FileEpochStore<I> {
         }
     }
 
-    fn repair(
-        &mut self,
-        checkpoint: EpochCheckpoint,
-    ) -> Result<(), (EpochIoPhase, String)> {
+    fn repair(&mut self, checkpoint: EpochCheckpoint) -> Result<(), (EpochIoPhase, String)> {
         self.io
             .set_len(EpochIoPhase::RepairTruncate, checkpoint.start_offset)
             .map_err(|error| (EpochIoPhase::RepairTruncate, error.to_string()))?;
@@ -633,8 +637,8 @@ impl<I: EpochFileIo> FileEpochStore<I> {
                 "repaired prefix digest does not match checkpoint".to_owned(),
             ));
         }
-        let inspection = inspect_file(&bytes)
-            .map_err(|error| (EpochIoPhase::VerifyRead, error.to_string()))?;
+        let inspection =
+            inspect_file(&bytes).map_err(|error| (EpochIoPhase::VerifyRead, error.to_string()))?;
         if inspection.last_good_offset != bytes.len() {
             return Err((
                 EpochIoPhase::VerifyRead,
@@ -661,10 +665,7 @@ impl<I: EpochFileIo> FileEpochStore<I> {
                 EpochIoPhase::VerifyRead,
                 format!(
                     "expected repaired tail {} v{}, found {} v{}",
-                    checkpoint.world_id,
-                    checkpoint.world_version,
-                    actual_world,
-                    actual_version
+                    checkpoint.world_id, checkpoint.world_version, actual_world, actual_version
                 ),
             ));
         }
@@ -749,8 +750,9 @@ fn inspect_file(bytes: &[u8]) -> Result<FileInspection, FileEpochStoreError> {
             )
             .into());
         }
-        let payload_len = usize::try_from(payload_len)
-            .map_err(|_| FileEpochStoreError::File(corrupt(offset, "payload length does not fit")))?;
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            FileEpochStoreError::File(corrupt(offset, "payload length does not fit"))
+        })?;
         let total_len = FRAME_PREFIX_LEN
             .checked_add(payload_len)
             .and_then(|value| value.checked_add(FRAME_TRAILER_LEN))
@@ -957,7 +959,9 @@ impl<'a> EpochDecoder<'a> {
             .get(self.offset..end)
             .ok_or_else(|| "unexpected end of payload".to_owned())?;
         self.offset = end;
-        Ok(u64::from_le_bytes(slice.try_into().expect("fixed u64 slice")))
+        Ok(u64::from_le_bytes(
+            slice.try_into().expect("fixed u64 slice"),
+        ))
     }
 
     fn string(&mut self) -> Result<String, String> {
@@ -1063,7 +1067,10 @@ mod tests {
         ) -> std::io::Result<usize> {
             match self.take(phase) {
                 Some(FaultAction::Fail(errno)) => Err(injected(errno)),
-                Some(FaultAction::WritePrefixThenFail { bytes: count, errno }) => {
+                Some(FaultAction::WritePrefixThenFail {
+                    bytes: count,
+                    errno,
+                }) => {
                     let count = count.min(bytes.len());
                     if count != 0 {
                         let written = self.inner.write_at(phase, offset, &bytes[..count])?;
@@ -1167,14 +1174,18 @@ mod tests {
         let frames = three_frames();
         let sequential_path = temp_path("sequential");
         let epoch_path = temp_path("epoch");
-        let mut sequential =
-            FileEpochStore::open(&sequential_path, FileEpochSyncPolicy::PerFrame)
-                .expect("sequential opens");
-        let mut epoch = FileEpochStore::open(&epoch_path, FileEpochSyncPolicy::PerEpoch)
-            .expect("epoch opens");
-        sequential.append_epoch(&frames).expect("sequential commits");
+        let mut sequential = FileEpochStore::open(&sequential_path, FileEpochSyncPolicy::PerFrame)
+            .expect("sequential opens");
+        let mut epoch =
+            FileEpochStore::open(&epoch_path, FileEpochSyncPolicy::PerEpoch).expect("epoch opens");
+        sequential
+            .append_epoch(&frames)
+            .expect("sequential commits");
         epoch.append_epoch(&frames).expect("epoch commits");
-        assert_eq!(fs::read(&sequential_path).unwrap(), fs::read(&epoch_path).unwrap());
+        assert_eq!(
+            fs::read(&sequential_path).unwrap(),
+            fs::read(&epoch_path).unwrap()
+        );
         assert_eq!(sequential.metrics().data_syncs, 3);
         assert_eq!(epoch.metrics().data_syncs, 1);
         let _ = fs::remove_file(sequential_path);
@@ -1185,7 +1196,11 @@ mod tests {
     fn prefix_write_enospc_repairs_exact_checkpoint_and_store_remains_reusable() {
         let path = temp_path("prefix-repair");
         let frames = three_frames();
-        let original = fs::read({ initialized(&path); &path }).expect("prefix reads");
+        let original = fs::read({
+            initialized(&path);
+            &path
+        })
+        .expect("prefix reads");
         let rules = vec![FaultRule {
             phase: EpochIoPhase::EpochWrite,
             action: FaultAction::WritePrefixThenFail {

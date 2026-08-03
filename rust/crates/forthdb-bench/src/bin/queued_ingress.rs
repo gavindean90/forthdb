@@ -6,7 +6,7 @@ use forthdb_world::{
 use serde::Serialize;
 use std::env;
 use std::fs;
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 

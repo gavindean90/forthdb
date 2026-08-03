@@ -112,7 +112,10 @@ fn shared_kernel_matches_legacy_queries_and_provenance() {
         distinct: false,
         ..QueryOptions::default()
     };
-    assert_eq!(shared.query(&patterns, options), legacy.query(&patterns, options));
+    assert_eq!(
+        shared.query(&patterns, options),
+        legacy.query(&patterns, options)
+    );
     shared.validate_full().expect("query fixture full audit");
 }
 
@@ -179,7 +182,9 @@ fn deterministic_random_sequence_matches_legacy_after_every_checkpoint() {
             shared.validate().expect("incremental audit at checkpoint");
         }
         if step % 997 == 0 {
-            shared.validate_full().expect("full structural audit at checkpoint");
+            shared
+                .validate_full()
+                .expect("full structural audit at checkpoint");
             legacy.validate().expect("legacy audit at checkpoint");
         }
     }

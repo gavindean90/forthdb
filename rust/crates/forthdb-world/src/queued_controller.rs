@@ -2,7 +2,7 @@ use super::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -84,12 +84,10 @@ pub enum TicketRejection {
 impl TicketRejection {
     fn from_intent_rejection(error: &IntentRejection) -> Self {
         match error {
-            IntentRejection::WorldPrecondition { expected, actual } => {
-                Self::WorldPrecondition {
-                    expected: *expected,
-                    actual: *actual,
-                }
-            }
+            IntentRejection::WorldPrecondition { expected, actual } => Self::WorldPrecondition {
+                expected: *expected,
+                actual: *actual,
+            },
             IntentRejection::SlotPrecondition {
                 slot,
                 expected,
@@ -420,9 +418,7 @@ impl ControllerMetricsInner {
             rejected: self.rejected.load(Ordering::Relaxed),
             epochs: self.epochs.load(Ordering::Relaxed),
             abandoned_tickets: self.abandoned_tickets.load(Ordering::Relaxed),
-            completion_delivery_failures: self
-                .completion_delivery_failures
-                .load(Ordering::Relaxed),
+            completion_delivery_failures: self.completion_delivery_failures.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Acquire),
             maximum_queue_depth: self.maximum_queue_depth.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Acquire),
@@ -628,11 +624,7 @@ fn run_worker(
     }
 }
 
-fn claim(
-    staged: StagedIntent,
-    metrics: &ControllerMetricsInner,
-    batch: &mut Vec<StagedIntent>,
-) {
+fn claim(staged: StagedIntent, metrics: &ControllerMetricsInner, batch: &mut Vec<StagedIntent>) {
     metrics.release_ingress();
     metrics.claimed.fetch_add(1, Ordering::Relaxed);
     staged.lifecycle.claim();
@@ -704,9 +696,8 @@ mod tests {
 
     #[test]
     fn saturation_returns_the_original_intent_immediately() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -725,8 +716,7 @@ mod tests {
             Ok(())
         });
 
-        let controller =
-            QueuedIntentController::new(database, 1, 1).expect("controller starts");
+        let controller = QueuedIntentController::new(database, 1, 1).expect("controller starts");
         let first = controller
             .submit(QueuedIntent::new())
             .expect("first intent enters worker");
@@ -759,9 +749,8 @@ mod tests {
 
     #[test]
     fn dropping_a_claimed_ticket_does_not_cancel_history() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -790,7 +779,9 @@ mod tests {
         assert_eq!(ticket.state().phase, TicketPhase::Claimed);
         drop(ticket);
         release_tx.send(()).expect("release worker");
-        controller.flush().expect("abandoned intent still completes");
+        controller
+            .flush()
+            .expect("abandoned intent still completes");
 
         let world = database.snapshot();
         assert_eq!(world.version(), 1);
@@ -805,9 +796,8 @@ mod tests {
 
     #[test]
     fn rejection_routes_only_to_its_own_ticket() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
         let controller =
             QueuedIntentController::new(database.clone(), 8, 8).expect("controller starts");
         let slot = SlotId::new("pipeline/state");
@@ -829,7 +819,9 @@ mod tests {
             SlotId::new("pipeline/rejected"),
             state_fact(EntityId::new(2), "never"),
         );
-        let rejected = controller.submit(rejected).expect("rejected intent submitted");
+        let rejected = controller
+            .submit(rejected)
+            .expect("rejected intent submitted");
 
         let mut third = QueuedIntent::new();
         third.define_fact(
@@ -846,14 +838,18 @@ mod tests {
         controller.flush().expect("controller drains");
 
         assert_eq!(third_world.version(), 2);
-        assert!(database
-            .snapshot()
-            .resolve(&SlotId::new("pipeline/rejected"))
-            .is_none());
-        assert!(database
-            .snapshot()
-            .resolve(&SlotId::new("pipeline/third"))
-            .is_some());
+        assert!(
+            database
+                .snapshot()
+                .resolve(&SlotId::new("pipeline/rejected"))
+                .is_none()
+        );
+        assert!(
+            database
+                .snapshot()
+                .resolve(&SlotId::new("pipeline/third"))
+                .is_some()
+        );
         let metrics = controller.metrics();
         assert_eq!(metrics.accepted, 2);
         assert_eq!(metrics.rejected, 1);
@@ -861,9 +857,8 @@ mod tests {
 
     #[test]
     fn ticket_resolution_never_precedes_tail_publication() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
         let controller =
             QueuedIntentController::new(database.clone(), 4, 4).expect("controller starts");
         let slot = SlotId::new("published/state");
@@ -883,11 +878,9 @@ mod tests {
 
     #[test]
     fn fast_claims_never_underflow_ingress_accounting() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
-        let controller =
-            QueuedIntentController::new(database, 4, 4).expect("controller starts");
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
+        let controller = QueuedIntentController::new(database, 4, 4).expect("controller starts");
 
         for _ in 0..1_000 {
             let ticket = loop {

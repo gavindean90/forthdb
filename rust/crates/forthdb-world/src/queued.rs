@@ -380,10 +380,7 @@ pub fn derive_epoch(
                     entities,
                 }));
             }
-            Err(error) => outcomes.push(EpochOutcome::Rejected(RejectedIntent {
-                position,
-                error,
-            })),
+            Err(error) => outcomes.push(EpochOutcome::Rejected(RejectedIntent { position, error })),
         }
     }
 
@@ -399,14 +396,7 @@ fn derive_intent(
     predecessor: Arc<World>,
     intent: QueuedIntent,
     validators: &[Validator],
-) -> Result<
-    (
-        Arc<World>,
-        Arc<CommitFrame>,
-        BTreeMap<TempEntity, EntityId>,
-    ),
-    IntentRejection,
-> {
+) -> Result<(Arc<World>, Arc<CommitFrame>, BTreeMap<TempEntity, EntityId>), IntentRejection> {
     check_preconditions(&predecessor, &intent.preconditions)?;
     let (operations, entities) =
         resolve_operations(&predecessor, intent.namespace, intent.operations)?;
@@ -587,7 +577,9 @@ mod tests {
                 Operation::Forget { slot } => transaction.forget(slot.clone()),
             }
         }
-        database.commit(transaction).expect("oracle commit succeeds")
+        database
+            .commit(transaction)
+            .expect("oracle commit succeeds")
     }
 
     #[test]
@@ -673,7 +665,11 @@ mod tests {
         assert_eq!(plan.tail().next_entity(), 3);
         let last = plan.outcomes()[2].accepted().expect("last accepted");
         assert_eq!(last.entity(last_entity), Some(EntityId::new(2)));
-        assert!(plan.tail().resolve(&SlotId::new("rejected/state")).is_none());
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("rejected/state"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -722,7 +718,11 @@ mod tests {
         ));
         assert!(plan.outcomes()[2].accepted().is_some());
         assert_eq!(plan.tail().resolve(&slot), Some(&updated));
-        assert!(plan.tail().resolve(&SlotId::new("should/not/exist")).is_none());
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("should/not/exist"))
+                .is_none()
+        );
         assert!(plan.tail().resolve(&SlotId::new("should/exist")).is_some());
     }
 
@@ -875,11 +875,16 @@ mod tests {
                         Operation::Forget { slot } => transaction.forget(slot.clone()),
                     }
                 }
-                database.commit(transaction).expect("strict commit succeeds");
+                database
+                    .commit(transaction)
+                    .expect("strict commit succeeds");
             }
         }
 
-        assert_eq!(fs::read(&queued_path).unwrap(), fs::read(&strict_path).unwrap());
+        assert_eq!(
+            fs::read(&queued_path).unwrap(),
+            fs::read(&strict_path).unwrap()
+        );
         let _ = fs::remove_file(queued_path);
         let _ = fs::remove_file(strict_path);
     }

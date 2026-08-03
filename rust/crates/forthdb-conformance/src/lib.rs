@@ -26,7 +26,9 @@ impl fmt::Display for FixtureError {
         match self {
             Self::Io(error) => write!(formatter, "could not read fixture: {error}"),
             Self::Json(error) => write!(formatter, "could not parse fixture JSON: {error}"),
-            Self::Validation(message) => write!(formatter, "invalid conformance fixture: {message}"),
+            Self::Validation(message) => {
+                write!(formatter, "invalid conformance fixture: {message}")
+            }
         }
     }
 }
@@ -68,7 +70,9 @@ impl KernelFixture {
             )));
         }
         if self.cases.is_empty() {
-            return Err(FixtureError::validation("fixture must contain at least one case"));
+            return Err(FixtureError::validation(
+                "fixture must contain at least one case",
+            ));
         }
 
         let mut case_names = BTreeSet::new();
@@ -359,10 +363,7 @@ impl AtomSpec {
         }
     }
 
-    pub fn materialize(
-        &self,
-        entities: &BTreeMap<String, EntityId>,
-    ) -> Result<Atom, FixtureError> {
+    pub fn materialize(&self, entities: &BTreeMap<String, EntityId>) -> Result<Atom, FixtureError> {
         match self {
             Self::Entity(reference) => entities
                 .get(&reference.entity)
@@ -412,10 +413,7 @@ impl TermSpec {
         }
     }
 
-    pub fn materialize(
-        &self,
-        entities: &BTreeMap<String, EntityId>,
-    ) -> Result<Term, FixtureError> {
+    pub fn materialize(&self, entities: &BTreeMap<String, EntityId>) -> Result<Term, FixtureError> {
         match self {
             Self::Entity(reference) => entities
                 .get(&reference.entity)
@@ -456,10 +454,7 @@ impl FactSpec {
         self.object.validate(entities, context)
     }
 
-    pub fn materialize(
-        &self,
-        entities: &BTreeMap<String, EntityId>,
-    ) -> Result<Fact, FixtureError> {
+    pub fn materialize(&self, entities: &BTreeMap<String, EntityId>) -> Result<Fact, FixtureError> {
         Ok(Fact::new(
             self.subject.materialize(entities)?,
             Predicate::new(&self.predicate),
@@ -623,8 +618,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn checked_in_fixture() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../conformance/v1/kernel_cases.json")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../conformance/v1/kernel_cases.json")
     }
 
     #[test]
@@ -646,7 +640,9 @@ mod tests {
             ("copy_1".to_owned(), EntityId::new(20)),
         ]);
 
-        let actual = fact.materialize(&entities).expect("fact should materialize");
+        let actual = fact
+            .materialize(&entities)
+            .expect("fact should materialize");
         let expected = Fact::new(
             Atom::Entity(EntityId::new(10)),
             Predicate::new("has_copy"),
