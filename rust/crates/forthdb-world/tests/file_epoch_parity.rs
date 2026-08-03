@@ -1,6 +1,7 @@
 use forthdb_core::{Atom, EntityId, Fact, Literal, Predicate, SlotId};
 use forthdb_world::{
-    CommitStore, Database, FileCommitStore, FileEpochStore, FileEpochSyncPolicy, MemoryCommitStore,
+    CommitStore, Database, FileCommitStore, FileEpochStore, FileEpochSyncPolicy,
+    MemoryCommitStore,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -33,7 +34,10 @@ fn both_epoch_policies_match_the_established_file_store_bytes() {
     memory.commit(first).expect("first frame commits");
     for value in ["two", "three", "four"] {
         let mut transaction = memory.begin();
-        transaction.define(SlotId::new(format!("state/{value}")), state_fact(value));
+        transaction.define(
+            SlotId::new(format!("state/{value}")),
+            state_fact(value),
+        );
         memory.commit(transaction).expect("frame commits");
     }
     let frames = memory.frames();
@@ -48,15 +52,17 @@ fn both_epoch_policies_match_the_established_file_store_bytes() {
     }
     drop(oracle);
 
-    let mut per_frame = FileEpochStore::open(&per_frame_path, FileEpochSyncPolicy::PerFrame)
-        .expect("per-frame store opens");
+    let mut per_frame =
+        FileEpochStore::open(&per_frame_path, FileEpochSyncPolicy::PerFrame)
+            .expect("per-frame store opens");
     per_frame
         .append_epoch(&frames)
         .expect("per-frame epoch appends");
     drop(per_frame);
 
-    let mut per_epoch = FileEpochStore::open(&per_epoch_path, FileEpochSyncPolicy::PerEpoch)
-        .expect("per-epoch store opens");
+    let mut per_epoch =
+        FileEpochStore::open(&per_epoch_path, FileEpochSyncPolicy::PerEpoch)
+            .expect("per-epoch store opens");
     per_epoch
         .append_epoch(&frames)
         .expect("per-epoch arena appends");

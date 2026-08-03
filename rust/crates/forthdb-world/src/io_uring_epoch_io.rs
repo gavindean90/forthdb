@@ -4,7 +4,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-use io_uring::{IoUring, opcode, squeue, types};
+use io_uring::{opcode, squeue, types, IoUring};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
@@ -180,8 +180,7 @@ impl IoUringEpochFileIo {
                     std::io::ErrorKind::InvalidInput,
                     format!(
                         "io_uring epoch requires {} SQEs but ring has {} entries",
-                        entries.len(),
-                        self.ring_entries
+                        entries.len(), self.ring_entries
                     ),
                 ),
             ));
@@ -226,8 +225,7 @@ impl IoUringEpochFileIo {
         }
         metrics.completion_events += completions.len() as u64;
 
-        if let Err(error) = validate_completion_batch(expected_writes, expected_cqes, &completions)
-        {
+        if let Err(error) = validate_completion_batch(expected_writes, expected_cqes, &completions) {
             let reset = self.discard_and_recreate_ring().err();
             return Err(reset
                 .map(|source| (EpochIoPhase::EpochWrite, source))
@@ -409,10 +407,7 @@ impl IoUringEpochFileIo {
     }
 }
 
-fn invalid_completion(
-    phase: EpochIoPhase,
-    message: impl Into<String>,
-) -> (EpochIoPhase, std::io::Error) {
+fn invalid_completion(phase: EpochIoPhase, message: impl Into<String>) -> (EpochIoPhase, std::io::Error) {
     (
         phase,
         std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()),
@@ -495,7 +490,9 @@ fn validate_completion_batch(
                 EpochIoPhase::EpochWrite,
                 std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
-                    format!("io_uring write {index} completed {result} of {expected_length} bytes"),
+                    format!(
+                        "io_uring write {index} completed {result} of {expected_length} bytes"
+                    ),
                 ),
             ));
         }
@@ -521,6 +518,7 @@ fn validate_completion_batch(
     }
     Ok(())
 }
+
 
 fn write_user_data(index: usize) -> u64 {
     WRITE_USER_DATA_TAG | index as u64
@@ -648,8 +646,8 @@ impl EpochFileIo for IoUringEpochFileIo {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -686,7 +684,10 @@ mod tests {
         }
     }
 
-    fn open_or_skip(path: &Path, strategy: IoUringEpochStrategy) -> Option<IoUringEpochStore> {
+    fn open_or_skip(
+        path: &Path,
+        strategy: IoUringEpochStrategy,
+    ) -> Option<IoUringEpochStore> {
         match IoUringEpochFileIo::open_store_with_entries(path, strategy, 64) {
             Ok(store) => Some(store),
             Err(error) if unavailable(&error) => {
@@ -710,9 +711,7 @@ mod tests {
         for index in 0..count {
             let mut transaction = database.begin();
             transaction.define(SlotId::new(format!("slot/{index}")), fact(index));
-            database
-                .commit(transaction)
-                .expect("memory commit succeeds");
+            database.commit(transaction).expect("memory commit succeeds");
         }
         database.frames()
     }
@@ -788,9 +787,10 @@ mod tests {
     fn all_ring_epoch_strategies_match_established_v1_bytes() {
         let frames = frames(3);
         let control = TempFile::new("control");
-        let control_database =
-            Database::new(FileCommitStore::open(control.path()).expect("file control opens"))
-                .expect("control reconstructs");
+        let control_database = Database::new(
+            FileCommitStore::open(control.path()).expect("file control opens"),
+        )
+        .expect("control reconstructs");
         for frame in &frames {
             control_database
                 .store

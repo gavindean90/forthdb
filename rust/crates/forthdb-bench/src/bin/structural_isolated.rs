@@ -4,8 +4,8 @@ use serde::Serialize;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
 use std::hint::black_box;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 struct CountingAllocator;
@@ -167,9 +167,7 @@ fn main() {
         let prepared = prepare_world(size);
         drain_reaper();
         let (samples, iterations) = dimensions(size);
-        candidate_scaling.push(measure_world_candidate(
-            &prepared, size, samples, iterations,
-        ));
+        candidate_scaling.push(measure_world_candidate(&prepared, size, samples, iterations));
         read_scaling.push(measure_resolve(&prepared, size));
         drop(prepared);
         drain_reaper();
@@ -188,11 +186,7 @@ fn main() {
         implementation: "rust",
         scope: "milestone-5-structural-sharing-isolated",
         status: "observational",
-        profile: if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
+        profile: if cfg!(debug_assertions) { "debug" } else { "release" },
         environment: Environment {
             os: env::consts::OS,
             architecture: env::consts::ARCH,
@@ -395,7 +389,10 @@ fn measure_resolve(prepared: &PreparedWorld, retained: u64) -> ReadMeasurement {
     }
 }
 
-fn measure_snapshot_retirement(base_definitions: u64, snapshot_count: usize) -> SnapshotRetirement {
+fn measure_snapshot_retirement(
+    base_definitions: u64,
+    snapshot_count: usize,
+) -> SnapshotRetirement {
     drain_reaper();
     let database = Database::new(MemoryCommitStore::new()).expect("memory database opens");
     let mut initial = database.begin();
@@ -414,9 +411,7 @@ fn measure_snapshot_retirement(base_definitions: u64, snapshot_count: usize) -> 
             SlotId::new(format!("pressure/delta/{index}")),
             literal_fact("pressure", "delta", &index.to_string()),
         );
-        database
-            .commit(transaction)
-            .expect("pressure delta commits");
+        database.commit(transaction).expect("pressure delta commits");
         snapshots.push(database.snapshot());
     }
     drain_reaper();

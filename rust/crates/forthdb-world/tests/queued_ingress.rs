@@ -4,7 +4,7 @@ use forthdb_world::{
     TicketPhase,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -21,10 +21,12 @@ fn state_fact(entity: EntityId, value: String) -> Fact {
 
 #[test]
 fn concurrent_producers_lose_or_duplicate_no_admitted_intents() {
-    let database =
-        Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
-    let controller =
-        Arc::new(QueuedIntentController::new(database.clone(), 64, 16).expect("controller starts"));
+    let database = Arc::new(
+        Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
+    );
+    let controller = Arc::new(
+        QueuedIntentController::new(database.clone(), 64, 16).expect("controller starts"),
+    );
     let start = Arc::new(Barrier::new(PRODUCERS + 1));
     let (ticket_tx, ticket_rx) = mpsc::channel();
     let mut workers = Vec::new();
@@ -98,8 +100,9 @@ fn concurrent_producers_lose_or_duplicate_no_admitted_intents() {
 
 #[test]
 fn dropping_a_ticket_before_claim_does_not_remove_its_intent() {
-    let database =
-        Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
+    let database = Arc::new(
+        Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
+    );
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let release_rx = Arc::new(Mutex::new(release_rx));
@@ -108,9 +111,7 @@ fn dropping_a_ticket_before_claim_does_not_remove_its_intent() {
     let validator_once = block_once.clone();
     database.register_validator(move |_| {
         if validator_once.swap(false, Ordering::SeqCst) {
-            entered_tx
-                .send(())
-                .expect("test observes blocked predecessor");
+            entered_tx.send(()).expect("test observes blocked predecessor");
             validator_release
                 .lock()
                 .expect("release receiver lock")
@@ -144,17 +145,13 @@ fn dropping_a_ticket_before_claim_does_not_remove_its_intent() {
         TicketOutcome::Accepted { .. } => {}
         TicketOutcome::Rejected(error) => panic!("first intent rejected: {error}"),
     }
-    controller
-        .flush()
-        .expect("queued abandoned intent completes");
+    controller.flush().expect("queued abandoned intent completes");
 
     assert_eq!(database.snapshot().version(), 2);
-    assert!(
-        database
-            .snapshot()
-            .resolve(&SlotId::new("queued-abandonment/state"))
-            .is_some()
-    );
+    assert!(database
+        .snapshot()
+        .resolve(&SlotId::new("queued-abandonment/state"))
+        .is_some());
     let metrics = controller.metrics();
     assert_eq!(metrics.submitted, 2);
     assert_eq!(metrics.claimed, 2);

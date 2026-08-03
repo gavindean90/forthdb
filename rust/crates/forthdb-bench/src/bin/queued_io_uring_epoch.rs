@@ -2,17 +2,16 @@
 mod linux {
     use forthdb_core::{Atom, EntityId, Fact, ForthDb, Literal, Predicate, SlotId};
     use forthdb_world::{
-        CommitStore, Database, DurableQueuedIntentController, DurableSubmitError,
-        DurableTicketOutcome, EpochFileIo, FileCommitStore, FileEpochMetrics, FileEpochStore,
-        FileEpochStoreError, FileEpochSyncPolicy, IoUringEpochFileIo, IoUringEpochStrategy,
-        QueuedIntent,
+        CommitStore, Database, DurableQueuedIntentController, DurableSubmitError, DurableTicketOutcome,
+        EpochFileIo, FileCommitStore, FileEpochMetrics, FileEpochStore, FileEpochStoreError,
+        FileEpochSyncPolicy, IoUringEpochFileIo, IoUringEpochStrategy, QueuedIntent,
     };
     use serde::Serialize;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -161,8 +160,12 @@ mod linux {
                 for round in 0..ROUNDS {
                     for offset in 0..Variant::ALL.len() {
                         let variant = Variant::ALL[(round + offset) % Variant::ALL.len()];
-                        let sample =
-                            run_sample(base.path(), variant, max_batch, intents_per_producer);
+                        let sample = run_sample(
+                            base.path(),
+                            variant,
+                            max_batch,
+                            intents_per_producer,
+                        );
                         samples
                             .iter_mut()
                             .find(|(candidate, _)| *candidate == variant)
@@ -199,11 +202,7 @@ mod linux {
             environment: Environment {
                 os: env::consts::OS,
                 architecture: env::consts::ARCH,
-                profile: if cfg!(debug_assertions) {
-                    "debug"
-                } else {
-                    "release"
-                },
+                profile: if cfg!(debug_assertions) { "debug" } else { "release" },
                 git_sha: env::var("GITHUB_SHA").ok(),
                 github_run_id: env::var("GITHUB_RUN_ID").ok(),
             },
@@ -230,9 +229,10 @@ mod linux {
 
     fn build_base_file() -> TempFile {
         let base = TempFile::new("base");
-        let database =
-            Database::new(FileCommitStore::open(base.path()).expect("base file store opens"))
-                .expect("base file database reconstructs");
+        let database = Database::new(
+            FileCommitStore::open(base.path()).expect("base file store opens"),
+        )
+        .expect("base file database reconstructs");
         let mut transaction = database.begin();
         assert_eq!(transaction.entity(), EntityId::new(1));
         for index in 0..RETAINED_DEFINITIONS {
@@ -357,9 +357,7 @@ mod linux {
         let started = Instant::now();
         start_gate.wait();
         for _ in 0..total {
-            let ticket = ticket_rx
-                .recv()
-                .expect("every admitted ticket is collected");
+            let ticket = ticket_rx.recv().expect("every admitted ticket is collected");
             match ticket.wait().expect("durable ticket resolves") {
                 DurableTicketOutcome::Accepted { .. } => {}
                 DurableTicketOutcome::Rejected(error) => panic!("intent rejected: {error}"),

@@ -1,14 +1,15 @@
 use forthdb_core::{Atom, EntityId, Fact, Literal, Predicate, SlotId};
 use forthdb_world::{
-    CommitFrame, CommitStore, Database, EpochFileIo, EpochIoPhase, FileCommitStore, FileEpochState,
-    FileEpochStore, FileEpochStoreError, FileEpochSyncPolicy, MemoryCommitStore, StdEpochFileIo,
+    CommitFrame, CommitStore, Database, EpochFileIo, EpochIoPhase, FileCommitStore,
+    FileEpochState, FileEpochStore, FileEpochStoreError, FileEpochSyncPolicy, MemoryCommitStore,
+    StdEpochFileIo,
 };
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 const HEADER_LEN: usize = 16;
 const ENOSPC: i32 = 28;
@@ -45,9 +46,11 @@ impl EpochFileIo for PrefixThenFailIo {
             let target = self.prefix.min(bytes.len());
             let mut written = 0usize;
             while written < target {
-                let count =
-                    self.inner
-                        .write_at(phase, offset + written as u64, &bytes[written..target])?;
+                let count = self.inner.write_at(
+                    phase,
+                    offset + written as u64,
+                    &bytes[written..target],
+                )?;
                 if count == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -113,9 +116,7 @@ fn every_epoch_byte_boundary_repairs_to_the_exact_prefix() {
     let complete_path = temp_path("complete");
     let mut complete = FileEpochStore::open(&complete_path, FileEpochSyncPolicy::PerEpoch)
         .expect("complete store opens");
-    complete
-        .append_epoch(&frames)
-        .expect("complete epoch commits");
+    complete.append_epoch(&frames).expect("complete epoch commits");
     drop(complete);
     let complete_bytes = fs::read(&complete_path).expect("complete bytes read");
     let arena_len = complete_bytes.len() - HEADER_LEN;

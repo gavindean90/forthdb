@@ -1,6 +1,6 @@
 use forthdb_conformance::{
-    ExpectedRow, ExpectedValueSpec, FixtureError, KernelCase, KernelFixture, PatternSourceSpec,
-    Step, TermSpec,
+    ExpectedRow, ExpectedValueSpec, FixtureError, KernelCase, KernelFixture, PatternSourceSpec, Step,
+    TermSpec,
 };
 use forthdb_core::{
     Atom, Binding, BoundValue, EntityId, ForthDb, Literal, Pattern, Predicate, QueryOptions,
@@ -86,16 +86,10 @@ fn execute_case(case: &KernelCase) -> Result<usize, FixtureError> {
                 assertions += 1;
             }
             Step::Definitions { name, slot, expect } => {
-                let expected: Result<Vec<_>, _> = expect
-                    .iter()
-                    .map(|fact| fact.materialize(&entities))
-                    .collect();
+                let expected: Result<Vec<_>, _> =
+                    expect.iter().map(|fact| fact.materialize(&entities)).collect();
                 let expected = expected?;
-                let actual: Vec<_> = db
-                    .definitions(&SlotId::new(slot))
-                    .into_iter()
-                    .cloned()
-                    .collect();
+                let actual: Vec<_> = db.definitions(&SlotId::new(slot)).into_iter().cloned().collect();
                 if actual != expected {
                     return Err(mismatch(
                         &context,
@@ -176,14 +170,15 @@ fn execute_case(case: &KernelCase) -> Result<usize, FixtureError> {
                     .iter()
                     .map(|pattern| match pattern {
                         PatternSourceSpec::Inline(pattern) => pattern.materialize(&entities),
-                        PatternSourceSpec::Compiled(reference) => {
-                            compiled.get(&reference.compiled).cloned().ok_or_else(|| {
+                        PatternSourceSpec::Compiled(reference) => compiled
+                            .get(&reference.compiled)
+                            .cloned()
+                            .ok_or_else(|| {
                                 FixtureError::Validation(format!(
                                     "{context}: compiled pattern {:?} is unavailable",
                                     reference.compiled
                                 ))
-                            })
-                        }
+                            }),
                     })
                     .collect();
                 let result = db.query(
@@ -194,7 +189,13 @@ fn execute_case(case: &KernelCase) -> Result<usize, FixtureError> {
                         ..QueryOptions::default()
                     },
                 );
-                compare_rows(&context, name, &result.rows, &expect.rows, &entities)?;
+                compare_rows(
+                    &context,
+                    name,
+                    &result.rows,
+                    &expect.rows,
+                    &entities,
+                )?;
                 for (metric, expected) in &expect.metrics {
                     let actual = match metric.as_str() {
                         "candidate_facts" => result.metrics.candidate_facts,
@@ -235,9 +236,9 @@ fn source_term(
             entities,
             context,
         )?))),
-        TermSpec::Literal(reference) => Ok(SourceTerm::Atom(Atom::Literal(Literal::new(
-            &reference.literal,
-        )))),
+        TermSpec::Literal(reference) => {
+            Ok(SourceTerm::Atom(Atom::Literal(Literal::new(&reference.literal))))
+        }
         TermSpec::Variable(reference) => Variable::new(&reference.variable)
             .map(SourceTerm::Variable)
             .map_err(|error| FixtureError::Validation(format!("{context}: {error}"))),
@@ -261,11 +262,9 @@ fn expected_value(
     context: &str,
 ) -> Result<BoundValue, FixtureError> {
     match spec {
-        ExpectedValueSpec::Entity(reference) => Ok(BoundValue::Entity(entity_id(
-            &reference.entity,
-            entities,
-            context,
-        )?)),
+        ExpectedValueSpec::Entity(reference) => {
+            Ok(BoundValue::Entity(entity_id(&reference.entity, entities, context)?))
+        }
         ExpectedValueSpec::Literal(reference) => {
             Ok(BoundValue::Literal(Literal::new(&reference.literal)))
         }
@@ -303,7 +302,10 @@ fn compare_rows(
                 .binding
                 .iter()
                 .map(|(variable, value)| {
-                    Ok((variable.clone(), expected_value(value, entities, context)?))
+                    Ok((
+                        variable.clone(),
+                        expected_value(value, entities, context)?,
+                    ))
                 })
                 .collect();
             Ok((binding?, row.provenance.clone()))
@@ -335,7 +337,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn checked_in_fixture() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../conformance/v1/kernel_cases.json")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../conformance/v1/kernel_cases.json")
     }
 
     #[test]

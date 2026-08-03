@@ -1,5 +1,6 @@
 use forthdb_core::{
-    Atom, ForthDb, Literal, Pattern, Predicate, PredicateTerm, QueryOptions, SlotId, Term, Variable,
+    Atom, ForthDb, Literal, Pattern, Predicate, PredicateTerm, QueryOptions, SlotId, Term,
+    Variable,
 };
 use serde::Serialize;
 use std::env;
@@ -253,9 +254,9 @@ fn exact_query_measurement(dataset_size: u64, iterations: u64) -> Measurement {
         move |(db, patterns)| {
             let mut checksum = 0_u64;
             for _ in 0..iterations {
-                checksum = checksum.wrapping_add(black_box(
-                    db.query(patterns, QueryOptions::default()).rows.len(),
-                ) as u64);
+                checksum = checksum.wrapping_add(
+                    black_box(db.query(patterns, QueryOptions::default()).rows.len()) as u64,
+                );
             }
             checksum
         },
@@ -296,9 +297,9 @@ fn indexed_variable_query_measurement(dataset_size: u64, iterations: u64) -> Mea
         move |(db, patterns)| {
             let mut checksum = 0_u64;
             for _ in 0..iterations {
-                checksum = checksum.wrapping_add(black_box(
-                    db.query(patterns, QueryOptions::default()).rows.len(),
-                ) as u64);
+                checksum = checksum.wrapping_add(
+                    black_box(db.query(patterns, QueryOptions::default()).rows.len()) as u64,
+                );
             }
             checksum
         },
@@ -352,9 +353,9 @@ fn two_hop_join_measurement(fanout: u64, iterations: u64) -> Measurement {
         move |(db, patterns)| {
             let mut checksum = 0_u64;
             for _ in 0..iterations {
-                checksum = checksum.wrapping_add(black_box(
-                    db.query(patterns, QueryOptions::default()).rows.len(),
-                ) as u64);
+                checksum = checksum.wrapping_add(
+                    black_box(db.query(patterns, QueryOptions::default()).rows.len()) as u64,
+                );
             }
             checksum
         },
