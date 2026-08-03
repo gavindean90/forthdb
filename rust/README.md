@@ -27,7 +27,7 @@ The current conformance result is:
 status: passed
 ```
 
-`forthdb-world` implements Milestones 1 and 2 of `WORLD_CONTRACT.md`:
+`forthdb-world` implements Milestones 1, 2, and 3 of `WORLD_CONTRACT.md`:
 
 - `WorldId`
 - immutable `World` snapshots
@@ -41,17 +41,23 @@ status: passed
 - the `CommitStore` abstraction
 - `MemoryCommitStore`
 - `FileCommitStore`
+- `MmapCommitStore`
 - canonical versioned commit-frame encoding
 - synchronized append before publication
 - reopening and logical reconstruction
 - incomplete-tail recovery
 - fail-closed corruption handling
+- mapped frame-offset indexing
+- borrowed zero-copy record and payload slices
+- remapping after successful durable appends
 
 The candidate implementation deep-clones the base semantic kernel and applies only the staged transaction operations to that private clone. Existing readers retain their original immutable `Arc<World>`.
 
-`FileCommitStore` writes the version 1 format specified in `../FILE_FORMAT.md` using ordinary file I/O and `sync_data()`. It intentionally contains no mmap or io_uring code.
+`FileCommitStore` writes the version 1 format specified in `../FILE_FORMAT.md` using ordinary file I/O and `sync_data()`. `MmapCommitStore` maps those exact bytes for validation, recovery, and direct borrowed access to persisted records and payloads. The existing file store remains the authoritative append implementation; the mapped store remaps after a successful synchronized append.
 
-`forthdb-bench` contains separate release-mode observational benchmark binaries for the semantic kernel, committed-world engine, and file commit store.
+A post-durability remap failure is recorded as an optimization failure rather than returned as a failed commit. That avoids reporting failure after a frame has already been synchronized. Cross-process mutation or truncation while a map is live remains outside the current contract.
+
+`forthdb-bench` contains separate release-mode observational benchmark binaries for the semantic kernel, committed-world engine, file commit store, and mmap commit store.
 
 ## Run locally
 
@@ -71,6 +77,9 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
 
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin file
+
+cargo run --quiet --release --manifest-path rust/Cargo.toml \
+  -p forthdb-bench --bin mmap
 ```
 
 The benchmark commands print JSON containing workload dimensions, three elapsed samples, median/minimum/maximum nanoseconds per operation, operations per second, checksums, build profile, platform, and available GitHub metadata.
@@ -130,6 +139,27 @@ The close spacing between no-op and one-definition durable commits shows that th
 
 Reopening 1,000 frames remained below half a millisecond in this observation. That result covers physical frame checks plus logical identity and invariant verification; it is not a checkpointed startup measurement.
 
+## MmapCommitStore baseline
+
+The accepted Milestone 3 benchmark was GitHub Actions run `30774026801`, using a release build on Linux x86-64 and the hosted runner's temporary filesystem.
+
+| Workload | Median | Approx. throughput | Shape |
+| --- | ---: | ---: | --- |
+| Mmap open and reconstruct 100 frames | 103.64 µs | 9,648 opens/s | Map, scan, checksum, decode, validate, and reconstruct |
+| Mmap open and reconstruct 1,000 frames | 463.44 µs | 2,158 opens/s | Full validation and reconstruction from mapped bytes |
+| Mmap open and reconstruct 10,000 frames | 3.96 ms | 253 opens/s | Full validation and reconstruction from mapped bytes |
+| Paired ordinary-file open, 1,000 frames | 419.81 µs | 2,382 opens/s | Same generated format and hosted run using `read_to_end` |
+| Zero-copy mapped record lookup, 10,000 frames | 2.69 ns | 372.2 million lookups/s | Hot offset-directory lookup returning a borrowed record slice |
+| Full mapped-byte scan, 10,000 frames | 112.80 µs/scan | 8,865 scans/s | Consume every mapped byte without an owned input copy |
+| 100 synchronized mmap no-op commits | 315.02 µs/commit | 3,174 commits/s | Canonical append, `sync_data()`, publication, and remap |
+| Recover mapped incomplete tail after 100 frames | 381.03 µs | 2,624 recoveries/s | Map, detect tail, unmap, truncate, synchronize, and remap |
+
+Mmap did not improve full 1,000-frame reopening in this observation: the paired ordinary-file path was about 10% faster. The current startup path still decodes owned `CommitFrame` values and reconstructs the complete semantic world, so those costs dominate after the input bytes are available. Mapping removes the separate `read_to_end` input buffer, but it does not yet make semantic reconstruction zero-copy.
+
+The new capability is direct indexed access to persisted bytes. Opening builds a compact frame-span directory, after which `mapped_record()` and `mapped_payload()` return borrowed slices into the mapping without allocation or payload decoding. The 2.69 ns result is a hot-cache microbenchmark of that narrow primitive, not an end-to-end database query or storage-device result.
+
+The synchronized mmap commit observation remained in the same sub-millisecond class as `FileCommitStore`. Hosted-runner variance and benchmark ordering prevent treating the measured difference as a durable speedup claim. The relevant result is that remapping did not introduce an order-of-magnitude penalty while preserving the same synchronized append contract.
+
 ## Benchmark boundaries
 
 The current measurements cover:
@@ -141,15 +171,18 @@ The current measurements cover:
 - canonical frame encoding and checksums
 - ordinary file append and `sync_data()`
 - reopening from disk
-- incomplete-tail truncation
+- memory-mapped frame scanning and validation
+- borrowed zero-copy access to persisted record and payload bytes
+- incomplete-tail truncation and remapping
 - fail-closed tests for established corruption
 
 They do not include:
 
-- mmap
 - io_uring
 - batching or group commit
 - checkpoints
+- zero-copy semantic object reconstruction
+- structural sharing in candidate worlds
 - compaction
 - process-crash fault injection
 - cross-process writer coordination
@@ -161,6 +194,6 @@ The figures are not comparisons with Python, SQLite, RocksDB, PostgreSQL, or ano
 
 ## Next storage milestone
 
-The next storage milestone is `MmapCommitStore`: map the same canonical committed history for read and recovery while preserving the existing transaction, publication, and file-format contracts.
+The next storage milestone is `IoUringCommitStore`: preserve the same canonical frames and publication contract while moving append and synchronization submission behind Linux io_uring.
 
-Mmap is a read-path and startup mechanism. It does not replace synchronized append. io_uring remains the later write-submission milestone, where batching and queue depth can be measured without changing committed-world semantics.
+The initial io_uring milestone should measure single-commit overhead honestly before introducing queue depth, batching, or group commit. Mmap remains the read and persisted-byte access path; io_uring is the write-submission path.
