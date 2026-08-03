@@ -1,4 +1,14 @@
-fn decode_file(bytes: &[u8]) -> Result<(Vec<Arc<CommitFrame>>, usize), FileCommitStoreError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameSpan {
+    record_start: usize,
+    payload_start: usize,
+    payload_end: usize,
+    record_end: usize,
+}
+
+fn decode_file(
+    bytes: &[u8],
+) -> Result<(Vec<Arc<CommitFrame>>, Vec<FrameSpan>, usize), FileCommitStoreError> {
     if bytes.len() < FILE_HEADER_LEN {
         return Err(FileCommitStoreError::InvalidHeader(
             "header is incomplete".to_owned(),
@@ -21,6 +31,7 @@ fn decode_file(bytes: &[u8]) -> Result<(Vec<Arc<CommitFrame>>, usize), FileCommi
     }
 
     let mut frames = Vec::new();
+    let mut spans = Vec::new();
     let mut offset = FILE_HEADER_LEN;
     let mut last_good_offset = FILE_HEADER_LEN;
 
@@ -83,11 +94,68 @@ fn decode_file(bytes: &[u8]) -> Result<(Vec<Arc<CommitFrame>>, usize), FileCommi
         );
         validate_decoded_position(&frames, &frame, offset)?;
         frames.push(frame);
+        spans.push(FrameSpan {
+            record_start: offset,
+            payload_start,
+            payload_end,
+            record_end: trailer_end,
+        });
         offset += total_len;
         last_good_offset = offset;
     }
 
-    Ok((frames, last_good_offset))
+    Ok((frames, spans, last_good_offset))
+}
+
+fn decode_complete_span(bytes: &[u8], offset: usize) -> Result<FrameSpan, FileCommitStoreError> {
+    let remaining = bytes.len().saturating_sub(offset);
+    if remaining < FRAME_PREFIX_LEN {
+        return Err(corrupt(offset, "newly appended frame prefix is incomplete"));
+    }
+    if &bytes[offset..offset + 4] != FRAME_MAGIC {
+        return Err(corrupt(offset, "frame magic does not match FRM1"));
+    }
+    let payload_len = u64::from_le_bytes(
+        bytes[offset + 4..offset + 12]
+            .try_into()
+            .expect("fixed frame length slice"),
+    );
+    if payload_len > MAX_FRAME_BYTES {
+        return Err(corrupt(offset, "newly appended frame exceeds payload limit"));
+    }
+    let payload_len = usize::try_from(payload_len)
+        .map_err(|_| corrupt(offset, "payload length does not fit this platform"))?;
+    let payload_start = offset + FRAME_PREFIX_LEN;
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or_else(|| corrupt(offset, "record length overflow"))?;
+    let record_end = payload_end
+        .checked_add(FRAME_TRAILER_LEN)
+        .ok_or_else(|| corrupt(offset, "record length overflow"))?;
+    if record_end != bytes.len() {
+        return Err(corrupt(
+            offset,
+            format!("newly appended record ends at {record_end}, mapped file ends at {}", bytes.len()),
+        ));
+    }
+    if &bytes[payload_end..record_end] != FRAME_TRAILER {
+        return Err(corrupt(offset, "completion trailer does not match END1"));
+    }
+    let expected_checksum = u64::from_le_bytes(
+        bytes[offset + 12..offset + 20]
+            .try_into()
+            .expect("fixed checksum slice"),
+    );
+    let actual_checksum = checksum(&bytes[payload_start..payload_end]);
+    if actual_checksum != expected_checksum {
+        return Err(corrupt(offset, "newly appended frame checksum mismatch"));
+    }
+    Ok(FrameSpan {
+        record_start: offset,
+        payload_start,
+        payload_end,
+        record_end,
+    })
 }
 
 fn validate_decoded_position(
