@@ -1,0 +1,64 @@
+name: Patch Milestone 6D Benchmark API
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out head branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref }}
+          persist-credentials: true
+
+      - name: Add explicit stopped and poisoned benchmark failures
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          paths = [
+              Path("rust/crates/forthdb-bench/src/bin/queued_file_epoch.rs"),
+              Path("rust/crates/forthdb-bench/src/bin/queued_io_uring_epoch.rs"),
+          ]
+          closed = '''                            Err(DurableSubmitError::Closed(_)) => {
+                                      panic!("durable controller closed")
+                                  }
+          '''
+          poisoned = '''                            Err(DurableSubmitError::Closed(_)) => {
+                                      panic!("durable controller closed")
+                                  }
+                                  Err(DurableSubmitError::Poisoned { reason, .. }) => {
+                                      panic!("durable controller poisoned: {reason}")
+                                  }
+          '''
+          failed = '''                DurableTicketOutcome::DurabilityFailed(error) => {
+                          panic!("durability failed during benchmark: {error}")
+                      }
+          '''
+          stopped = '''                DurableTicketOutcome::DurabilityFailed(error) => {
+                          panic!("durability failed during benchmark: {error}")
+                      }
+                      DurableTicketOutcome::Stopped(reason) => {
+                          panic!("durable controller stopped during benchmark: {reason:?}")
+                      }
+          '''
+          for path in paths:
+              text = path.read_text()
+              if closed not in text:
+                  raise SystemExit(f"closed match target missing in {path}")
+              if failed not in text:
+                  raise SystemExit(f"outcome match target missing in {path}")
+              text = text.replace(closed, poisoned, 1).replace(failed, stopped, 1)
+              path.write_text(text)
+          PY
+          rm .github/workflows/patch-m6d-bench-api.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Handle lifecycle outcomes in durability benchmarks"
+          git push origin "HEAD:${{ github.head_ref }}"
