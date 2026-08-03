@@ -82,6 +82,7 @@ mod linux {
                 io_uring_noop_sequence_measurement(100),
                 file_define_sequence_measurement(100),
                 io_uring_define_sequence_measurement(100),
+                file_noop_sequence_measurement(1_000),
                 io_uring_noop_sequence_measurement(1_000),
                 io_uring_open_existing_measurement(1_000),
             ]
@@ -171,8 +172,22 @@ mod linux {
     }
 
     fn file_noop_sequence_measurement(commits: u64) -> Measurement {
+        let (name, notes) = match commits {
+            100 => (
+                "file_store_individually_synced_noop_commits_100",
+                "Same-run baseline: canonical write_all, sync_data, and publication for each fixed-size frame.",
+            ),
+            1_000 => (
+                "file_store_individually_synced_noop_commits_1000",
+                "Longer ordinary-I/O control using write_all and sync_data for every fixed-size frame.",
+            ),
+            _ => (
+                "file_store_individually_synced_noop_commits",
+                "Ordinary-I/O control using write_all and sync_data for every fixed-size frame.",
+            ),
+        };
         measure_with_setup(
-            "file_store_individually_synced_noop_commits_100",
+            name,
             "commit",
             commits,
             || {
@@ -190,7 +205,7 @@ mod linux {
                 database.snapshot().version()
                     ^ fs::metadata(temp.path()).expect("metadata exists").len()
             },
-            "Same-run baseline: canonical write_all, sync_data, and publication for each fixed-size frame.",
+            notes,
         )
     }
 
