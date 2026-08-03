@@ -22,6 +22,50 @@ mod linux {
     const MAX_BATCH: usize = 16;
     const RING_ENTRIES: u32 = 64;
 
+    #[derive(Clone, Copy)]
+    enum Materializer {
+        TokenVm,
+        World,
+    }
+
+    impl Materializer {
+        fn from_environment() -> Result<Self, Box<dyn Error>> {
+            match std::env::var("FORTHDB_LIBRARY_MATERIALIZER")
+                .unwrap_or_else(|_| "vm".to_owned())
+                .as_str()
+            {
+                "vm" => Ok(Self::TokenVm),
+                "world" => Ok(Self::World),
+                value => Err(format!(
+                    "FORTHDB_LIBRARY_MATERIALIZER must be vm or world, found {value}"
+                )
+                .into()),
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::TokenVm => "io_uring_admission_journal_token_vm",
+                Self::World => "io_uring_admission_journal_epoch_worlds",
+            }
+        }
+
+        fn uses_vm(self) -> bool {
+            matches!(self, Self::TokenVm)
+        }
+
+        fn open(self, path: &Path) -> Result<AdmissionEpochController, Box<dyn Error>> {
+            Ok(match self {
+                Self::TokenVm => {
+                    AdmissionEpochController::open_vm(path, CAPACITY, MAX_BATCH, RING_ENTRIES)?
+                }
+                Self::World => {
+                    AdmissionEpochController::open(path, CAPACITY, MAX_BATCH, RING_ENTRIES)?
+                }
+            })
+        }
+    }
+
     #[derive(Serialize)]
     struct Report {
         status: &'static str,
@@ -66,6 +110,8 @@ mod linux {
         data_writes: u64,
         data_syncs: u64,
         completion_events: u64,
+        vm_materialized_epochs: u64,
+        world_materialized_epochs: u64,
     }
 
     struct Accepted {
@@ -84,7 +130,7 @@ mod linux {
                 ))
             });
         let _ = fs::remove_file(&path);
-        let report = run_library(&path)?;
+        let report = run_library(&path, Materializer::from_environment()?)?;
         let json = serde_json::to_string_pretty(&report)?;
         if let Ok(report_path) = std::env::var("FORTHDB_LIBRARY_REPORT") {
             fs::write(report_path, format!("{json}\n"))?;
@@ -93,9 +139,9 @@ mod linux {
         Ok(())
     }
 
-    fn run_library(path: &Path) -> Result<Report, Box<dyn Error>> {
+    fn run_library(path: &Path, materializer: Materializer) -> Result<Report, Box<dyn Error>> {
         let started = Instant::now();
-        let controller = AdmissionEpochController::open(path, CAPACITY, MAX_BATCH, RING_ENTRIES)?;
+        let controller = materializer.open(path)?;
 
         let named = [
             ("Asimov", "Isaac Asimov"),
@@ -309,7 +355,7 @@ mod linux {
         controller.shutdown();
         drop(controller);
 
-        let recovered = AdmissionEpochController::open(path, CAPACITY, MAX_BATCH, RING_ENTRIES)?;
+        let recovered = materializer.open(path)?;
         let recovered_world = recovered.snapshot();
         let recovered_locations = query(&recovered_world, &copies_and_shelves);
         let recovery = Recovery {
@@ -328,10 +374,16 @@ mod linux {
         if observation.durable_epochs != observation.applied_epochs {
             return Err("durable admission and semantic publication did not converge".into());
         }
+        if materializer.uses_vm()
+            && (observation.vm_materialized_epochs != observation.applied_epochs
+                || observation.world_materialized_epochs != 0)
+        {
+            return Err("library epochs did not remain on the token VM materializer".into());
+        }
 
         Ok(Report {
             status: "ok",
-            engine: "io_uring_admission_journal_epoch_worlds",
+            engine: materializer.label(),
             database_path: path.display().to_string(),
             elapsed_us: started.elapsed().as_micros(),
             world_version: recovered_world.version(),
@@ -505,6 +557,8 @@ mod linux {
             data_writes: controller.data_writes,
             data_syncs: controller.data_syncs,
             completion_events: controller.completion_events,
+            vm_materialized_epochs: controller.vm_materialized_epochs,
+            world_materialized_epochs: controller.world_materialized_epochs,
         }
     }
 }

@@ -13,6 +13,7 @@ This workspace contains the Rust semantic kernel and committed-world engine.
 7. Ordinary-file durability epochs
 8. Opt-in speculative io_uring durability overlap
 9. Durable admission journal with immutable epoch worlds
+10. Durable token-VM materialization and deterministic VM recovery
 
 All stores implement the same `CommitStore` contract. Strict transactions derive and validate a private candidate, append its canonical `CommitFrame`, wait for required durability, and only then publish the immutable successor.
 
@@ -26,7 +27,7 @@ Milestone 6B adds `FileEpochStore` and `DurableQueuedIntentController`. The pair
 
 Milestone 6C tested three synchronous Linux io_uring epoch transports. None outperformed the ordinary-file epoch control, so those transports were retired. The remaining opt-in io_uring controller uses one contiguous `WRITE` plus `FSYNC(DATASYNC)` to overlap durability of epoch N with private preparation of epoch N+1. The ordinary-file per-epoch transport remains the default.
 
-The current draft direction separates durable admission from semantic publication. Ordered intents are encoded into one checksummed admission epoch and become durable through one io_uring `WRITE -> DATASYNC`. The admitted epoch is then evaluated deterministically and publishes at most one immutable world. Recovery replays admission epochs rather than requiring a second synchronized outcome log. Multiple accepted intents in one epoch share the same published world and preserve individual accepted or rejected outcomes.
+The durable token-VM path separates durable admission from semantic publication. Ordered intents are encoded into one checksummed admission epoch and become durable through one io_uring `WRITE -> DATASYNC`. `AdmissionEpochController::open_vm` deterministically compiles each durable intent into the framed stack VM during live execution and recovery, then publishes at most one existing immutable `World` query view. Multiple accepted intents in one epoch share the same published world and preserve individual accepted or rejected outcomes.
 
 `AdmissionEpochController::open_with_window` makes the durable-to-applied bound
 explicit. The existing `open` API keeps the one-epoch default. Larger windows
@@ -66,6 +67,7 @@ Design and evidence:
 - [`FILE_EPOCHS.md`](FILE_EPOCHS.md)
 - [`IO_URING_EPOCHS.md`](IO_URING_EPOCHS.md)
 - [`ADMISSION_EPOCH_WORLDS.md`](ADMISSION_EPOCH_WORLDS.md)
+- [`DURABLE_TOKEN_VM.md`](DURABLE_TOKEN_VM.md)
 - [`FILE_FORMAT.md`](../FILE_FORMAT.md)
 - [`WORLD_CONTRACT.md`](../WORLD_CONTRACT.md)
 

@@ -1,7 +1,7 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::io_uring_epoch_io::PendingIoUringEpoch;
-use crate::queued::{decode_queued_intent, encode_queued_intent};
+use crate::queued::{VmEpochMaterializer, decode_queued_intent, encode_queued_intent};
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -133,6 +133,8 @@ pub struct AdmissionEpochMetrics {
     pub data_syncs: u64,
     pub completion_events: u64,
     pub maximum_semantic_lag: u64,
+    pub vm_materialized_epochs: u64,
+    pub world_materialized_epochs: u64,
 }
 
 #[derive(Default)]
@@ -149,6 +151,8 @@ struct Metrics {
     data_syncs: AtomicU64,
     completion_events: AtomicU64,
     maximum_semantic_lag: AtomicU64,
+    vm_materialized_epochs: AtomicU64,
+    world_materialized_epochs: AtomicU64,
 }
 
 impl Metrics {
@@ -166,6 +170,8 @@ impl Metrics {
             data_syncs: self.data_syncs.load(Ordering::Relaxed),
             completion_events: self.completion_events.load(Ordering::Relaxed),
             maximum_semantic_lag: self.maximum_semantic_lag.load(Ordering::Relaxed),
+            vm_materialized_epochs: self.vm_materialized_epochs.load(Ordering::Relaxed),
+            world_materialized_epochs: self.world_materialized_epochs.load(Ordering::Relaxed),
         }
     }
 
@@ -176,6 +182,17 @@ impl Metrics {
             .saturating_sub(self.applied_epochs.load(Ordering::Acquire));
         self.maximum_semantic_lag.fetch_max(lag, Ordering::Relaxed);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionMaterializer {
+    World,
+    TokenVm,
+}
+
+enum EpochMaterializer {
+    World,
+    TokenVm(VmEpochMaterializer),
 }
 
 struct StagedIntent {
@@ -230,6 +247,41 @@ impl AdmissionEpochController {
         )
     }
 
+    pub fn open_vm(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        max_batch: usize,
+        ring_entries: u32,
+    ) -> Result<Self, AdmissionEpochOpenError> {
+        Self::open_with_materializer(
+            path,
+            capacity,
+            max_batch,
+            ring_entries,
+            1,
+            Vec::new(),
+            AdmissionMaterializer::TokenVm,
+        )
+    }
+
+    pub fn open_vm_with_window(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        max_batch: usize,
+        ring_entries: u32,
+        max_unapplied_epochs: usize,
+    ) -> Result<Self, AdmissionEpochOpenError> {
+        Self::open_with_materializer(
+            path,
+            capacity,
+            max_batch,
+            ring_entries,
+            max_unapplied_epochs,
+            Vec::new(),
+            AdmissionMaterializer::TokenVm,
+        )
+    }
+
     pub fn open_with_window(
         path: impl AsRef<Path>,
         capacity: usize,
@@ -272,6 +324,45 @@ impl AdmissionEpochController {
         max_unapplied_epochs: usize,
         validators: Vec<Validator>,
     ) -> Result<Self, AdmissionEpochOpenError> {
+        Self::open_with_materializer(
+            path,
+            capacity,
+            max_batch,
+            ring_entries,
+            max_unapplied_epochs,
+            validators,
+            AdmissionMaterializer::World,
+        )
+    }
+
+    pub fn open_vm_with_validators_and_window(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        max_batch: usize,
+        ring_entries: u32,
+        max_unapplied_epochs: usize,
+        validators: Vec<Validator>,
+    ) -> Result<Self, AdmissionEpochOpenError> {
+        Self::open_with_materializer(
+            path,
+            capacity,
+            max_batch,
+            ring_entries,
+            max_unapplied_epochs,
+            validators,
+            AdmissionMaterializer::TokenVm,
+        )
+    }
+
+    fn open_with_materializer(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        max_batch: usize,
+        ring_entries: u32,
+        max_unapplied_epochs: usize,
+        validators: Vec<Validator>,
+        materializer: AdmissionMaterializer,
+    ) -> Result<Self, AdmissionEpochOpenError> {
         if capacity == 0 || max_batch == 0 || max_unapplied_epochs == 0 {
             return Err(AdmissionEpochOpenError::Config(
                 "capacity, maximum batch, and maximum unapplied epochs must be nonzero".to_owned(),
@@ -290,12 +381,14 @@ impl AdmissionEpochController {
             let lease = WriterLease::acquire(&path)?;
             let recovered = recover_journal(&path)?;
             let validator_store = Arc::new(RwLock::new(validators));
-            let current = Arc::new(RwLock::new(replay_epochs(
+            let (replayed, materializer) = replay_epochs(
                 &recovered.epochs,
                 &validator_store
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            )?));
+                materializer,
+            )?;
+            let current = Arc::new(RwLock::new(replayed));
             let io = IoUringEpochFileIo::open(&path, ring_entries)?;
             let metrics = Arc::new(Metrics::default());
             metrics
@@ -326,6 +419,7 @@ impl AdmissionEpochController {
                         worker_current,
                         worker_validators,
                         worker_metrics,
+                        materializer,
                     );
                     worker_closed.store(true, Ordering::Release);
                 })
@@ -530,6 +624,7 @@ fn run_worker(
     current: Arc<RwLock<Arc<World>>>,
     validators: Arc<RwLock<Vec<Validator>>>,
     metrics: Arc<Metrics>,
+    mut materializer: EpochMaterializer,
 ) {
     let mut pending_commands = VecDeque::new();
     let mut durable_backlog = VecDeque::new();
@@ -641,7 +736,9 @@ fn run_worker(
                 }
             }
 
-            if let Err((batch, error)) = materialize(durable, &current, &validators, &metrics) {
+            if let Err((batch, error)) =
+                materialize(durable, &current, &validators, &metrics, &mut materializer)
+            {
                 fail_outcomes(batch, error.clone());
                 if let Some(pending) = pending_successor {
                     match complete_admission(&mut io, &mut file_len, pending, &metrics) {
@@ -786,6 +883,7 @@ fn materialize(
     current: &RwLock<Arc<World>>,
     validators: &RwLock<Vec<Validator>>,
     metrics: &Metrics,
+    materializer: &mut EpochMaterializer,
 ) -> Result<(), (EpochBatch, String)> {
     let base = current
         .read()
@@ -800,10 +898,26 @@ fn materialize(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let plan = match catch_unwind(AssertUnwindSafe(|| {
-        derive_epoch_world(base, intents, &validator_snapshot)
+    let plan = match catch_unwind(AssertUnwindSafe(|| match materializer {
+        EpochMaterializer::World => Ok((
+            derive_epoch_world(base, intents, &validator_snapshot),
+            false,
+        )),
+        EpochMaterializer::TokenVm(vm) => vm.materialize(base, intents, &validator_snapshot),
     })) {
-        Ok(plan) => plan,
+        Ok(Ok((plan, used_vm))) => {
+            if used_vm {
+                metrics
+                    .vm_materialized_epochs
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                metrics
+                    .world_materialized_epochs
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            plan
+        }
+        Ok(Err(error)) => return Err((batch, error)),
         Err(payload) => {
             return Err((
                 batch,
@@ -976,12 +1090,28 @@ fn recover_journal(path: &Path) -> Result<RecoveredJournal, AdmissionEpochOpenEr
 fn replay_epochs(
     epochs: &[Vec<QueuedIntent>],
     validators: &[Validator],
-) -> Result<Arc<World>, AdmissionEpochOpenError> {
+    materializer: AdmissionMaterializer,
+) -> Result<(Arc<World>, EpochMaterializer), AdmissionEpochOpenError> {
     let mut world = Arc::new(World::genesis());
+    let mut materializer = match materializer {
+        AdmissionMaterializer::World => EpochMaterializer::World,
+        AdmissionMaterializer::TokenVm => {
+            EpochMaterializer::TokenVm(VmEpochMaterializer::new(world.next_entity()))
+        }
+    };
     for intents in epochs {
-        world = derive_epoch_world(world, intents.clone(), validators).tail();
+        world = match &mut materializer {
+            EpochMaterializer::World => {
+                derive_epoch_world(world, intents.clone(), validators).tail()
+            }
+            EpochMaterializer::TokenVm(vm) => vm
+                .materialize(world, intents.clone(), validators)
+                .map_err(AdmissionEpochOpenError::Format)?
+                .0
+                .tail(),
+        };
     }
-    Ok(world)
+    Ok((world, materializer))
 }
 
 fn encode_epoch(batch: &EpochBatch) -> Vec<u8> {
@@ -1193,7 +1323,8 @@ mod tests {
         assert_eq!(recovered.epochs.len(), 2);
         assert_eq!(recovered.file_len, expected_len as u64);
         assert_eq!(fs::metadata(&path).unwrap().len(), expected_len as u64);
-        let world = replay_epochs(&recovered.epochs, &[]).expect("epochs materialize");
+        let (world, _) = replay_epochs(&recovered.epochs, &[], AdmissionMaterializer::TokenVm)
+            .expect("epochs materialize");
         assert_eq!(world.version(), 2);
         assert!(world.resolve(&SlotId::new("replay/name")).is_some());
         assert!(world.resolve(&SlotId::new("replay/state")).is_some());
@@ -1202,9 +1333,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn io_uring_admission_publishes_one_world_and_replays_it() {
+    fn io_uring_token_vm_publishes_one_world_and_replays_it() {
         let path = path("io-uring");
-        let controller = match AdmissionEpochController::open(&path, 16, 16, 64) {
+        let controller = match AdmissionEpochController::open_vm(&path, 16, 16, 64) {
             Ok(controller) => controller,
             Err(AdmissionEpochOpenError::Io(error))
                 if matches!(
@@ -1251,11 +1382,13 @@ mod tests {
         };
         assert_eq!(first_world.id(), second_world.id());
         assert_eq!(first_world.version(), 1);
+        assert_eq!(controller.metrics().vm_materialized_epochs, 1);
+        assert_eq!(controller.metrics().world_materialized_epochs, 0);
         let expected = first_world.id();
         controller.shutdown();
         drop(controller);
 
-        let reopened = AdmissionEpochController::open(&path, 16, 16, 64)
+        let reopened = AdmissionEpochController::open_vm(&path, 16, 16, 64)
             .expect("durable admission journal reopens");
         assert_eq!(reopened.snapshot().id(), expected);
         reopened.shutdown();

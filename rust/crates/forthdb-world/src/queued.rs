@@ -1,4 +1,7 @@
 use super::*;
+use crate::stack_vm::{
+    Cell, ExecutionOutcome, Instruction, IntentProgram, SlotToken, Workspace as VmWorkspace,
+};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -582,6 +585,289 @@ impl EpochPlan {
 
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
+    }
+}
+
+const VM_LITERAL_BASE: u64 = 1 << 63;
+
+/// Persistent token dictionaries and semantic state for the durable VM
+/// materializer. Durable intents remain the canonical journal representation;
+/// both live execution and recovery compile them through this same state.
+pub(crate) struct VmEpochMaterializer {
+    workspace: VmWorkspace,
+    slots: BTreeMap<SlotId, SlotToken>,
+    predicates: BTreeMap<Predicate, Cell>,
+    predicate_values: Vec<Predicate>,
+    literals: BTreeMap<Literal, Cell>,
+    literal_values: Vec<Literal>,
+}
+
+impl VmEpochMaterializer {
+    pub(crate) fn new(next_entity: u64) -> Self {
+        Self {
+            workspace: VmWorkspace::with_indexes_from(next_entity, 0, 32, 1_024, 1_024),
+            slots: BTreeMap::new(),
+            predicates: BTreeMap::new(),
+            predicate_values: Vec::new(),
+            literals: BTreeMap::new(),
+            literal_values: Vec::new(),
+        }
+    }
+
+    pub(crate) fn materialize(
+        &mut self,
+        base: Arc<World>,
+        intents: Vec<QueuedIntent>,
+        validators: &[Validator],
+    ) -> Result<(EpochPlan, bool), String> {
+        if !validators.is_empty() {
+            let plan = derive_epoch_world(base, intents, validators);
+            if let Some(frame) = plan.frames().first() {
+                self.apply_committed(frame.operations())?;
+            }
+            return Ok((plan, false));
+        }
+        self.derive_vm_epoch(base, intents).map(|plan| (plan, true))
+    }
+
+    fn derive_vm_epoch(
+        &mut self,
+        base: Arc<World>,
+        intents: Vec<QueuedIntent>,
+    ) -> Result<EpochPlan, String> {
+        enum VmOutcome {
+            Accepted {
+                position: usize,
+                entities: BTreeMap<TempEntity, EntityId>,
+            },
+            Rejected(RejectedIntent),
+        }
+
+        if self.workspace.next_entity() != base.next_entity() {
+            return Err(format!(
+                "VM allocator {}, published world allocator {}",
+                self.workspace.next_entity(),
+                base.next_entity()
+            ));
+        }
+
+        let mut predecessor_id = base.id();
+        let mut predecessor_version = base.version();
+        let mut accepted_operations = Vec::new();
+        let mut outcomes = Vec::with_capacity(intents.len());
+        let mut accepted_count = 0usize;
+
+        for (position, intent) in intents.into_iter().enumerate() {
+            if let Err(error) = self.check_preconditions(predecessor_id, &intent.preconditions) {
+                outcomes.push(VmOutcome::Rejected(RejectedIntent { position, error }));
+                continue;
+            }
+
+            let (operations, entities) = match resolve_operations_from(
+                self.workspace.next_entity(),
+                intent.namespace,
+                intent.operations,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    outcomes.push(VmOutcome::Rejected(RejectedIntent { position, error }));
+                    continue;
+                }
+            };
+            let program = self.compile_operations(&operations)?;
+            match self.workspace.execute(&program) {
+                ExecutionOutcome::Accepted => {
+                    predecessor_version = predecessor_version.saturating_add(1);
+                    predecessor_id = calculate_world_id(
+                        predecessor_id,
+                        predecessor_version,
+                        self.workspace.next_entity(),
+                        &operations,
+                    );
+                    accepted_operations.extend(operations);
+                    accepted_count += 1;
+                    outcomes.push(VmOutcome::Accepted { position, entities });
+                }
+                ExecutionOutcome::Rejected(error) => {
+                    return Err(format!(
+                        "compiled durable intent was rejected by the VM: {error:?}"
+                    ));
+                }
+            }
+        }
+
+        if accepted_count == 0 {
+            return Ok(EpochPlan {
+                base: base.clone(),
+                tail: base,
+                outcomes: outcomes
+                    .into_iter()
+                    .map(|outcome| match outcome {
+                        VmOutcome::Rejected(rejected) => EpochOutcome::Rejected(rejected),
+                        VmOutcome::Accepted { .. } => unreachable!(),
+                    })
+                    .collect(),
+                frames: Vec::new(),
+            });
+        }
+
+        let candidate = CandidateWorld::construct(base.as_ref(), accepted_operations)
+            .map_err(|error| format!("VM projection could not build published world: {error}"))?;
+        let frame = candidate.commit_frame();
+        let world = Arc::new(candidate.into_world(frame.clone(), base.history.clone()));
+        let outcomes = outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                VmOutcome::Accepted { position, entities } => {
+                    EpochOutcome::Accepted(AcceptedIntent {
+                        position,
+                        world: world.clone(),
+                        frame: frame.clone(),
+                        entities,
+                    })
+                }
+                VmOutcome::Rejected(rejected) => EpochOutcome::Rejected(rejected),
+            })
+            .collect();
+        Ok(EpochPlan {
+            base,
+            tail: world,
+            outcomes,
+            frames: vec![frame],
+        })
+    }
+
+    fn check_preconditions(
+        &self,
+        predecessor_id: WorldId,
+        preconditions: &[IntentPrecondition],
+    ) -> Result<(), IntentRejection> {
+        for precondition in preconditions {
+            match precondition {
+                IntentPrecondition::ExpectedWorld(expected) if *expected != predecessor_id => {
+                    return Err(IntentRejection::WorldPrecondition {
+                        expected: *expected,
+                        actual: predecessor_id,
+                    });
+                }
+                IntentPrecondition::ExpectedWorld(_) => {}
+                IntentPrecondition::ExpectedSlot { slot, expected } => {
+                    let actual = self.resolve_fact(slot);
+                    if actual != *expected {
+                        return Err(IntentRejection::SlotPrecondition {
+                            slot: slot.clone(),
+                            expected: expected.clone(),
+                            actual,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_committed(&mut self, operations: &[Operation]) -> Result<(), String> {
+        let program = self.compile_operations(operations)?;
+        match self.workspace.execute(&program) {
+            ExecutionOutcome::Accepted => Ok(()),
+            ExecutionOutcome::Rejected(error) => Err(format!(
+                "validated committed operations were rejected by the VM: {error:?}"
+            )),
+        }
+    }
+
+    fn compile_operations(&mut self, operations: &[Operation]) -> Result<IntentProgram, String> {
+        let mut instructions = Vec::with_capacity(operations.len().saturating_mul(4));
+        for operation in operations {
+            match operation {
+                Operation::AllocateEntity { entity } => {
+                    if entity.value() >= VM_LITERAL_BASE {
+                        return Err("entity allocator exhausted the VM atom namespace".to_owned());
+                    }
+                    instructions.push(Instruction::allocate_discard());
+                }
+                Operation::Define { slot, fact } => {
+                    let slot = self.slot_token(slot);
+                    let subject = self.atom_cell(&fact.subject)?;
+                    let predicate = self.predicate_cell(&fact.predicate);
+                    let object = self.atom_cell(&fact.object)?;
+                    instructions.extend([
+                        Instruction::push(subject),
+                        Instruction::push(predicate),
+                        Instruction::push(object),
+                        Instruction::define(slot),
+                    ]);
+                }
+                Operation::Forget { slot } => {
+                    let slot = self.slot_token(slot);
+                    instructions.push(Instruction::forget(slot));
+                }
+            }
+        }
+        Ok(IntentProgram::new(0, instructions))
+    }
+
+    fn slot_token(&mut self, slot: &SlotId) -> SlotToken {
+        if let Some(token) = self.slots.get(slot) {
+            return *token;
+        }
+        let token = SlotToken(self.slots.len() as u32);
+        self.slots.insert(slot.clone(), token);
+        self.workspace.ensure_slot_count(self.slots.len());
+        token
+    }
+
+    fn predicate_cell(&mut self, predicate: &Predicate) -> Cell {
+        if let Some(cell) = self.predicates.get(predicate) {
+            return *cell;
+        }
+        let cell = Cell(self.predicates.len() as u64);
+        self.predicates.insert(predicate.clone(), cell);
+        self.predicate_values.push(predicate.clone());
+        cell
+    }
+
+    fn atom_cell(&mut self, atom: &Atom) -> Result<Cell, String> {
+        match atom {
+            Atom::Entity(entity) if entity.value() < VM_LITERAL_BASE => Ok(Cell(entity.value())),
+            Atom::Entity(_) => {
+                Err("entity identifier overlaps the VM literal namespace".to_owned())
+            }
+            Atom::Literal(literal) => {
+                if let Some(cell) = self.literals.get(literal) {
+                    return Ok(*cell);
+                }
+                let offset = self.literal_values.len() as u64;
+                let value = VM_LITERAL_BASE
+                    .checked_add(offset)
+                    .ok_or_else(|| "VM literal token overflow".to_owned())?;
+                let cell = Cell(value);
+                self.literals.insert(literal.clone(), cell);
+                self.literal_values.push(literal.clone());
+                Ok(cell)
+            }
+        }
+    }
+
+    fn resolve_fact(&self, slot: &SlotId) -> Option<Fact> {
+        let token = self.slots.get(slot)?;
+        let (subject, predicate, object) = self.workspace.resolve_fact_cells(*token)?;
+        Some(Fact::new(
+            self.atom_from_cell(subject)?,
+            self.predicate_values.get(predicate.0 as usize)?.clone(),
+            self.atom_from_cell(object)?,
+        ))
+    }
+
+    fn atom_from_cell(&self, cell: Cell) -> Option<Atom> {
+        if cell.0 < VM_LITERAL_BASE {
+            Some(Atom::Entity(EntityId::new(cell.0)))
+        } else {
+            self.literal_values
+                .get((cell.0 - VM_LITERAL_BASE) as usize)
+                .cloned()
+                .map(Atom::Literal)
+        }
     }
 }
 
@@ -1602,6 +1888,118 @@ mod tests {
             let slot = SlotId::new(format!("random/{slot_index}"));
             assert_eq!(oracle.snapshot().resolve(&slot), plan.tail().resolve(&slot));
         }
+    }
+
+    #[test]
+    fn token_vm_materializer_matches_epoch_worlds_across_boundaries() {
+        let mut materializer = VmEpochMaterializer::new(1);
+        let mut reference_world = Arc::new(World::genesis());
+        let mut vm_world = Arc::new(World::genesis());
+
+        for epoch in 0..64_u64 {
+            let slot = SlotId::new(format!("vm/epoch/{epoch}"));
+            let fact = Fact::new(
+                Atom::Literal(Literal::new("vm")),
+                Predicate::new("value"),
+                Atom::Literal(Literal::new(epoch.to_string())),
+            );
+            let mut define = QueuedIntent::new();
+            define.expect_absent(slot.clone());
+            define.define_fact(slot.clone(), fact.clone());
+
+            let mut dependent = QueuedIntent::new();
+            dependent.expect_value(slot.clone(), fact);
+            dependent.define_fact(
+                SlotId::new(format!("vm/dependent/{epoch}")),
+                Fact::new(
+                    Atom::Literal(Literal::new("dependent")),
+                    Predicate::new("value"),
+                    Atom::Literal(Literal::new(epoch.to_string())),
+                ),
+            );
+
+            let mut rejected = QueuedIntent::new();
+            rejected.expect_absent(slot.clone());
+            let rejected_entity = rejected.entity();
+            rejected.define(
+                SlotId::new(format!("vm/rejected/{epoch}")),
+                intent_state_fact(rejected_entity, "never"),
+            );
+
+            let mut allocated = QueuedIntent::new();
+            let entity = allocated.entity();
+            allocated.define(
+                SlotId::new(format!("vm/entity/{epoch}")),
+                intent_state_fact(entity, &epoch.to_string()),
+            );
+
+            let mut intents = vec![define, dependent, rejected, allocated];
+            if epoch > 0 && epoch % 3 == 0 {
+                let mut forget = QueuedIntent::new();
+                forget.forget(SlotId::new(format!("vm/dependent/{}", epoch - 1)));
+                intents.push(forget);
+            }
+
+            let expected = derive_epoch_world(reference_world, intents.clone(), &[]);
+            let (actual, used_vm) = materializer
+                .materialize(vm_world, intents, &[])
+                .expect("VM epoch materializes");
+            assert!(used_vm);
+            assert_eq!(actual.frames(), expected.frames(), "epoch {epoch}");
+            assert_eq!(actual.tail().id(), expected.tail().id(), "epoch {epoch}");
+            assert_eq!(
+                actual.tail().next_entity(),
+                expected.tail().next_entity(),
+                "epoch {epoch}"
+            );
+            for (actual, expected) in actual.outcomes().iter().zip(expected.outcomes()) {
+                assert_eq!(actual.accepted().is_some(), expected.accepted().is_some());
+                if let (Some(actual), Some(expected)) = (actual.accepted(), expected.accepted()) {
+                    assert_eq!(actual.entities(), expected.entities());
+                }
+            }
+            reference_world = expected.tail();
+            vm_world = actual.tail();
+        }
+    }
+
+    #[test]
+    fn token_vm_fallback_keeps_validator_epochs_in_sync() {
+        let mut materializer = VmEpochMaterializer::new(1);
+        let base = Arc::new(World::genesis());
+        let mut first = QueuedIntent::new();
+        first.define_fact(
+            SlotId::new("vm/validated"),
+            state_fact(EntityId::new(7), "ready"),
+        );
+        let validator: Validator = Arc::new(|candidate| {
+            candidate
+                .resolve(&SlotId::new("vm/validated"))
+                .is_some()
+                .then_some(())
+                .ok_or_else(|| "missing validated state".to_owned())
+        });
+        let (fallback, used_vm) = materializer
+            .materialize(base, vec![first], &[validator])
+            .expect("validator fallback materializes");
+        assert!(!used_vm);
+
+        let mut dependent = QueuedIntent::new();
+        dependent.expect_value(
+            SlotId::new("vm/validated"),
+            state_fact(EntityId::new(7), "ready"),
+        );
+        dependent.define_fact(
+            SlotId::new("vm/after-validator"),
+            state_fact(EntityId::new(7), "still-ready"),
+        );
+        let (actual, used_vm) = materializer
+            .materialize(fallback.tail(), vec![dependent.clone()], &[])
+            .expect("VM resumes after validator fallback");
+        let expected = derive_epoch_world(fallback.tail(), vec![dependent], &[]);
+        assert!(used_vm);
+        assert_eq!(actual.frames(), expected.frames());
+        assert_eq!(actual.tail().id(), expected.tail().id());
     }
 
     fn temporary_path(label: &str) -> PathBuf {

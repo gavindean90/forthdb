@@ -22,6 +22,7 @@ pub struct SlotToken(pub u32);
 pub enum Opcode {
     ExpectObject,
     Allocate,
+    AllocateDiscard,
     LoadLocal,
     StoreLocal,
     PushCell,
@@ -50,6 +51,14 @@ impl Instruction {
     pub const fn allocate() -> Self {
         Self {
             opcode: Opcode::Allocate,
+            argument: 0,
+            immediate: 0,
+        }
+    }
+
+    pub(crate) const fn allocate_discard() -> Self {
+        Self {
+            opcode: Opcode::AllocateDiscard,
             argument: 0,
             immediate: 0,
         }
@@ -435,6 +444,24 @@ impl Workspace {
         )
     }
 
+    pub(crate) fn with_indexes_from(
+        next_entity: u64,
+        slot_count: usize,
+        stack_capacity: usize,
+        record_capacity: usize,
+        delta_capacity: usize,
+    ) -> Self {
+        let mut workspace = Self::new(
+            slot_count,
+            stack_capacity,
+            record_capacity,
+            delta_capacity,
+            true,
+        );
+        workspace.next_entity = next_entity;
+        workspace
+    }
+
     fn new(
         slot_count: usize,
         stack_capacity: usize,
@@ -485,6 +512,20 @@ impl Workspace {
     pub fn resolve_object(&self, slot: SlotToken) -> Option<Cell> {
         let head = self.accepted_head(slot).ok()?;
         (head != NONE).then(|| self.records.get(head).object)
+    }
+
+    pub(crate) fn resolve_fact_cells(&self, slot: SlotToken) -> Option<(Cell, Cell, Cell)> {
+        let head = self.accepted_head(slot).ok()?;
+        (head != NONE).then(|| {
+            let record = self.records.get(head);
+            (record.subject, record.predicate, record.object)
+        })
+    }
+
+    pub(crate) fn ensure_slot_count(&mut self, slot_count: usize) {
+        if self.accepted_heads.len() < slot_count {
+            self.accepted_heads.resize(slot_count, NONE);
+        }
     }
 
     pub fn next_entity(&self) -> u64 {
@@ -689,6 +730,10 @@ impl Workspace {
                 let entity = Cell(self.next_entity);
                 self.next_entity = self.next_entity.saturating_add(1);
                 self.push(entity)
+            }
+            Opcode::AllocateDiscard => {
+                self.next_entity = self.next_entity.saturating_add(1);
+                Ok(())
             }
             Opcode::LoadLocal => {
                 let value = self.local(instruction.argument as usize)?;

@@ -36,6 +36,15 @@ jobs:
             -p forthdb-library \
             -- "$RUNNER_TEMP/forthdb-library-artifacts/library.fdb"
 
+      - name: Run library with the previous world materializer
+        run: |
+          FORTHDB_LIBRARY_MATERIALIZER=world \
+          FORTHDB_LIBRARY_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/library-world-report.json" \
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-library \
+            -- "$RUNNER_TEMP/forthdb-library-artifacts/library-world.fdb"
+
       - name: Compare Python and Rust library engines
         run: |
           python library_comparison.py \
@@ -51,6 +60,16 @@ jobs:
             -p forthdb-library \
             --bin ramped \
             -- "$RUNNER_TEMP/forthdb-library-artifacts/ramped"
+
+      - name: Run ramped circulation with the previous world materializer
+        run: |
+          FORTHDB_LIBRARY_MATERIALIZER=world \
+          FORTHDB_RAMPED_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/ramped-library-world.json" \
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-library \
+            --bin ramped \
+            -- "$RUNNER_TEMP/forthdb-library-artifacts/ramped-world"
 
       - name: Measure bounded admission versus publication
         run: |
@@ -98,6 +117,19 @@ jobs:
                   f"Recovery parity: world `{recovery['same_world']}`, version "
                   f"`{recovery['same_version']}`, frames `{recovery['same_frame_count']}`.\n"
               )
+              handle.write(
+                  f"VM materialized epochs: `{control['vm_materialized_epochs']}`; "
+                  f"world-materializer fallbacks: `{control['world_materialized_epochs']}`.\n"
+              )
+              world_report = report.parent / "library-world-report.json"
+              if world_report.exists():
+                  baseline = json.loads(world_report.read_text())
+                  handle.write(
+                      f"\nComplete library scenario: token VM "
+                      f"`{data['elapsed_us'] / 1000:.2f} ms`; previous materializer "
+                      f"`{baseline['elapsed_us'] / 1000:.2f} ms`; identical world: "
+                      f"`{data['world_id'] == baseline['world_id']}`.\n"
+                  )
               comparison = report.parent / "library-comparison.json"
               if comparison.exists():
                   compared = json.loads(comparison.read_text())
@@ -133,6 +165,15 @@ jobs:
                       f"`{scaled['branch_rush_sync_reduction_percent']:.1f}%`; exact semantic "
                       f"projection: `{scaled['semantic_projection_equal']}`.\n"
                   )
+                  ramped_world = report.parent / "ramped-library-world.json"
+                  if ramped_world.exists():
+                      baseline = json.loads(ramped_world.read_text())
+                      handle.write(
+                          f"\nToken VM versus previous materializer: interactive "
+                          f"`{interactive['intents_per_second'] / baseline['interactive']['intents_per_second']:.2f}x`; "
+                          f"branch rush "
+                          f"`{rush['intents_per_second'] / baseline['branch_rush']['intents_per_second']:.2f}x`.\n"
+                      )
               windowed = report.parent / "admission-window.json"
               if windowed.exists():
                   measured = json.loads(windowed.read_text())

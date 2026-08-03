@@ -109,6 +109,11 @@ work.
 permutation arrays, layers a short immutable delta suffix over the compact
 base, and measures atomically published reader snapshots.
 
+[`DURABLE_TOKEN_VM.md`](DURABLE_TOKEN_VM.md) connects the journal to that VM.
+Canonical admitted intents compile through the same path during live execution
+and recovery, while the accepted epoch produces one existing `World` query
+view for application compatibility.
+
 ## Library reference
 
 The Rust library application groups seven domain intentions into five durable

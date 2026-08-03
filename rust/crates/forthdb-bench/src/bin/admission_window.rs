@@ -388,6 +388,9 @@ mod linux {
             data_syncs: after.data_syncs - before.data_syncs,
             completion_events: after.completion_events - before.completion_events,
             maximum_semantic_lag: after.maximum_semantic_lag,
+            vm_materialized_epochs: after.vm_materialized_epochs - before.vm_materialized_epochs,
+            world_materialized_epochs: after.world_materialized_epochs
+                - before.world_materialized_epochs,
         }
     }
 

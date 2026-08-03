@@ -19,6 +19,54 @@ mod linux {
     const MAX_BATCH: usize = 16;
     const QUERY_SAMPLES: usize = 7;
 
+    #[derive(Clone, Copy)]
+    enum Materializer {
+        TokenVm,
+        World,
+    }
+
+    impl Materializer {
+        fn from_environment() -> Result<Self, Box<dyn Error>> {
+            match std::env::var("FORTHDB_LIBRARY_MATERIALIZER")
+                .unwrap_or_else(|_| "vm".to_owned())
+                .as_str()
+            {
+                "vm" => Ok(Self::TokenVm),
+                "world" => Ok(Self::World),
+                value => Err(format!(
+                    "FORTHDB_LIBRARY_MATERIALIZER must be vm or world, found {value}"
+                )
+                .into()),
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::TokenVm => "io_uring_admission_journal_token_vm",
+                Self::World => "io_uring_admission_journal_epoch_worlds",
+            }
+        }
+
+        fn uses_vm(self) -> bool {
+            matches!(self, Self::TokenVm)
+        }
+
+        fn open(
+            self,
+            path: &Path,
+            capacity: usize,
+        ) -> Result<AdmissionEpochController, Box<dyn Error>> {
+            Ok(match self {
+                Self::TokenVm => {
+                    AdmissionEpochController::open_vm(path, capacity, MAX_BATCH, RING_ENTRIES)?
+                }
+                Self::World => {
+                    AdmissionEpochController::open(path, capacity, MAX_BATCH, RING_ENTRIES)?
+                }
+            })
+        }
+    }
+
     #[derive(Clone, Copy, Serialize)]
     struct Scale {
         works: usize,
@@ -126,6 +174,8 @@ mod linux {
         data_syncs: u64,
         syncs_per_intent: f64,
         maximum_semantic_lag_epochs: u64,
+        vm_materialized_epochs: u64,
+        world_materialized_epochs: u64,
         admitted_bytes: u64,
         active_slot_growth: usize,
         immutable_record_growth: usize,
@@ -157,12 +207,20 @@ mod linux {
             });
         fs::create_dir_all(&root)?;
         let scale = Scale::from_environment()?;
-        let interactive = run_profile(&root.join("interactive.fdb"), scale, 1, "interactive")?;
+        let materializer = Materializer::from_environment()?;
+        let interactive = run_profile(
+            &root.join("interactive.fdb"),
+            scale,
+            1,
+            "interactive",
+            materializer,
+        )?;
         let branch_rush = run_profile(
             &root.join("branch-rush.fdb"),
             scale,
             MAX_BATCH,
             "branch_rush",
+            materializer,
         )?;
         let semantic_projection_equal = interactive.projection == branch_rush.projection;
         if !semantic_projection_equal {
@@ -170,7 +228,7 @@ mod linux {
         }
         let report = Report {
             status: "ok",
-            engine: "io_uring_admission_journal_epoch_worlds",
+            engine: materializer.label(),
             purpose: "realistic scaled library circulation comparison",
             scale,
             branch_rush_throughput_ratio: branch_rush.intents_per_second
@@ -194,13 +252,14 @@ mod linux {
         scale: Scale,
         epoch_width: usize,
         profile: &'static str,
+        materializer: Materializer,
     ) -> Result<ProfileReport, Box<dyn Error>> {
         let _ = fs::remove_file(path);
         let capacity = scale
             .circulation_intents()
             .div_ceil(epoch_width)
             .saturating_add(8);
-        let controller = AdmissionEpochController::open(path, capacity, MAX_BATCH, RING_ENTRIES)?;
+        let controller = materializer.open(path, capacity)?;
 
         let setup_started = Instant::now();
         let entities = allocate_entities(&controller, scale)?;
@@ -220,6 +279,12 @@ mod linux {
         let workload_elapsed = workload_started.elapsed();
         let final_metrics = controller.metrics();
         let metrics = metric_delta(final_metrics, setup_metrics);
+        if materializer.uses_vm()
+            && (metrics.vm_materialized_epochs != metrics.applied_epochs
+                || metrics.world_materialized_epochs != 0)
+        {
+            return Err(format!("{profile} left the token VM materializer").into());
+        }
         if accepted as u64 != metrics.accepted_intents
             || rejected as u64 != metrics.rejected_intents
             || rejected != scale.circulation_cycles
@@ -250,7 +315,7 @@ mod linux {
         drop(controller);
 
         let recovery_started = Instant::now();
-        let recovered = AdmissionEpochController::open(path, capacity, MAX_BATCH, RING_ENTRIES)?;
+        let recovered = materializer.open(path, capacity)?;
         let recovered_world = recovered.snapshot();
         let recovered_projection = projection(&recovered_world)?;
         let recovery = RecoveryObservation {
@@ -289,6 +354,8 @@ mod linux {
             data_syncs: metrics.data_syncs,
             syncs_per_intent: metrics.data_syncs as f64 / intent_count,
             maximum_semantic_lag_epochs: final_metrics.maximum_semantic_lag,
+            vm_materialized_epochs: metrics.vm_materialized_epochs,
+            world_materialized_epochs: metrics.world_materialized_epochs,
             admitted_bytes: metrics.admitted_bytes,
             active_slot_growth: expected_slots - setup_active_slots,
             immutable_record_growth: expected_records - setup_records,
@@ -716,6 +783,9 @@ mod linux {
             data_syncs: after.data_syncs - before.data_syncs,
             completion_events: after.completion_events - before.completion_events,
             maximum_semantic_lag: after.maximum_semantic_lag,
+            vm_materialized_epochs: after.vm_materialized_epochs - before.vm_materialized_epochs,
+            world_materialized_epochs: after.world_materialized_epochs
+                - before.world_materialized_epochs,
         }
     }
 
