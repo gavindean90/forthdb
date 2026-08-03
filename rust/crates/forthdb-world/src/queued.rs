@@ -1,22 +1,25 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// An entity identifier local to exactly one queued intent.
+static NEXT_INTENT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+
+/// An entity handle local to exactly one queued intent.
 ///
-/// Temporary identifiers are resolved only when the committer assigns the
-/// intent a private predecessor world. The same numeric temporary identifier
-/// in two intents therefore never aliases.
+/// The namespace is intentionally opaque. Two intents may both allocate
+/// temporary index zero, but their handles remain distinct and cannot alias.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TempEntity(u32);
+pub struct TempEntity {
+    namespace: u64,
+    index: u32,
+}
 
 impl TempEntity {
     pub const fn index(self) -> u32 {
-        self.0
+        self.index
     }
 }
 
-/// An atom in a queued intent. Unlike a committed [`Atom`], it may refer to an
-/// entity that has not been assigned a durable identifier yet.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IntentAtom {
     Entity(EntityId),
@@ -98,14 +101,27 @@ enum IntentOperation {
     Forget { slot: SlotId },
 }
 
-/// Operations that explicitly delegate predecessor assignment to the epoch
-/// planner. This is intentionally distinct from [`Transaction`], whose base
-/// world remains absolute and whose stale-writer behavior is unchanged.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Operations that delegate predecessor assignment to an epoch planner.
+///
+/// This is deliberately not a [`Transaction`]. A strict transaction retains
+/// an absolute base world and the existing stale-writer contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueuedIntent {
+    namespace: u64,
     next_temporary: u32,
     preconditions: Vec<IntentPrecondition>,
     operations: Vec<IntentOperation>,
+}
+
+impl Default for QueuedIntent {
+    fn default() -> Self {
+        Self {
+            namespace: NEXT_INTENT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
+            next_temporary: 0,
+            preconditions: Vec::new(),
+            operations: Vec::new(),
+        }
+    }
 }
 
 impl QueuedIntent {
@@ -141,7 +157,10 @@ impl QueuedIntent {
     }
 
     pub fn entity(&mut self) -> TempEntity {
-        let temporary = TempEntity(self.next_temporary);
+        let temporary = TempEntity {
+            namespace: self.namespace,
+            index: self.next_temporary,
+        };
         self.next_temporary = self
             .next_temporary
             .checked_add(1)
@@ -197,7 +216,7 @@ impl fmt::Display for IntentRejection {
             ),
             Self::UnknownTemporaryEntity(entity) => write!(
                 formatter,
-                "queued intent referenced unallocated temporary entity {}",
+                "queued intent referenced temporary entity {} from another scope or before allocation",
                 entity.index()
             ),
             Self::Candidate(error) => write!(formatter, "queued candidate failed: {error}"),
@@ -295,8 +314,8 @@ impl EpochOutcome {
     }
 }
 
-/// A deterministic private successor chain. Constructing a plan never mutates
-/// the supplied base world and never publishes a successor.
+/// A deterministic private successor chain. Derivation never mutates the base
+/// and never publishes a successor.
 #[derive(Debug)]
 pub struct EpochPlan {
     base: Arc<World>,
@@ -335,12 +354,11 @@ impl EpochPlan {
     }
 }
 
-/// Derive a private chain in ingress order.
+/// Construct the accepted private world chain in ingress order.
 ///
 /// Preconditions and validators are evaluated against the predecessor assigned
-/// to each intent. Rejected intents consume neither a world version nor an
-/// entity identifier, and the following intent continues from the previous
-/// accepted world.
+/// to each intent. A rejected intent consumes neither a version nor an entity
+/// identifier, and the next intent continues from the preceding accepted world.
 pub fn derive_epoch(
     base: Arc<World>,
     intents: Vec<QueuedIntent>,
@@ -351,8 +369,7 @@ pub fn derive_epoch(
     let mut frames = Vec::with_capacity(intents.len());
 
     for (position, intent) in intents.into_iter().enumerate() {
-        let result = derive_intent(predecessor.clone(), intent, validators);
-        match result {
+        match derive_intent(predecessor.clone(), intent, validators) {
             Ok((world, frame, entities)) => {
                 predecessor = world.clone();
                 frames.push(frame.clone());
@@ -391,9 +408,10 @@ fn derive_intent(
     IntentRejection,
 > {
     check_preconditions(&predecessor, &intent.preconditions)?;
-    let (operations, entities) = resolve_operations(&predecessor, intent.operations)?;
-    let candidate =
-        CandidateWorld::construct(predecessor.as_ref(), operations).map_err(IntentRejection::Candidate)?;
+    let (operations, entities) =
+        resolve_operations(&predecessor, intent.namespace, intent.operations)?;
+    let candidate = CandidateWorld::construct(predecessor.as_ref(), operations)
+        .map_err(IntentRejection::Candidate)?;
     for validator in validators {
         validator(&candidate).map_err(IntentRejection::Validation)?;
     }
@@ -432,6 +450,7 @@ fn check_preconditions(
 
 fn resolve_operations(
     predecessor: &World,
+    namespace: u64,
     intent_operations: Vec<IntentOperation>,
 ) -> Result<(Vec<Operation>, BTreeMap<TempEntity, EntityId>), IntentRejection> {
     let mut next_entity = predecessor.next_entity();
@@ -441,6 +460,9 @@ fn resolve_operations(
     for operation in intent_operations {
         match operation {
             IntentOperation::AllocateEntity { temporary } => {
+                if temporary.namespace != namespace {
+                    return Err(IntentRejection::UnknownTemporaryEntity(temporary));
+                }
                 let entity = EntityId::new(next_entity);
                 next_entity = next_entity
                     .checked_add(1)
@@ -448,12 +470,10 @@ fn resolve_operations(
                 entities.insert(temporary, entity);
                 operations.push(Operation::AllocateEntity { entity });
             }
-            IntentOperation::Define { slot, fact } => {
-                operations.push(Operation::Define {
-                    slot,
-                    fact: resolve_fact(fact, &entities)?,
-                });
-            }
+            IntentOperation::Define { slot, fact } => operations.push(Operation::Define {
+                slot,
+                fact: resolve_fact(fact, namespace, &entities)?,
+            }),
             IntentOperation::Forget { slot } => operations.push(Operation::Forget { slot }),
         }
     }
@@ -463,33 +483,39 @@ fn resolve_operations(
 
 fn resolve_fact(
     fact: IntentFact,
+    namespace: u64,
     entities: &BTreeMap<TempEntity, EntityId>,
 ) -> Result<Fact, IntentRejection> {
     Ok(Fact::new(
-        resolve_atom(fact.subject, entities)?,
+        resolve_atom(fact.subject, namespace, entities)?,
         fact.predicate,
-        resolve_atom(fact.object, entities)?,
+        resolve_atom(fact.object, namespace, entities)?,
     ))
 }
 
 fn resolve_atom(
     atom: IntentAtom,
+    namespace: u64,
     entities: &BTreeMap<TempEntity, EntityId>,
 ) -> Result<Atom, IntentRejection> {
     match atom {
         IntentAtom::Entity(entity) => Ok(Atom::Entity(entity)),
-        IntentAtom::Temporary(temporary) => entities
-            .get(&temporary)
-            .copied()
-            .map(Atom::Entity)
-            .ok_or(IntentRejection::UnknownTemporaryEntity(temporary)),
+        IntentAtom::Temporary(temporary) => {
+            if temporary.namespace != namespace {
+                return Err(IntentRejection::UnknownTemporaryEntity(temporary));
+            }
+            entities
+                .get(&temporary)
+                .copied()
+                .map(Atom::Entity)
+                .ok_or(IntentRejection::UnknownTemporaryEntity(temporary))
+        }
         IntentAtom::Literal(literal) => Ok(Atom::Literal(literal)),
     }
 }
 
-/// Stage 6A's in-memory publication control. All accepted frames are appended
-/// to the infallible memory store, then the global reader head is advanced once
-/// to the epoch tail. Strict commits and queued epochs share `commit_lock`.
+/// Stage 6A's in-memory publication control. It appends every accepted frame to
+/// the infallible store, then changes the global reader head exactly once.
 impl Database<MemoryCommitStore> {
     pub fn commit_queued_epoch(&self, intents: Vec<QueuedIntent>) -> EpochPlan {
         let _commit_guard = self
@@ -516,7 +542,6 @@ impl Database<MemoryCommitStore> {
                 }
             }
             drop(store);
-
             *self
                 .current
                 .write()
@@ -546,11 +571,7 @@ mod tests {
     }
 
     fn intent_state_fact(entity: impl Into<IntentAtom>, value: &str) -> IntentFact {
-        IntentFact::new(
-            entity,
-            Predicate::new("state"),
-            Literal::new(value),
-        )
+        IntentFact::new(entity, Predicate::new("state"), Literal::new(value))
     }
 
     fn replay_frame(database: &Database<MemoryCommitStore>, frame: &CommitFrame) -> Arc<World> {
@@ -571,7 +592,6 @@ mod tests {
 
     #[test]
     fn temporary_entities_are_scoped_and_resolved_from_each_predecessor() {
-        let base = Arc::new(World::genesis());
         let mut first = QueuedIntent::new();
         let first_temp = first.entity();
         first.define(
@@ -586,8 +606,9 @@ mod tests {
             intent_state_fact(second_temp, "ready"),
         );
 
-        assert_eq!(first_temp, second_temp, "temporary namespaces may reuse indexes");
-        let plan = derive_epoch(base, vec![first, second], &[]);
+        assert_eq!(first_temp.index(), second_temp.index());
+        assert_ne!(first_temp, second_temp);
+        let plan = derive_epoch(Arc::new(World::genesis()), vec![first, second], &[]);
         let first = plan.outcomes()[0].accepted().expect("first accepted");
         let second = plan.outcomes()[1].accepted().expect("second accepted");
         assert_eq!(first.entity(first_temp), Some(EntityId::new(1)));
@@ -596,9 +617,29 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_intent_consumes_neither_version_nor_allocator_state() {
-        let base = Arc::new(World::genesis());
+    fn a_foreign_temporary_handle_cannot_alias_a_local_handle() {
+        let mut owner = QueuedIntent::new();
+        let foreign = owner.entity();
 
+        let mut target = QueuedIntent::new();
+        let local = target.entity();
+        assert_eq!(foreign.index(), local.index());
+        target.define(
+            SlotId::new("target/state"),
+            intent_state_fact(foreign, "invalid"),
+        );
+
+        let plan = derive_epoch(Arc::new(World::genesis()), vec![target], &[]);
+        assert!(matches!(
+            plan.outcomes()[0].rejected().expect("rejected").error(),
+            IntentRejection::UnknownTemporaryEntity(entity) if *entity == foreign
+        ));
+        assert_eq!(plan.tail().version(), 0);
+        assert_eq!(plan.tail().next_entity(), 1);
+    }
+
+    #[test]
+    fn a_rejected_intent_consumes_neither_version_nor_allocator_state() {
         let mut accepted_first = QueuedIntent::new();
         let first_entity = accepted_first.entity();
         accepted_first.define(
@@ -621,7 +662,11 @@ mod tests {
             intent_state_fact(last_entity, "ready"),
         );
 
-        let plan = derive_epoch(base, vec![accepted_first, rejected, accepted_last], &[]);
+        let plan = derive_epoch(
+            Arc::new(World::genesis()),
+            vec![accepted_first, rejected, accepted_last],
+            &[],
+        );
         assert_eq!(plan.accepted_count(), 2);
         assert_eq!(plan.rejected_count(), 1);
         assert_eq!(plan.tail().version(), 2);
@@ -634,23 +679,22 @@ mod tests {
     #[test]
     fn slot_preconditions_observe_the_assigned_private_predecessor() {
         let slot = SlotId::new("service/state");
-        let initial_entity = EntityId::new(1);
-        let initial_fact = state_fact(initial_entity, "one");
-        let updated_fact = state_fact(initial_entity, "two");
-
+        let entity = EntityId::new(1);
+        let initial = state_fact(entity, "one");
+        let updated = state_fact(entity, "two");
         let database = Database::new(MemoryCommitStore::new()).expect("genesis valid");
         let mut setup = database.begin();
-        assert_eq!(setup.entity(), initial_entity);
-        setup.define(slot.clone(), initial_fact.clone());
+        assert_eq!(setup.entity(), entity);
+        setup.define(slot.clone(), initial.clone());
         let base = database.commit(setup).expect("setup commits");
 
         let mut first = QueuedIntent::new();
-        first.expect_value(slot.clone(), initial_fact.clone());
-        first.define_fact(slot.clone(), updated_fact.clone());
+        first.expect_value(slot.clone(), initial.clone());
+        first.define_fact(slot.clone(), updated.clone());
 
-        let mut stale_expectation = QueuedIntent::new();
-        stale_expectation.expect_value(slot.clone(), initial_fact);
-        stale_expectation.define_fact(
+        let mut stale = QueuedIntent::new();
+        stale.expect_value(slot.clone(), initial);
+        stale.define_fact(
             SlotId::new("should/not/exist"),
             Fact::new(
                 Atom::Literal(Literal::new("x")),
@@ -659,9 +703,9 @@ mod tests {
             ),
         );
 
-        let mut current_expectation = QueuedIntent::new();
-        current_expectation.expect_value(slot.clone(), updated_fact.clone());
-        current_expectation.define_fact(
+        let mut current = QueuedIntent::new();
+        current.expect_value(slot.clone(), updated.clone());
+        current.define_fact(
             SlotId::new("should/exist"),
             Fact::new(
                 Atom::Literal(Literal::new("x")),
@@ -670,18 +714,14 @@ mod tests {
             ),
         );
 
-        let plan = derive_epoch(
-            base,
-            vec![first, stale_expectation, current_expectation],
-            &[],
-        );
+        let plan = derive_epoch(base, vec![first, stale, current], &[]);
         assert!(plan.outcomes()[0].accepted().is_some());
         assert!(matches!(
             plan.outcomes()[1].rejected().expect("rejected").error(),
             IntentRejection::SlotPrecondition { .. }
         ));
         assert!(plan.outcomes()[2].accepted().is_some());
-        assert_eq!(plan.tail().resolve(&slot), Some(&updated_fact));
+        assert_eq!(plan.tail().resolve(&slot), Some(&updated));
         assert!(plan.tail().resolve(&SlotId::new("should/not/exist")).is_none());
         assert!(plan.tail().resolve(&SlotId::new("should/exist")).is_some());
     }
@@ -709,7 +749,7 @@ mod tests {
 
         let mut accepted = QueuedIntent::new();
         accepted.define_fact(
-            required.clone(),
+            required,
             Fact::new(
                 Atom::Literal(Literal::new("release")),
                 Predicate::new("approved_by"),
@@ -755,7 +795,6 @@ mod tests {
 
         assert_eq!(oracle.frames(), plan.frames());
         assert_eq!(oracle.snapshot().id(), plan.tail().id());
-        assert_eq!(oracle.snapshot().version(), plan.tail().version());
         for (outcome, oracle_world) in plan
             .outcomes()
             .iter()
@@ -815,9 +854,9 @@ mod tests {
         let queued_path = temporary_path("queued");
         let strict_path = temporary_path("strict");
         {
-            let mut queued_store = FileCommitStore::open(&queued_path).expect("queued file opens");
+            let mut store = FileCommitStore::open(&queued_path).expect("queued file opens");
             for frame in plan.frames() {
-                queued_store.append(frame.clone()).expect("frame appends");
+                store.append(frame.clone()).expect("frame appends");
             }
         }
         {
