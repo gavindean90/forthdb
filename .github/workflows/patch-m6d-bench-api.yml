@@ -25,36 +25,41 @@ jobs:
               Path("rust/crates/forthdb-bench/src/bin/queued_file_epoch.rs"),
               Path("rust/crates/forthdb-bench/src/bin/queued_io_uring_epoch.rs"),
           ]
-          closed = '''                            Err(DurableSubmitError::Closed(_)) => {
-                                      panic!("durable controller closed")
-                                  }
-          '''
-          poisoned = '''                            Err(DurableSubmitError::Closed(_)) => {
-                                      panic!("durable controller closed")
-                                  }
-                                  Err(DurableSubmitError::Poisoned { reason, .. }) => {
-                                      panic!("durable controller poisoned: {reason}")
-                                  }
-          '''
-          failed = '''                DurableTicketOutcome::DurabilityFailed(error) => {
-                          panic!("durability failed during benchmark: {error}")
-                      }
-          '''
-          stopped = '''                DurableTicketOutcome::DurabilityFailed(error) => {
-                          panic!("durability failed during benchmark: {error}")
-                      }
-                      DurableTicketOutcome::Stopped(reason) => {
-                          panic!("durable controller stopped during benchmark: {reason:?}")
-                      }
-          '''
+
+          def insert_after_block(lines, marker, new_lines):
+              index = next((i for i, line in enumerate(lines) if marker in line), None)
+              if index is None:
+                  raise SystemExit(f"marker {marker!r} missing")
+              close = index + 1
+              while close < len(lines) and lines[close].strip() != "}":
+                  close += 1
+              if close >= len(lines):
+                  raise SystemExit(f"closing brace missing after {marker!r}")
+              return lines[: close + 1] + new_lines(lines[index]) + lines[close + 1 :]
+
           for path in paths:
-              text = path.read_text()
-              if closed not in text:
-                  raise SystemExit(f"closed match target missing in {path}")
-              if failed not in text:
-                  raise SystemExit(f"outcome match target missing in {path}")
-              text = text.replace(closed, poisoned, 1).replace(failed, stopped, 1)
-              path.write_text(text)
+              lines = path.read_text().splitlines()
+              if not any("DurableSubmitError::Poisoned" in line for line in lines):
+                  lines = insert_after_block(
+                      lines,
+                      "Err(DurableSubmitError::Closed(_))",
+                      lambda marker: [
+                          f"{marker[: len(marker) - len(marker.lstrip())]}Err(DurableSubmitError::Poisoned {{ reason, .. }}) => {{",
+                          f"{marker[: len(marker) - len(marker.lstrip())]}    panic!(\"durable controller poisoned: {{reason}}\")",
+                          f"{marker[: len(marker) - len(marker.lstrip())]}}}",
+                      ],
+                  )
+              if not any("DurableTicketOutcome::Stopped" in line for line in lines):
+                  lines = insert_after_block(
+                      lines,
+                      "DurableTicketOutcome::DurabilityFailed(error)",
+                      lambda marker: [
+                          f"{marker[: len(marker) - len(marker.lstrip())]}DurableTicketOutcome::Stopped(reason) => {{",
+                          f"{marker[: len(marker) - len(marker.lstrip())]}    panic!(\"durable controller stopped during benchmark: {{reason:?}}\")",
+                          f"{marker[: len(marker) - len(marker.lstrip())]}}}",
+                      ],
+                  )
+              path.write_text("\n".join(lines) + "\n")
           PY
           rm .github/workflows/patch-m6d-bench-api.yml
           git config user.name "github-actions[bot]"
