@@ -208,6 +208,36 @@ jobs:
                       f"differential gate: `{measured['differential_gate_passed']}`.\n"
                   )
                   handle.write(f"\nPhase 2 scope: {measured['phase2_scope']}\n")
+                  phase3 = measured["phase3"]
+                  handle.write("\n## Stack VM Phase 3 reads\n\n")
+                  handle.write(
+                      "| Read | Result count | ns/query | QPS |\n"
+                      "| --- | ---: | ---: | ---: |\n"
+                  )
+                  for label, key in [
+                      ("Exact SPO", "point_lookup"),
+                      ("Predicate range", "predicate_range"),
+                  ]:
+                      metric = phase3[key]
+                      handle.write(
+                          f"| {label} | {metric['result_count']} | "
+                          f"{metric['ns_per_query']:.1f} | "
+                          f"{metric['queries_per_second']:.1f}/s |\n"
+                      )
+                  concurrent = phase3["concurrent_reads"]
+                  handle.write(
+                      f"\nConcurrent mixed reads: "
+                      f"`{concurrent['queries_per_second']:.1f}/s` across "
+                      f"`{concurrent['readers']}` readers while publishing "
+                      f"`{concurrent['snapshot_publications']}` snapshots; "
+                      f"complete-snapshot results valid: "
+                      f"`{phase3['snapshot_results_valid']}`.\n"
+                  )
+                  handle.write(
+                      f"\nCompact base facts: `{phase3['compact_base_facts']}`; "
+                      f"tail index deltas: `{phase3['tail_index_deltas']}`.\n"
+                  )
+                  handle.write(f"\nPhase 3 scope: {measured['phase3_scope']}\n")
           PY
 
       - name: Upload application database and report

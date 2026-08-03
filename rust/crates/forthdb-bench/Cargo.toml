@@ -7,6 +7,7 @@ publish = false
 default-run = "forthdb-bench"
 
 [dependencies]
+arc-swap = "1.7"
 forthdb-core = { path = "../forthdb-core" }
 forthdb-world = { path = "../forthdb-world" }
 serde.workspace = true

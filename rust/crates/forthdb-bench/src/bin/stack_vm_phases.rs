@@ -1,6 +1,8 @@
+use arc_swap::ArcSwap;
 use forthdb_core::{Literal, Predicate, SlotId};
 use forthdb_world::stack_vm::{
-    Cell, ExecutionOutcome, Instruction, IntentProgram, SlotToken, Workspace,
+    Cell, ExecutionOutcome, Instruction, IntentProgram, LayeredSnapshot, QueryPattern, SlotToken,
+    Workspace,
 };
 use forthdb_world::{
     Database, IntentFact, MemoryCommitStore, QueuedIntent, Validator, derive_epoch_world,
@@ -11,7 +13,9 @@ use std::env;
 use std::fs;
 use std::hint::black_box;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::Instant;
 
 const TOTAL_INTENTS: usize = 8_192;
@@ -19,6 +23,10 @@ const ROUNDS: usize = 5;
 const REJECT_EVERY: usize = 17;
 const STACK_REPETITIONS: usize = 64;
 const FLAT_SWEEP_PAIRS: usize = 5;
+const READ_ITERATIONS: usize = 100_000;
+const CONCURRENT_READERS: usize = 4;
+const CONCURRENT_READS_PER_READER: usize = 50_000;
+const CONCURRENT_PUBLICATIONS: usize = 50_000;
 
 struct CountingAllocator;
 
@@ -74,11 +82,40 @@ struct CaseResult {
 }
 
 #[derive(Serialize)]
+struct ReadMetric {
+    queries: usize,
+    median_elapsed_us: u128,
+    queries_per_second: f64,
+    ns_per_query: f64,
+    result_count: usize,
+}
+
+#[derive(Serialize)]
+struct ConcurrentReadMetric {
+    readers: usize,
+    queries: usize,
+    snapshot_publications: usize,
+    elapsed_us: u128,
+    queries_per_second: f64,
+}
+
+#[derive(Serialize)]
+struct Phase3Result {
+    compact_base_facts: usize,
+    tail_index_deltas: usize,
+    point_lookup: ReadMetric,
+    predicate_range: ReadMetric,
+    concurrent_reads: ConcurrentReadMetric,
+    snapshot_results_valid: bool,
+}
+
+#[derive(Serialize)]
 struct Report {
     status: &'static str,
     purpose: &'static str,
     phase1_scope: &'static str,
     phase2_scope: &'static str,
+    phase3_scope: &'static str,
     rounds: usize,
     stack_repetitions: usize,
     reject_every: usize,
@@ -86,6 +123,7 @@ struct Report {
     phase2_flat_gate_passed: bool,
     zero_allocation_gate_passed: bool,
     differential_gate_passed: bool,
+    phase3: Phase3Result,
     cases: Vec<CaseResult>,
 }
 
@@ -284,6 +322,124 @@ fn paired_phase2_width_ratio() -> f64 {
     median_f64(ratios)
 }
 
+fn phase3_snapshots() -> (Arc<LayeredSnapshot>, Arc<LayeredSnapshot>) {
+    let width = 256;
+    let mut workspace =
+        Workspace::with_indexes(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
+    let mut roots = Vec::with_capacity(TOTAL_INTENTS / width);
+    for epoch in 0..(TOTAL_INTENTS / width) {
+        for position in 0..width {
+            let index = epoch * width + position;
+            black_box(workspace.execute(&stack_program(index, SlotToken(0))));
+        }
+        roots.push(workspace.publish_epoch().expect("epoch publishes a root"));
+    }
+    let base_root = roots[roots.len() - 2];
+    let final_root = *roots.last().expect("at least one root");
+    let compact = Arc::new(workspace.compact_base(base_root));
+    let base_snapshot = Arc::new(workspace.layered_snapshot(compact.clone(), base_root));
+    let final_snapshot = Arc::new(workspace.layered_snapshot(compact, final_root));
+    (base_snapshot, final_snapshot)
+}
+
+fn measure_reads(snapshot: &LayeredSnapshot, pattern: QueryPattern) -> ReadMetric {
+    let expected = snapshot.query_count(pattern);
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let started = Instant::now();
+        let mut checksum = 0usize;
+        for _ in 0..READ_ITERATIONS {
+            checksum = checksum.wrapping_add(black_box(snapshot.query_count(pattern)));
+        }
+        black_box(checksum);
+        samples.push(started.elapsed().as_nanos().max(1));
+    }
+    let elapsed_ns = median(samples);
+    ReadMetric {
+        queries: READ_ITERATIONS,
+        median_elapsed_us: elapsed_ns / 1_000,
+        queries_per_second: READ_ITERATIONS as f64 * 1_000_000_000.0 / elapsed_ns as f64,
+        ns_per_query: elapsed_ns as f64 / READ_ITERATIONS as f64,
+        result_count: expected,
+    }
+}
+
+fn measure_concurrent_reads(
+    older: Arc<LayeredSnapshot>,
+    newer: Arc<LayeredSnapshot>,
+) -> (ConcurrentReadMetric, bool) {
+    let published = Arc::new(ArcSwap::from(older.clone()));
+    let barrier = Arc::new(Barrier::new(CONCURRENT_READERS + 1));
+    let point = QueryPattern::Exact(Cell(1), Cell(1), Cell(1));
+    let range = QueryPattern::Predicate(Cell(1));
+    let valid_point = [older.query_count(point), newer.query_count(point)];
+    let valid_range = [older.query_count(range), newer.query_count(range)];
+    let mut readers = Vec::with_capacity(CONCURRENT_READERS);
+    for _ in 0..CONCURRENT_READERS {
+        let published = published.clone();
+        let barrier = barrier.clone();
+        readers.push(thread::spawn(move || {
+            barrier.wait();
+            let mut valid = true;
+            let mut checksum = 0usize;
+            for iteration in 0..CONCURRENT_READS_PER_READER {
+                let snapshot = published.load_full();
+                let (pattern, allowed) = if iteration & 1 == 0 {
+                    (point, valid_point)
+                } else {
+                    (range, valid_range)
+                };
+                let count = snapshot.query_count(pattern);
+                valid &= allowed.contains(&count);
+                checksum = checksum.wrapping_add(count);
+            }
+            black_box(checksum);
+            valid
+        }));
+    }
+
+    barrier.wait();
+    let started = Instant::now();
+    for publication in 0..CONCURRENT_PUBLICATIONS {
+        published.store(if publication & 1 == 0 {
+            newer.clone()
+        } else {
+            older.clone()
+        });
+    }
+    let valid = readers
+        .into_iter()
+        .all(|reader| reader.join().expect("reader thread succeeds"));
+    let elapsed_us = started.elapsed().as_micros().max(1);
+    let queries = CONCURRENT_READERS * CONCURRENT_READS_PER_READER;
+    (
+        ConcurrentReadMetric {
+            readers: CONCURRENT_READERS,
+            queries,
+            snapshot_publications: CONCURRENT_PUBLICATIONS,
+            elapsed_us,
+            queries_per_second: queries as f64 * 1_000_000.0 / elapsed_us as f64,
+        },
+        valid,
+    )
+}
+
+fn run_phase3() -> Phase3Result {
+    let (older, newer) = phase3_snapshots();
+    let point_lookup = measure_reads(&newer, QueryPattern::Exact(Cell(1), Cell(1), Cell(1)));
+    let predicate_range = measure_reads(&newer, QueryPattern::Predicate(Cell(1)));
+    let (concurrent_reads, snapshot_results_valid) =
+        measure_concurrent_reads(older.clone(), newer.clone());
+    Phase3Result {
+        compact_base_facts: older.query_count(QueryPattern::Predicate(Cell(1))),
+        tail_index_deltas: newer.tail_delta_count(),
+        point_lookup,
+        predicate_range,
+        concurrent_reads,
+        snapshot_results_valid,
+    }
+}
+
 fn main() {
     let mut cases = Vec::new();
     for width in [16, 64, 128, 256] {
@@ -321,11 +477,13 @@ fn main() {
         .iter()
         .all(|case| case.stack_vm_phase2.hot_path_allocations == 0);
     let differential_gate_passed = cases.iter().all(|case| case.projection_parity);
+    let phase3 = run_phase3();
     let report = Report {
         status: "ok",
-        purpose: "measure clone-free stack materialization before and after layered SPO/POS/OSP deltas plus immutable POD world roots",
+        purpose: "measure clone-free stack materialization, layered SPO/POS/OSP maintenance, compact read bases, and atomically published immutable reader snapshots",
         phase1_scope: "slot-head semantics, temporary allocation, post-write rejection, and rollback",
         phase2_scope: "adds three permutation-delta indexes covering seven query shapes, incremental semantic hashing, and allocation-free immutable root publication; compacted query bases, host validators, durable tokens, and concurrent readers remain outside the VM",
+        phase3_scope: "compacts an older root into sorted SPO/POS/OSP arrays, resolves a short immutable delta tail, and atomically swaps Arc-owned snapshots for concurrent readers; compaction allocation, durable token integration, and production reclamation policy remain outside this experiment",
         rounds: ROUNDS,
         stack_repetitions: STACK_REPETITIONS,
         reject_every: REJECT_EVERY,
@@ -333,6 +491,7 @@ fn main() {
         phase2_flat_gate_passed,
         zero_allocation_gate_passed,
         differential_gate_passed,
+        phase3,
         cases,
     };
     let encoded = serde_json::to_string_pretty(&report).expect("report serializes");
@@ -342,4 +501,5 @@ fn main() {
     }
     assert!(report.zero_allocation_gate_passed);
     assert!(report.differential_gate_passed);
+    assert!(report.phase3.snapshot_results_valid);
 }

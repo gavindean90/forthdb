@@ -3,14 +3,18 @@
 //! This deliberately does not change the durable admission format. It isolates
 //! the cost of materializing rejectable intents without cloning `ForthDb`.
 
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 const NONE: u32 = u32::MAX;
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Cell(pub u64);
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SlotToken(pub u32);
 
 #[repr(u8)]
@@ -163,6 +167,7 @@ pub struct IndexDelta {
     second: Cell,
     third: Cell,
     record: u32,
+    slot: SlotToken,
 }
 
 #[repr(C)]
@@ -200,6 +205,101 @@ pub enum QueryPattern {
     SubjectObject(Cell, Cell),
     PredicateObject(Cell, Cell),
     Exact(Cell, Cell, Cell),
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompactIndexEntry {
+    first: Cell,
+    second: Cell,
+    third: Cell,
+    record: u32,
+    slot: SlotToken,
+}
+
+/// A compact immutable query base. Each permutation is a contiguous sorted
+/// array suitable for binary prefix lookup.
+pub struct CompactBase {
+    root: WorldRoot,
+    spo: Box<[CompactIndexEntry]>,
+    pos: Box<[CompactIndexEntry]>,
+    osp: Box<[CompactIndexEntry]>,
+}
+
+impl CompactBase {
+    pub fn active_fact_count(&self) -> usize {
+        self.spo.len()
+    }
+
+    pub fn world_id(&self) -> u64 {
+        self.root.world_id
+    }
+}
+
+/// A reader-owned world: an `Arc`-shared compact base plus the short immutable
+/// delta tail needed to reach a later root.
+pub struct LayeredSnapshot {
+    base: Arc<CompactBase>,
+    root: WorldRoot,
+    tail: Arc<[IndexDelta]>,
+}
+
+impl LayeredSnapshot {
+    pub fn world_id(&self) -> u64 {
+        self.root.world_id
+    }
+
+    pub fn tail_delta_count(&self) -> usize {
+        self.tail.len()
+    }
+
+    pub fn query_count(&self, pattern: QueryPattern) -> usize {
+        let (entries, key, key_len) = self.base_entries(pattern);
+        let range = compact_prefix_range(entries, key, key_len);
+        let mut count = range.end as i64 - range.start as i64;
+        for delta in self.tail.iter().copied() {
+            if matches_index(delta, pattern) {
+                count += if delta.added { 1 } else { -1 };
+            }
+        }
+        debug_assert!(count >= 0);
+        count as usize
+    }
+
+    pub fn query_slots(&self, pattern: QueryPattern) -> Vec<SlotToken> {
+        let (entries, key, key_len) = self.base_entries(pattern);
+        let range = compact_prefix_range(entries, key, key_len);
+        let mut active = entries[range]
+            .iter()
+            .map(|entry| (entry.record, entry.slot))
+            .collect::<Vec<_>>();
+        for delta in self.tail.iter().copied() {
+            if !matches_index(delta, pattern) {
+                continue;
+            }
+            if delta.added {
+                active.push((delta.record, delta.slot));
+            } else if let Some(position) = active
+                .iter()
+                .position(|(record, _)| *record == delta.record)
+            {
+                active.swap_remove(position);
+            }
+        }
+        let mut slots = active.into_iter().map(|(_, slot)| slot).collect::<Vec<_>>();
+        slots.sort_unstable();
+        slots
+    }
+
+    fn base_entries(&self, pattern: QueryPattern) -> (&[CompactIndexEntry], [Cell; 3], usize) {
+        let (permutation, key, key_len) = query_key(pattern);
+        let entries = match permutation {
+            IndexPermutation::Spo => self.base.spo.as_ref(),
+            IndexPermutation::Pos => self.base.pos.as_ref(),
+            IndexPermutation::Osp => self.base.osp.as_ref(),
+        };
+        (entries, key, key_len)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -473,6 +573,71 @@ impl Workspace {
         slots
     }
 
+    /// Consolidate one root into three sorted immutable permutation arrays.
+    /// Compaction allocates and is intentionally outside the materialization
+    /// and publication hot path measured by Phase 2.
+    pub fn compact_base(&self, root: WorldRoot) -> CompactBase {
+        let mut active = BTreeMap::<u32, IndexDelta>::new();
+        for delta in &self.index_deltas.active()[..root.index_delta_frontier as usize] {
+            if delta.permutation != IndexPermutation::Spo {
+                continue;
+            }
+            if delta.added {
+                active.insert(delta.record, *delta);
+            } else {
+                active.remove(&delta.record);
+            }
+        }
+
+        let mut spo = Vec::with_capacity(active.len());
+        let mut pos = Vec::with_capacity(active.len());
+        let mut osp = Vec::with_capacity(active.len());
+        for delta in active.values().copied() {
+            spo.push(CompactIndexEntry {
+                first: delta.first,
+                second: delta.second,
+                third: delta.third,
+                record: delta.record,
+                slot: delta.slot,
+            });
+            pos.push(CompactIndexEntry {
+                first: delta.second,
+                second: delta.third,
+                third: delta.first,
+                record: delta.record,
+                slot: delta.slot,
+            });
+            osp.push(CompactIndexEntry {
+                first: delta.third,
+                second: delta.first,
+                third: delta.second,
+                record: delta.record,
+                slot: delta.slot,
+            });
+        }
+        spo.sort_unstable();
+        pos.sort_unstable();
+        osp.sort_unstable();
+        CompactBase {
+            root,
+            spo: spo.into_boxed_slice(),
+            pos: pos.into_boxed_slice(),
+            osp: osp.into_boxed_slice(),
+        }
+    }
+
+    pub fn layered_snapshot(&self, base: Arc<CompactBase>, root: WorldRoot) -> LayeredSnapshot {
+        assert!(base.root.index_delta_frontier <= root.index_delta_frontier);
+        let tail = self.index_deltas.active()
+            [base.root.index_delta_frontier as usize..root.index_delta_frontier as usize]
+            .to_vec();
+        LayeredSnapshot {
+            base,
+            root,
+            tail: Arc::from(tail),
+        }
+    }
+
     fn checkpoint(&self) -> TrialCheckpoint {
         TrialCheckpoint {
             stack_pointer: self.stack_pointer,
@@ -633,6 +798,7 @@ impl Workspace {
             second: fact.predicate,
             third: fact.object,
             record,
+            slot: fact.slot,
         });
         self.index_deltas.push(IndexDelta {
             permutation: IndexPermutation::Pos,
@@ -641,6 +807,7 @@ impl Workspace {
             second: fact.object,
             third: fact.subject,
             record,
+            slot: fact.slot,
         });
         self.index_deltas.push(IndexDelta {
             permutation: IndexPermutation::Osp,
@@ -649,6 +816,7 @@ impl Workspace {
             second: fact.subject,
             third: fact.predicate,
             record,
+            slot: fact.slot,
         });
     }
 
@@ -757,6 +925,43 @@ fn matches_index(delta: IndexDelta, pattern: QueryPattern) -> bool {
                 && delta.third == object
         }
     }
+}
+
+fn query_key(pattern: QueryPattern) -> (IndexPermutation, [Cell; 3], usize) {
+    match pattern {
+        QueryPattern::Subject(subject) => (IndexPermutation::Spo, [subject, Cell(0), Cell(0)], 1),
+        QueryPattern::Predicate(predicate) => {
+            (IndexPermutation::Pos, [predicate, Cell(0), Cell(0)], 1)
+        }
+        QueryPattern::Object(object) => (IndexPermutation::Osp, [object, Cell(0), Cell(0)], 1),
+        QueryPattern::SubjectPredicate(subject, predicate) => {
+            (IndexPermutation::Spo, [subject, predicate, Cell(0)], 2)
+        }
+        QueryPattern::SubjectObject(subject, object) => {
+            (IndexPermutation::Osp, [object, subject, Cell(0)], 2)
+        }
+        QueryPattern::PredicateObject(predicate, object) => {
+            (IndexPermutation::Pos, [predicate, object, Cell(0)], 2)
+        }
+        QueryPattern::Exact(subject, predicate, object) => {
+            (IndexPermutation::Spo, [subject, predicate, object], 3)
+        }
+    }
+}
+
+fn compare_prefix(entry: &CompactIndexEntry, key: [Cell; 3], key_len: usize) -> Ordering {
+    let entry_key = [entry.first, entry.second, entry.third];
+    entry_key[..key_len].cmp(&key[..key_len])
+}
+
+fn compact_prefix_range(
+    entries: &[CompactIndexEntry],
+    key: [Cell; 3],
+    key_len: usize,
+) -> std::ops::Range<usize> {
+    let start = entries.partition_point(|entry| compare_prefix(entry, key, key_len).is_lt());
+    let end = entries.partition_point(|entry| !compare_prefix(entry, key, key_len).is_gt());
+    start..end
 }
 
 fn hash_record(mut hash: u64, record: FactRecord) -> u64 {
@@ -1004,6 +1209,57 @@ mod tests {
         }
     }
 
+    fn assert_all_layered_index_shapes(world: &crate::World, snapshot: &LayeredSnapshot) {
+        let Some((slot, fact)) = (0..64).find_map(|slot| {
+            world
+                .resolve(&SlotId::new(format!("differential/{slot}")))
+                .map(|fact| (slot, fact))
+        }) else {
+            return;
+        };
+        let subject = match fact.subject {
+            Atom::Entity(entity) => Cell(entity.value()),
+            Atom::Literal(_) => panic!("differential subjects are entities"),
+        };
+        let predicate = Cell(7);
+        let object = match &fact.object {
+            Atom::Literal(value) => Cell(value.as_str().parse().expect("numeric object")),
+            Atom::Entity(_) => panic!("differential objects are literals"),
+        };
+        let cases = [
+            ((true, false, false), QueryPattern::Subject(subject)),
+            ((false, true, false), QueryPattern::Predicate(predicate)),
+            ((false, false, true), QueryPattern::Object(object)),
+            (
+                (true, true, false),
+                QueryPattern::SubjectPredicate(subject, predicate),
+            ),
+            (
+                (true, false, true),
+                QueryPattern::SubjectObject(subject, object),
+            ),
+            (
+                (false, true, true),
+                QueryPattern::PredicateObject(predicate, object),
+            ),
+            (
+                (true, true, true),
+                QueryPattern::Exact(subject, predicate, object),
+            ),
+        ];
+        for ((bound_subject, bound_predicate, bound_object), pattern) in cases {
+            let expected =
+                current_query_slots(world, fact, bound_subject, bound_predicate, bound_object);
+            let actual = snapshot
+                .query_slots(pattern)
+                .into_iter()
+                .map(|slot| slot.0)
+                .collect::<Vec<_>>();
+            assert_eq!(expected, actual, "layered query mismatch at slot {slot}");
+            assert_eq!(snapshot.query_count(pattern), actual.len());
+        }
+    }
+
     #[test]
     fn deterministic_epoch_sweep_matches_current_slot_semantics() {
         for width in [16, 64, 128, 256] {
@@ -1022,6 +1278,7 @@ mod tests {
             let validators = [validator];
             let mut first_root = None;
             let mut first_root_value = None;
+            let mut final_root = None;
 
             for epoch in 0..(512 / width) {
                 let mut current = Vec::with_capacity(width);
@@ -1112,6 +1369,7 @@ mod tests {
                 let root = workspace
                     .publish_epoch()
                     .expect("epoch has accepted effects");
+                final_root = Some(root);
                 assert_eq!(root.allocator_head(), world.next_entity());
                 assert_eq!(root.version(), (epoch + 1) as u64);
                 assert_ne!(root.world_id(), 0);
@@ -1132,6 +1390,10 @@ mod tests {
                 }
             }
             assert_eq!(world.active_slot_count(), workspace.active_slot_count());
+            let compact = Arc::new(workspace.compact_base(first_root.unwrap()));
+            let snapshot = workspace.layered_snapshot(compact, final_root.unwrap());
+            assert_eq!(snapshot.world_id(), final_root.unwrap().world_id());
+            assert_all_layered_index_shapes(&world, &snapshot);
             assert_eq!(
                 workspace.resolve_object_at(first_root.unwrap(), SlotToken(2)),
                 first_root_value.unwrap(),

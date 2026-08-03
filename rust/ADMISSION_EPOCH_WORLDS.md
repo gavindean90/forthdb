@@ -105,6 +105,10 @@ hot-path allocation plus parity across all seven query shapes as correctness
 gates. Compacted query bases and concurrent reader ownership remain subsequent
 work.
 
+[`STACK_VM_PHASE3.md`](STACK_VM_PHASE3.md) compacts older roots into sorted
+permutation arrays, layers a short immutable delta suffix over the compact
+base, and measures atomically published reader snapshots.
+
 ## Library reference
 
 The Rust library application groups seven domain intentions into five durable
