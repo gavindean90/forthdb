@@ -12,6 +12,7 @@ This workspace contains the Rust semantic kernel and committed-world engine.
 6. Queued-intent semantic epoch control
 7. Bounded ingress and commit tickets
 8. Ordinary-file durability epochs
+9. io_uring durability transport comparison
 
 All stores implement the same `CommitStore` contract. Strict transactions derive and validate a private candidate, append its canonical `CommitFrame`, wait for required durability, and only then publish the immutable successor.
 
@@ -23,11 +24,14 @@ Milestone 6A.2 adds a fixed-capacity MPSC ingress and one in-memory committer th
 
 Milestone 6B adds `FileEpochStore` and `DurableQueuedIntentController`. The paired ordinary-file transport can either synchronize every frame or encode a contiguous frame arena and synchronize once per epoch. An accepted durable ticket resolves only after the file synchronization succeeds and the reader head advances to the epoch tail. Observed failures enter verified repair; any uncertain repair permanently poisons the live handle.
 
+Milestone 6C adds three interoperable Linux io_uring epoch transports: contiguous `WRITE`, `WRITEV`, and independent positional writes followed by an `IO_DRAIN` data-synchronization barrier. The existing committer thread owns the ring and reaps every CQE before publication. The experiment preserved the complete 6B contract but found that none of the ring submission shapes outperformed the ordinary-file epoch control.
+
 Design and evidence:
 
 - [`STRUCTURAL_SHARING.md`](STRUCTURAL_SHARING.md)
 - [`QUEUED_DURABILITY.md`](QUEUED_DURABILITY.md)
 - [`FILE_EPOCHS.md`](FILE_EPOCHS.md)
+- [`IO_URING_EPOCHS.md`](IO_URING_EPOCHS.md)
 - [`FILE_FORMAT.md`](../FILE_FORMAT.md)
 - [`WORLD_CONTRACT.md`](../WORLD_CONTRACT.md)
 
@@ -63,6 +67,9 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
 
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin queued_file_epoch
+
+cargo run --quiet --release --manifest-path rust/Cargo.toml \
+  -p forthdb-bench --bin queued_io_uring_epoch
 ```
 
 `IoUringCommitStore` is Linux-only and reports unavailability when ring creation is denied by the running kernel or security policy.
@@ -122,14 +129,31 @@ At batch size one the policies converged, confirming that the paired harness doe
 
 Failure tests use real files and inject deterministic write, synchronization, truncation, and verification failures. They include every byte boundary of a three-frame arena and subprocess termination without Rust cleanup. Successful repair restores the exact pre-epoch bytes; any uncertain double fault poisons the live handle.
 
+## Milestone 6C result
+
+The accepted four-round rotating benchmark used the same complete durable controller over a 100,000-definition base. Batch size one remained the no-amortization control.
+
+| Transport | Max batch | Median intents/s | Writes | Syncs | CQEs | Max writes in flight |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Ordinary per-epoch | 1 | 1,779 | 512 | 512 | 0 | 0 |
+| io_uring contiguous `WRITE` | 1 | 1,631 | 512 | 512 | 1,024 | 1 |
+| io_uring `WRITEV` | 1 | 1,762 | 512 | 512 | 1,024 | 1 |
+| io_uring positional writes | 1 | 1,670 | 512 | 512 | 1,024 | 1 |
+| Ordinary per-epoch | 16 | **8,183** | 128 | 128 | 0 | 0 |
+| io_uring contiguous `WRITE` | 16 | 8,010 | 129 | 129 | 258 | 1 |
+| io_uring `WRITEV` | 16 | 7,978 | 129 | 129 | 258 | 1 |
+| io_uring positional writes | 16 | 7,425 | 2,048 | 129 | 2,177 | 16 |
+
+`WRITEV` removed the contiguous arena copy but did not improve throughput. The pipelined form achieved genuine QD=16, yet its SQE and CQE overhead made it about 9 percent slower than one ordinary contiguous epoch write. The ordinary-file per-epoch transport therefore remains the default. A dedicated reactor and multiple epochs in flight are not justified by this result.
+
 ## Correctness gates
 
-The shared and legacy semantic kernels remain under differential testing. Milestone 6 adds sequential-versus-queued world and frame parity, byte-for-byte file parity, temporary-entity scope enforcement, predecessor-relative preconditions, independent rejection, one-tail publication, a deterministic 10,000-intent differential sequence, multi-producer admission/ticket stress, ordinary-file repair/poisoning tests, exhaustive byte-boundary failure injection, and subprocess crash-prefix recovery.
+The shared and legacy semantic kernels remain under differential testing. Milestone 6 adds sequential-versus-queued world and frame parity, byte-for-byte file parity, temporary-entity scope enforcement, predecessor-relative preconditions, independent rejection, one-tail publication, a deterministic 10,000-intent differential sequence, multi-producer admission/ticket stress, ordinary-file repair/poisoning tests, exhaustive byte-boundary failure injection, subprocess crash-prefix recovery, io_uring byte parity, explicit CQE correlation, malformed-completion rejection, and true-QD transport metrics.
 
-The existing world, file, mmap, io_uring, conformance, recovery, and canonical-byte suites remain mandatory. Milestone 6B adds a new file-epoch transport without changing `CommitFrame`, version 1 encoding, `FileCommitStore`, `MmapCommitStore`, or `IoUringCommitStore`.
+The existing world, file, mmap, io_uring, conformance, recovery, and canonical-byte suites remain mandatory. Milestones 6B and 6C add epoch transports without changing `CommitFrame`, version 1 encoding, `FileCommitStore`, `MmapCommitStore`, or the original queue-depth-one `IoUringCommitStore`.
 
 ## Current boundaries
 
-The engine does not yet implement dwell-time batching, adaptive batch policy, io_uring epoch transports, checkpoints, compaction, true power-loss fault injection, worker restart, or cross-process writer coordination.
+The engine does not yet implement dwell-time batching, adaptive batch policy, multiple durability epochs in flight, a dedicated completion reactor, registered io_uring resources, checkpoints, compaction, true power-loss fault injection, worker restart, or cross-process writer coordination.
 
-The next experiment is Milestone 6C: compare contiguous `WRITE`, `WRITEV`, and independent positional writes followed by a drained `FSYNC(DATASYNC)` barrier against the ordinary-file epoch control.
+Milestone 6C found no reason to replace the ordinary-file epoch control merely by changing submission shape. Any later ring experiment must test a different concurrency proposition—such as overlapping preparation with durability—behind a separately specified ownership and publication contract.
