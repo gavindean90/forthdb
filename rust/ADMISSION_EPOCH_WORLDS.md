@@ -86,3 +86,12 @@ epoch worlds:
 The application observes durable admission before semantic acceptance,
 preserves historical snapshots and compiled identity, then closes and reopens
 the admission journal to prove reconstruction of the identical final world.
+
+The ramped library reference uses the same model at application scale: 10,000
+works, 20,000 copies, 5,000 patrons, eight branches, and a deterministic mix of
+checkout, contention, holds, moves, loss/recovery, renames, and returns. It runs
+the identical ordered trace with one-intent interactive epochs and 16-intent
+branch-rush epochs. The comparison treats equal final projections and exact
+per-profile recovery as correctness gates, then reports throughput, admission
+and semantic latency, syncs per intent, semantic lag, query latency, and history
+growth.

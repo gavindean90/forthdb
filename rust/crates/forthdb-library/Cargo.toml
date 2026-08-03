@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+default-run = "forthdb-library"
 
 [dependencies]
 forthdb-core = { path = "../forthdb-core" }

@@ -28,6 +28,23 @@ Milestone 6C tested three synchronous Linux io_uring epoch transports. None outp
 
 The current draft direction separates durable admission from semantic publication. Ordered intents are encoded into one checksummed admission epoch and become durable through one io_uring `WRITE -> DATASYNC`. The admitted epoch is then evaluated deterministically and publishes at most one immutable world. Recovery replays admission epochs rather than requiring a second synchronized outcome log. Multiple accepted intents in one epoch share the same published world and preserve individual accepted or rejected outcomes.
 
+The library package also includes a ramped circulation comparison. It seeds
+10,000 works, 20,000 copies, 5,000 patrons, and eight branches, then applies the
+same deterministic 512-intent trace as interactive one-intent epochs and as
+16-intent branch-rush epochs. The trace covers checkout contention, holds,
+moves, loss and recovery, patron renames, and returns. Its JSON report records
+throughput and latency, syncs per intent, semantic lag, query latency, history
+growth, and exact recovery. Run it on Linux with:
+
+```console
+cargo run --release --manifest-path rust/Cargo.toml -p forthdb-library --bin ramped
+```
+
+`FORTHDB_RAMPED_WORKS`, `FORTHDB_RAMPED_COPIES`,
+`FORTHDB_RAMPED_PATRONS`, `FORTHDB_RAMPED_BRANCHES`, and
+`FORTHDB_RAMPED_CYCLES` can reduce or expand the hosted profile without changing
+its semantics.
+
 Design and evidence:
 
 - [`STRUCTURAL_SHARING.md`](STRUCTURAL_SHARING.md)
