@@ -8,6 +8,9 @@ publish = false
 [lib]
 path = "src/wrapper.rs"
 
+[features]
+fault-injection = []
+
 [dependencies]
 forthdb-core = { path = "../forthdb-core" }
 memmap2 = "0.9"

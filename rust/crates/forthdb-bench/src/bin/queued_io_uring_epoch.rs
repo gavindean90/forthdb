@@ -347,6 +347,9 @@ mod linux {
                             Err(DurableSubmitError::Closed(_)) => {
                                 panic!("durable controller closed")
                             }
+                            Err(DurableSubmitError::Poisoned { reason, .. }) => {
+                                panic!("durable controller poisoned: {reason}")
+                            }
                         }
                     }
                 }
@@ -363,6 +366,9 @@ mod linux {
                 DurableTicketOutcome::Rejected(error) => panic!("intent rejected: {error}"),
                 DurableTicketOutcome::DurabilityFailed(error) => {
                     panic!("durability failed during benchmark: {error}")
+                }
+                DurableTicketOutcome::Stopped(reason) => {
+                    panic!("durable controller stopped during benchmark: {reason:?}")
                 }
             }
         }

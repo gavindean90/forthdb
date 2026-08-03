@@ -2,16 +2,47 @@ use super::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 const PHASE_QUEUED: u8 = 0;
 const PHASE_CLAIMED: u8 = 1;
 const PHASE_RESOLVED: u8 = 2;
 
+const CONTROLLER_STARTING: u8 = 0;
+const CONTROLLER_RUNNING: u8 = 1;
+const CONTROLLER_DRAINING: u8 = 2;
+const CONTROLLER_CLOSED: u8 = 3;
+const CONTROLLER_POISONED: u8 = 4;
+
 static NEXT_DURABLE_TICKET_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableControllerState {
+    Starting,
+    Running,
+    Draining,
+    Closed,
+    Poisoned,
+}
+
+impl DurableControllerState {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            CONTROLLER_STARTING => Self::Starting,
+            CONTROLLER_RUNNING => Self::Running,
+            CONTROLLER_DRAINING => Self::Draining,
+            CONTROLLER_CLOSED => Self::Closed,
+            CONTROLLER_POISONED => Self::Poisoned,
+            _ => unreachable!("invalid durable controller state"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurableTicketPhase {
@@ -136,6 +167,12 @@ impl fmt::Display for DurableTicketRejection {
 
 impl Error for DurableTicketRejection {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTicketStopReason {
+    ShutdownBeforeClaim,
+    WorkerFailed(String),
+}
+
 #[derive(Debug)]
 pub enum DurableTicketOutcome {
     Accepted {
@@ -145,27 +182,35 @@ pub enum DurableTicketOutcome {
     },
     Rejected(DurableTicketRejection),
     DurabilityFailed(String),
+    Stopped(DurableTicketStopReason),
 }
 
 impl DurableTicketOutcome {
     pub fn world(&self) -> Option<Arc<World>> {
         match self {
             Self::Accepted { world, .. } => Some(world.clone()),
-            Self::Rejected(_) | Self::DurabilityFailed(_) => None,
+            Self::Rejected(_) | Self::DurabilityFailed(_) | Self::Stopped(_) => None,
         }
     }
 
     pub fn rejection(&self) -> Option<&DurableTicketRejection> {
         match self {
             Self::Rejected(error) => Some(error),
-            Self::Accepted { .. } | Self::DurabilityFailed(_) => None,
+            Self::Accepted { .. } | Self::DurabilityFailed(_) | Self::Stopped(_) => None,
         }
     }
 
     pub fn durability_error(&self) -> Option<&str> {
         match self {
             Self::DurabilityFailed(message) => Some(message),
-            Self::Accepted { .. } | Self::Rejected(_) => None,
+            Self::Accepted { .. } | Self::Rejected(_) | Self::Stopped(_) => None,
+        }
+    }
+
+    pub fn stop_reason(&self) -> Option<&DurableTicketStopReason> {
+        match self {
+            Self::Stopped(reason) => Some(reason),
+            Self::Accepted { .. } | Self::Rejected(_) | Self::DurabilityFailed(_) => None,
         }
     }
 }
@@ -221,9 +266,7 @@ impl DurableCommitTicket {
         result
     }
 
-    pub fn try_wait(
-        &mut self,
-    ) -> Result<Option<DurableTicketOutcome>, DurableTicketWaitError> {
+    pub fn try_wait(&mut self) -> Result<Option<DurableTicketOutcome>, DurableTicketWaitError> {
         let receiver = self
             .receiver
             .as_ref()
@@ -258,12 +301,16 @@ impl Drop for DurableCommitTicket {
 pub enum DurableSubmitError {
     Full(QueuedIntent),
     Closed(QueuedIntent),
+    Poisoned {
+        intent: QueuedIntent,
+        reason: String,
+    },
 }
 
 impl DurableSubmitError {
     pub fn into_intent(self) -> QueuedIntent {
         match self {
-            Self::Full(intent) | Self::Closed(intent) => intent,
+            Self::Full(intent) | Self::Closed(intent) | Self::Poisoned { intent, .. } => intent,
         }
     }
 }
@@ -272,7 +319,13 @@ impl fmt::Display for DurableSubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Full(_) => write!(formatter, "durable queued-intent ingress is full"),
-            Self::Closed(_) => write!(formatter, "durable queued-intent controller is closed"),
+            Self::Closed(_) => write!(formatter, "durable queued-intent controller is not running"),
+            Self::Poisoned { reason, .. } => {
+                write!(
+                    formatter,
+                    "durable queued-intent controller is poisoned: {reason}"
+                )
+            }
         }
     }
 }
@@ -299,26 +352,107 @@ impl fmt::Display for DurableControllerConfigError {
 impl Error for DurableControllerConfigError {}
 
 #[derive(Debug)]
-pub struct DurableControllerStopped;
+pub enum DurableControllerOpenError {
+    WriterLease(WriterLeaseError),
+    Store(FileEpochStoreError),
+    History(CandidateError),
+    Controller(DurableControllerConfigError),
+}
+
+impl fmt::Display for DurableControllerOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriterLease(error) => write!(formatter, "writer ownership failed: {error}"),
+            Self::Store(error) => write!(formatter, "durable store open failed: {error}"),
+            Self::History(error) => {
+                write!(formatter, "durable history reconstruction failed: {error}")
+            }
+            Self::Controller(error) => {
+                write!(formatter, "durable controller start failed: {error}")
+            }
+        }
+    }
+}
+
+impl Error for DurableControllerOpenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::WriterLease(error) => Some(error),
+            Self::Store(error) => Some(error),
+            Self::History(error) => Some(error),
+            Self::Controller(error) => Some(error),
+        }
+    }
+}
+
+impl From<WriterLeaseError> for DurableControllerOpenError {
+    fn from(value: WriterLeaseError) -> Self {
+        Self::WriterLease(value)
+    }
+}
+
+impl From<FileEpochStoreError> for DurableControllerOpenError {
+    fn from(value: FileEpochStoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl From<CandidateError> for DurableControllerOpenError {
+    fn from(value: CandidateError) -> Self {
+        Self::History(value)
+    }
+}
+
+impl From<DurableControllerConfigError> for DurableControllerOpenError {
+    fn from(value: DurableControllerConfigError) -> Self {
+        Self::Controller(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableControllerStopped {
+    pub state: DurableControllerState,
+    pub reason: Option<String>,
+}
 
 impl fmt::Display for DurableControllerStopped {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "durable queued-intent controller is stopped")
+        if let Some(reason) = &self.reason {
+            write!(
+                formatter,
+                "durable controller stopped in {:?}: {reason}",
+                self.state
+            )
+        } else {
+            write!(formatter, "durable controller stopped in {:?}", self.state)
+        }
     }
 }
 
 impl Error for DurableControllerStopped {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableShutdownReport {
+    pub previous_state: DurableControllerState,
+    pub final_state: DurableControllerState,
+    pub queued_stopped: u64,
+    pub worker_failures: u64,
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableQueuedControllerMetrics {
     pub capacity: usize,
     pub max_batch: usize,
+    pub state: DurableControllerState,
     pub submitted: u64,
     pub backpressured: u64,
     pub claimed: u64,
     pub accepted: u64,
     pub rejected: u64,
     pub durability_failed: u64,
+    pub shutdown_before_claim: u64,
+    pub worker_failed: u64,
     pub epochs: u64,
     pub abandoned_tickets: u64,
     pub completion_delivery_failures: u64,
@@ -326,16 +460,37 @@ pub struct DurableQueuedControllerMetrics {
     pub maximum_queue_depth: u64,
     pub in_flight: u64,
     pub worker_alive: bool,
+    pub queue_wait_nanos: u64,
+    pub derive_nanos: u64,
+    pub persist_nanos: u64,
+    pub publish_nanos: u64,
+    pub delivery_nanos: u64,
+    pub epoch_total_nanos: u64,
+}
+
+impl DurableQueuedControllerMetrics {
+    pub fn estimated_pipeline_speedup_ceiling(&self) -> Option<f64> {
+        if self.derive_nanos == 0 || self.persist_nanos == 0 {
+            return None;
+        }
+        let serial = self.derive_nanos.saturating_add(self.persist_nanos) as f64;
+        let overlapped = self.derive_nanos.max(self.persist_nanos) as f64;
+        Some(serial / overlapped)
+    }
 }
 
 #[derive(Default)]
 struct DurableControllerMetricsInner {
+    state: AtomicU8,
+    poison_reason: Mutex<Option<String>>,
     submitted: AtomicU64,
     backpressured: AtomicU64,
     claimed: AtomicU64,
     accepted: AtomicU64,
     rejected: AtomicU64,
     durability_failed: AtomicU64,
+    shutdown_before_claim: AtomicU64,
+    worker_failed: AtomicU64,
     epochs: AtomicU64,
     abandoned_tickets: AtomicU64,
     completion_delivery_failures: AtomicU64,
@@ -343,9 +498,54 @@ struct DurableControllerMetricsInner {
     maximum_queue_depth: AtomicU64,
     in_flight: AtomicU64,
     worker_alive: AtomicBool,
+    queue_wait_nanos: AtomicU64,
+    derive_nanos: AtomicU64,
+    persist_nanos: AtomicU64,
+    publish_nanos: AtomicU64,
+    delivery_nanos: AtomicU64,
+    epoch_total_nanos: AtomicU64,
 }
 
 impl DurableControllerMetricsInner {
+    fn state(&self) -> DurableControllerState {
+        DurableControllerState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    fn set_state(&self, state: DurableControllerState) {
+        let raw = match state {
+            DurableControllerState::Starting => CONTROLLER_STARTING,
+            DurableControllerState::Running => CONTROLLER_RUNNING,
+            DurableControllerState::Draining => CONTROLLER_DRAINING,
+            DurableControllerState::Closed => CONTROLLER_CLOSED,
+            DurableControllerState::Poisoned => CONTROLLER_POISONED,
+        };
+        self.state.store(raw, Ordering::Release);
+    }
+
+    fn poison(&self, reason: impl Into<String>) -> String {
+        let reason = reason.into();
+        *self
+            .poison_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason.clone());
+        self.set_state(DurableControllerState::Poisoned);
+        reason
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.poison_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn stopped(&self) -> DurableControllerStopped {
+        DurableControllerStopped {
+            state: self.state(),
+            reason: self.reason(),
+        }
+    }
+
     fn reserve_ingress(&self, capacity: usize) -> Option<u64> {
         let capacity = capacity as u64;
         let mut current = self.queue_depth.load(Ordering::Acquire);
@@ -389,21 +589,28 @@ impl DurableControllerMetricsInner {
         DurableQueuedControllerMetrics {
             capacity,
             max_batch,
+            state: self.state(),
             submitted: self.submitted.load(Ordering::Relaxed),
             backpressured: self.backpressured.load(Ordering::Relaxed),
             claimed: self.claimed.load(Ordering::Relaxed),
             accepted: self.accepted.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             durability_failed: self.durability_failed.load(Ordering::Relaxed),
+            shutdown_before_claim: self.shutdown_before_claim.load(Ordering::Relaxed),
+            worker_failed: self.worker_failed.load(Ordering::Relaxed),
             epochs: self.epochs.load(Ordering::Relaxed),
             abandoned_tickets: self.abandoned_tickets.load(Ordering::Relaxed),
-            completion_delivery_failures: self
-                .completion_delivery_failures
-                .load(Ordering::Relaxed),
+            completion_delivery_failures: self.completion_delivery_failures.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Acquire),
             maximum_queue_depth: self.maximum_queue_depth.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Acquire),
             worker_alive: self.worker_alive.load(Ordering::Acquire),
+            queue_wait_nanos: self.queue_wait_nanos.load(Ordering::Relaxed),
+            derive_nanos: self.derive_nanos.load(Ordering::Relaxed),
+            persist_nanos: self.persist_nanos.load(Ordering::Relaxed),
+            publish_nanos: self.publish_nanos.load(Ordering::Relaxed),
+            delivery_nanos: self.delivery_nanos.load(Ordering::Relaxed),
+            epoch_total_nanos: self.epoch_total_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -412,17 +619,20 @@ struct DurableStagedIntent {
     intent: QueuedIntent,
     completion: mpsc::Sender<DurableTicketOutcome>,
     lifecycle: Arc<DurableTicketLifecycle>,
+    admitted_at: Instant,
 }
 
 enum DurableControllerCommand {
     Intent(DurableStagedIntent),
-    Barrier(mpsc::Sender<()>),
+    Barrier(mpsc::Sender<Result<(), DurableControllerStopped>>),
 }
 
 pub struct DurableQueuedIntentController<I: EpochFileIo = StdEpochFileIo> {
     database: Arc<Database<FileEpochStore<I>>>,
-    sender: Option<SyncSender<DurableControllerCommand>>,
-    worker: Option<JoinHandle<()>>,
+    sender: Arc<Mutex<Option<SyncSender<DurableControllerCommand>>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    writer_lease: Mutex<Option<WriterLease>>,
+    shutdown_lock: Mutex<()>,
     metrics: Arc<DurableControllerMetricsInner>,
     capacity: usize,
     max_batch: usize,
@@ -439,11 +649,40 @@ impl<I: EpochFileIo + 'static> fmt::Debug for DurableQueuedIntentController<I> {
     }
 }
 
+impl DurableQueuedIntentController<StdEpochFileIo> {
+    pub fn open_owned(
+        path: impl AsRef<Path>,
+        policy: FileEpochSyncPolicy,
+        capacity: usize,
+        max_batch: usize,
+    ) -> Result<Self, DurableControllerOpenError> {
+        let path = path.as_ref();
+        let lease = WriterLease::acquire(path)?;
+        let store = FileEpochStore::open(path, policy)?;
+        let database = Arc::new(Database::new(store)?);
+        Self::new_with_lease(database, capacity, max_batch, Some(lease)).map_err(Into::into)
+    }
+}
+
 impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
+    /// Starts a controller without acquiring a process writer lease.
+    ///
+    /// This remains useful for injected-I/O tests and callers that manage an
+    /// equivalent external lease. Production writable opens should prefer
+    /// `open_owned`.
     pub fn new(
         database: Arc<Database<FileEpochStore<I>>>,
         capacity: usize,
         max_batch: usize,
+    ) -> Result<Self, DurableControllerConfigError> {
+        Self::new_with_lease(database, capacity, max_batch, None)
+    }
+
+    fn new_with_lease(
+        database: Arc<Database<FileEpochStore<I>>>,
+        capacity: usize,
+        max_batch: usize,
+        lease: Option<WriterLease>,
     ) -> Result<Self, DurableControllerConfigError> {
         if capacity == 0 {
             return Err(DurableControllerConfigError::ZeroCapacity);
@@ -452,23 +691,36 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
             return Err(DurableControllerConfigError::ZeroBatchSize);
         }
         let (sender, receiver) = mpsc::sync_channel(capacity);
+        let sender = Arc::new(Mutex::new(Some(sender)));
         let metrics = Arc::new(DurableControllerMetricsInner::default());
+        metrics.set_state(DurableControllerState::Starting);
         metrics.worker_alive.store(true, Ordering::Release);
         let worker_database = database.clone();
         let worker_metrics = metrics.clone();
+        let worker_sender = sender.clone();
         let worker = thread::Builder::new()
             .name("forthdb-file-epoch-committer".to_owned())
             .spawn(move || {
-                run_durable_worker(worker_database, receiver, max_batch, worker_metrics)
+                run_durable_worker(
+                    worker_database,
+                    receiver,
+                    max_batch,
+                    worker_metrics,
+                    worker_sender,
+                )
             })
             .map_err(|error| {
                 metrics.worker_alive.store(false, Ordering::Release);
+                metrics.poison(format!("failed to spawn durable committer: {error}"));
                 DurableControllerConfigError::Spawn(error)
             })?;
+        metrics.set_state(DurableControllerState::Running);
         Ok(Self {
             database,
-            sender: Some(sender),
-            worker: Some(worker),
+            sender,
+            worker: Mutex::new(Some(worker)),
+            writer_lease: Mutex::new(lease),
+            shutdown_lock: Mutex::new(()),
             metrics,
             capacity,
             max_batch,
@@ -479,11 +731,35 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
         self.database.clone()
     }
 
-    pub fn submit(
-        &self,
-        intent: QueuedIntent,
-    ) -> Result<DurableCommitTicket, DurableSubmitError> {
-        let Some(sender) = self.sender.as_ref() else {
+    pub fn state(&self) -> DurableControllerState {
+        self.metrics.state()
+    }
+
+    pub fn poison_reason(&self) -> Option<String> {
+        self.metrics.reason()
+    }
+
+    pub fn submit(&self, intent: QueuedIntent) -> Result<DurableCommitTicket, DurableSubmitError> {
+        let sender_guard = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.metrics.state() {
+            DurableControllerState::Poisoned => {
+                return Err(DurableSubmitError::Poisoned {
+                    intent,
+                    reason: self
+                        .metrics
+                        .reason()
+                        .unwrap_or_else(|| "worker or store state is uncertain".to_owned()),
+                });
+            }
+            DurableControllerState::Running => {}
+            DurableControllerState::Starting
+            | DurableControllerState::Draining
+            | DurableControllerState::Closed => return Err(DurableSubmitError::Closed(intent)),
+        }
+        let Some(sender) = sender_guard.as_ref() else {
             return Err(DurableSubmitError::Closed(intent));
         };
         let Some(depth) = self.metrics.reserve_ingress(self.capacity) else {
@@ -496,6 +772,7 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
             intent,
             completion,
             lifecycle: lifecycle.clone(),
+            admitted_at: Instant::now(),
         });
         match sender.try_send(command) {
             Ok(()) => {
@@ -516,7 +793,13 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
             }
             Err(TrySendError::Disconnected(DurableControllerCommand::Intent(staged))) => {
                 self.metrics.release_ingress();
-                Err(DurableSubmitError::Closed(staged.intent))
+                let reason = self
+                    .metrics
+                    .poison("durable worker command channel disconnected unexpectedly");
+                Err(DurableSubmitError::Poisoned {
+                    intent: staged.intent,
+                    reason,
+                })
             }
             Err(TrySendError::Full(DurableControllerCommand::Barrier(_)))
             | Err(TrySendError::Disconnected(DurableControllerCommand::Barrier(_))) => {
@@ -526,14 +809,28 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
     }
 
     pub fn flush(&self) -> Result<(), DurableControllerStopped> {
-        let Some(sender) = self.sender.as_ref() else {
-            return Err(DurableControllerStopped);
+        let sender = {
+            let guard = self
+                .sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.metrics.state() != DurableControllerState::Running {
+                return Err(self.metrics.stopped());
+            }
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| self.metrics.stopped())?
         };
         let (completed, receiver) = mpsc::channel();
         sender
             .send(DurableControllerCommand::Barrier(completed))
-            .map_err(|_| DurableControllerStopped)?;
-        receiver.recv().map_err(|_| DurableControllerStopped)
+            .map_err(|_| self.metrics.stopped())?;
+        receiver.recv().map_err(|_| self.metrics.stopped())?
+    }
+
+    pub fn shutdown(&self) -> DurableShutdownReport {
+        self.shutdown_internal()
     }
 
     pub fn metrics(&self) -> DurableQueuedControllerMetrics {
@@ -557,20 +854,61 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
     }
 }
 
-impl<I: EpochFileIo> Drop for DurableQueuedIntentController<I> {
-    fn drop(&mut self) {
-        drop(self.sender.take());
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+impl<I: EpochFileIo> DurableQueuedIntentController<I> {
+    fn shutdown_internal(&self) -> DurableShutdownReport {
+        let _shutdown_guard = self
+            .shutdown_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_state = self.metrics.state();
+        if matches!(
+            previous_state,
+            DurableControllerState::Starting | DurableControllerState::Running
+        ) {
+            self.metrics.set_state(DurableControllerState::Draining);
+        }
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(sender);
+
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            if let Err(payload) = worker.join() {
+                let reason = self.metrics.poison(format!(
+                    "durable worker join observed panic: {}",
+                    panic_message(payload)
+                ));
+                poison_store(&self.database, &reason);
+            }
+        }
+        if self.metrics.state() == DurableControllerState::Draining {
+            self.metrics.set_state(DurableControllerState::Closed);
+        }
+        self.writer_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+
+        DurableShutdownReport {
+            previous_state,
+            final_state: self.metrics.state(),
+            queued_stopped: self.metrics.shutdown_before_claim.load(Ordering::Relaxed),
+            worker_failures: self.metrics.worker_failed.load(Ordering::Relaxed),
+            reason: self.metrics.reason(),
         }
     }
 }
 
-struct DurableWorkerLiveness(Arc<DurableControllerMetricsInner>);
-
-impl Drop for DurableWorkerLiveness {
+impl<I: EpochFileIo> Drop for DurableQueuedIntentController<I> {
     fn drop(&mut self) {
-        self.0.worker_alive.store(false, Ordering::Release);
+        let _ = self.shutdown_internal();
     }
 }
 
@@ -579,8 +917,39 @@ fn run_durable_worker<I: EpochFileIo + 'static>(
     receiver: Receiver<DurableControllerCommand>,
     max_batch: usize,
     metrics: Arc<DurableControllerMetricsInner>,
+    sender: Arc<Mutex<Option<SyncSender<DurableControllerCommand>>>>,
 ) {
-    let _liveness = DurableWorkerLiveness(metrics.clone());
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        run_durable_worker_loop(&database, &receiver, max_batch, &metrics, &sender)
+    }));
+    if let Err(payload) = result {
+        let reason = metrics.poison(format!(
+            "durable worker panicked outside epoch boundary: {}",
+            panic_message(payload)
+        ));
+        poison_store(&database, &reason);
+        sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drain_receiver(&receiver, DrainReason::WorkerFailed(reason), &metrics);
+    }
+    if metrics.state() == DurableControllerState::Running {
+        let reason = metrics.poison("durable worker exited while controller was running");
+        poison_store(&database, &reason);
+    } else if metrics.state() == DurableControllerState::Draining {
+        metrics.set_state(DurableControllerState::Closed);
+    }
+    metrics.worker_alive.store(false, Ordering::Release);
+}
+
+fn run_durable_worker_loop<I: EpochFileIo + 'static>(
+    database: &Arc<Database<FileEpochStore<I>>>,
+    receiver: &Receiver<DurableControllerCommand>,
+    max_batch: usize,
+    metrics: &Arc<DurableControllerMetricsInner>,
+    sender: &Arc<Mutex<Option<SyncSender<DurableControllerCommand>>>>,
+) {
     let mut pending = VecDeque::new();
     loop {
         let command = match pending.pop_front() {
@@ -590,14 +959,38 @@ fn run_durable_worker<I: EpochFileIo + 'static>(
                 Err(_) => break,
             },
         };
+
+        match metrics.state() {
+            DurableControllerState::Draining | DurableControllerState::Closed => {
+                reject_command(command, DrainReason::Shutdown, metrics);
+                drain_pending_and_receiver(&mut pending, receiver, DrainReason::Shutdown, metrics);
+                break;
+            }
+            DurableControllerState::Poisoned => {
+                let reason = metrics
+                    .reason()
+                    .unwrap_or_else(|| "durable controller is poisoned".to_owned());
+                reject_command(command, DrainReason::WorkerFailed(reason.clone()), metrics);
+                drain_pending_and_receiver(
+                    &mut pending,
+                    receiver,
+                    DrainReason::WorkerFailed(reason),
+                    metrics,
+                );
+                break;
+            }
+            DurableControllerState::Starting | DurableControllerState::Running => {}
+        }
+
         match command {
             DurableControllerCommand::Intent(first) => {
                 let mut batch = Vec::with_capacity(max_batch);
-                claim(first, &metrics, &mut batch);
-                while batch.len() < max_batch {
+                claim(first, metrics, &mut batch);
+                while batch.len() < max_batch && metrics.state() == DurableControllerState::Running
+                {
                     match receiver.try_recv() {
                         Ok(DurableControllerCommand::Intent(staged)) => {
-                            claim(staged, &metrics, &mut batch)
+                            claim(staged, metrics, &mut batch)
                         }
                         Ok(command @ DurableControllerCommand::Barrier(_)) => {
                             pending.push_back(command);
@@ -606,10 +999,24 @@ fn run_durable_worker<I: EpochFileIo + 'static>(
                         Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                     }
                 }
-                process_durable_batch(&database, batch, &metrics);
+                if let Err(reason) = process_durable_batch(database, batch, metrics) {
+                    let reason = metrics.poison(reason);
+                    poison_store(database, &reason);
+                    sender
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    drain_pending_and_receiver(
+                        &mut pending,
+                        receiver,
+                        DrainReason::WorkerFailed(reason),
+                        metrics,
+                    );
+                    break;
+                }
             }
             DurableControllerCommand::Barrier(completed) => {
-                let _ = completed.send(());
+                let _ = completed.send(Ok(()));
             }
         }
     }
@@ -622,6 +1029,9 @@ fn claim(
 ) {
     metrics.release_ingress();
     metrics.claimed.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .queue_wait_nanos
+        .fetch_add(nanos(staged.admitted_at.elapsed()), Ordering::Relaxed);
     staged.lifecycle.claim();
     batch.push(staged);
 }
@@ -634,11 +1044,13 @@ struct DurableEpochFailure {
 fn commit_durable_epoch<I: EpochFileIo>(
     database: &Database<FileEpochStore<I>>,
     intents: Vec<QueuedIntent>,
+    metrics: &DurableControllerMetricsInner,
 ) -> Result<EpochPlan, DurableEpochFailure> {
     let _commit_guard = database
         .commit_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let derive_started = Instant::now();
     let base = database.snapshot();
     let validators = database
         .validators
@@ -646,21 +1058,37 @@ fn commit_durable_epoch<I: EpochFileIo>(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     let plan = derive_epoch(base, intents, &validators);
+    metrics
+        .derive_nanos
+        .fetch_add(nanos(derive_started.elapsed()), Ordering::Relaxed);
+    lifecycle_fault_point("after_derive_before_persist");
     if plan.is_empty() {
         return Ok(plan);
     }
+
+    let persist_started = Instant::now();
     let append_result = database
         .store
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .append_epoch(plan.frames());
+    metrics
+        .persist_nanos
+        .fetch_add(nanos(persist_started.elapsed()), Ordering::Relaxed);
     if let Err(error) = append_result {
         return Err(DurableEpochFailure { plan, error });
     }
+    lifecycle_fault_point("after_persist_before_publish");
+
+    let publish_started = Instant::now();
     *database
         .current
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = plan.tail();
+    metrics
+        .publish_nanos
+        .fetch_add(nanos(publish_started.elapsed()), Ordering::Relaxed);
+    lifecycle_fault_point("after_publish_before_delivery");
     Ok(plan)
 }
 
@@ -668,7 +1096,8 @@ fn process_durable_batch<I: EpochFileIo>(
     database: &Database<FileEpochStore<I>>,
     batch: Vec<DurableStagedIntent>,
     metrics: &DurableControllerMetricsInner,
-) {
+) -> Result<(), String> {
+    let epoch_started = Instant::now();
     metrics
         .in_flight
         .store(batch.len() as u64, Ordering::Release);
@@ -679,16 +1108,47 @@ fn process_durable_batch<I: EpochFileIo>(
         routes.push((staged.completion, staged.lifecycle));
     }
 
-    match commit_durable_epoch(database, intents) {
-        Ok(plan) => route_success(routes, &plan, metrics),
-        Err(failure) => route_failure(routes, &failure.plan, &failure.error, metrics),
+    let commit = catch_unwind(AssertUnwindSafe(|| {
+        commit_durable_epoch(database, intents, metrics)
+    }));
+    let delivery_started = Instant::now();
+    match commit {
+        Ok(Ok(plan)) => route_success(routes, &plan, metrics),
+        Ok(Err(failure)) => route_failure(routes, &failure.plan, &failure.error, metrics),
+        Err(payload) => {
+            let reason = format!("durable epoch worker failed: {}", panic_message(payload));
+            route_stopped(
+                routes,
+                DurableTicketStopReason::WorkerFailed(reason.clone()),
+                metrics,
+            );
+            metrics.worker_failed.fetch_add(1, Ordering::Relaxed);
+            metrics.in_flight.store(0, Ordering::Release);
+            metrics
+                .delivery_nanos
+                .fetch_add(nanos(delivery_started.elapsed()), Ordering::Relaxed);
+            metrics
+                .epoch_total_nanos
+                .fetch_add(nanos(epoch_started.elapsed()), Ordering::Relaxed);
+            return Err(reason);
+        }
     }
+    metrics
+        .delivery_nanos
+        .fetch_add(nanos(delivery_started.elapsed()), Ordering::Relaxed);
     metrics.epochs.fetch_add(1, Ordering::Relaxed);
     metrics.in_flight.store(0, Ordering::Release);
+    metrics
+        .epoch_total_nanos
+        .fetch_add(nanos(epoch_started.elapsed()), Ordering::Relaxed);
+    Ok(())
 }
 
 fn route_success(
-    routes: Vec<(mpsc::Sender<DurableTicketOutcome>, Arc<DurableTicketLifecycle>)>,
+    routes: Vec<(
+        mpsc::Sender<DurableTicketOutcome>,
+        Arc<DurableTicketLifecycle>,
+    )>,
     plan: &EpochPlan,
     metrics: &DurableControllerMetricsInner,
 ) {
@@ -714,7 +1174,10 @@ fn route_success(
 }
 
 fn route_failure(
-    routes: Vec<(mpsc::Sender<DurableTicketOutcome>, Arc<DurableTicketLifecycle>)>,
+    routes: Vec<(
+        mpsc::Sender<DurableTicketOutcome>,
+        Arc<DurableTicketLifecycle>,
+    )>,
     plan: &EpochPlan,
     error: &FileEpochStoreError,
     metrics: &DurableControllerMetricsInner,
@@ -737,6 +1200,83 @@ fn route_failure(
     }
 }
 
+fn route_stopped(
+    routes: Vec<(
+        mpsc::Sender<DurableTicketOutcome>,
+        Arc<DurableTicketLifecycle>,
+    )>,
+    reason: DurableTicketStopReason,
+    metrics: &DurableControllerMetricsInner,
+) {
+    for (completion, lifecycle) in routes {
+        resolve(
+            completion,
+            lifecycle,
+            DurableTicketOutcome::Stopped(reason.clone()),
+            metrics,
+        );
+    }
+}
+
+#[derive(Clone)]
+enum DrainReason {
+    Shutdown,
+    WorkerFailed(String),
+}
+
+fn reject_command(
+    command: DurableControllerCommand,
+    reason: DrainReason,
+    metrics: &DurableControllerMetricsInner,
+) {
+    match command {
+        DurableControllerCommand::Intent(staged) => {
+            metrics.release_ingress();
+            let outcome = match reason {
+                DrainReason::Shutdown => {
+                    metrics
+                        .shutdown_before_claim
+                        .fetch_add(1, Ordering::Relaxed);
+                    DurableTicketOutcome::Stopped(DurableTicketStopReason::ShutdownBeforeClaim)
+                }
+                DrainReason::WorkerFailed(message) => {
+                    metrics.worker_failed.fetch_add(1, Ordering::Relaxed);
+                    DurableTicketOutcome::Stopped(DurableTicketStopReason::WorkerFailed(message))
+                }
+            };
+            resolve(staged.completion, staged.lifecycle, outcome, metrics);
+        }
+        DurableControllerCommand::Barrier(completed) => {
+            let _ = completed.send(Err(metrics.stopped()));
+        }
+    }
+}
+
+fn drain_pending_and_receiver(
+    pending: &mut VecDeque<DurableControllerCommand>,
+    receiver: &Receiver<DurableControllerCommand>,
+    reason: DrainReason,
+    metrics: &DurableControllerMetricsInner,
+) {
+    while let Some(command) = pending.pop_front() {
+        reject_command(command, reason.clone(), metrics);
+    }
+    drain_receiver(receiver, reason, metrics);
+}
+
+fn drain_receiver(
+    receiver: &Receiver<DurableControllerCommand>,
+    reason: DrainReason,
+    metrics: &DurableControllerMetricsInner,
+) {
+    loop {
+        match receiver.try_recv() {
+            Ok(command) => reject_command(command, reason.clone(), metrics),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
 fn resolve(
     completion: mpsc::Sender<DurableTicketOutcome>,
     lifecycle: Arc<DurableTicketLifecycle>,
@@ -750,6 +1290,38 @@ fn resolve(
             .fetch_add(1, Ordering::Relaxed);
     }
 }
+
+fn poison_store<I: EpochFileIo>(database: &Database<FileEpochStore<I>>, reason: &str) {
+    database
+        .store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .poison_external(reason.to_owned());
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+fn nanos(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(feature = "fault-injection")]
+fn lifecycle_fault_point(name: &str) {
+    if std::env::var("FORTHDB_M6D_CRASH_POINT").ok().as_deref() == Some(name) {
+        std::process::exit(86);
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn lifecycle_fault_point(_name: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -829,11 +1401,11 @@ mod tests {
     #[test]
     fn accepted_ticket_arrives_only_after_file_epoch_and_head_publication() {
         let path = temp_path("success");
-        let store = FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch)
-            .expect("epoch store opens");
+        let store =
+            FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch).expect("epoch store opens");
         let database = Arc::new(Database::new(store).expect("database opens"));
-        let controller = DurableQueuedIntentController::new(database.clone(), 16, 8)
-            .expect("controller starts");
+        let controller =
+            DurableQueuedIntentController::new(database.clone(), 16, 8).expect("controller starts");
         let ticket = controller
             .submit(intent("durable/state", "ready"))
             .expect("intent admitted");
@@ -860,8 +1432,8 @@ mod tests {
         let store = FileEpochStore::from_io(&path, io, FileEpochSyncPolicy::PerEpoch)
             .expect("injected store opens");
         let database = Arc::new(Database::new(store).expect("database opens"));
-        let controller = DurableQueuedIntentController::new(database.clone(), 16, 8)
-            .expect("controller starts");
+        let controller =
+            DurableQueuedIntentController::new(database.clone(), 16, 8).expect("controller starts");
 
         let failed = controller
             .submit(intent("durable/failed", "not-published"))
@@ -891,11 +1463,11 @@ mod tests {
     #[test]
     fn semantic_rejection_remains_independent_of_neighboring_durability() {
         let path = temp_path("rejection");
-        let store = FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch)
-            .expect("epoch store opens");
+        let store =
+            FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch).expect("epoch store opens");
         let database = Arc::new(Database::new(store).expect("database opens"));
-        let controller = DurableQueuedIntentController::new(database.clone(), 16, 8)
-            .expect("controller starts");
+        let controller =
+            DurableQueuedIntentController::new(database.clone(), 16, 8).expect("controller starts");
 
         let accepted = controller
             .submit(intent("durable/accepted", "yes"))
@@ -917,6 +1489,161 @@ mod tests {
         assert_eq!(database.snapshot().version(), 1);
         assert_eq!(database.frame_count(), 1);
         drop(controller);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn graceful_shutdown_finishes_claimed_epoch_and_stops_queued_intents() {
+        use std::sync::Condvar;
+        use std::time::{Duration, Instant};
+
+        let path = temp_path("graceful-shutdown");
+        let store =
+            FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch).expect("epoch store opens");
+        let database = Arc::new(Database::new(store).expect("database opens"));
+        let entered = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let release = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let validator_entered = entered.clone();
+        let validator_release = release.clone();
+        database.register_validator(move |_| {
+            let (lock, signal) = &*validator_entered;
+            *lock.lock().expect("entered lock") = true;
+            signal.notify_all();
+            let (lock, signal) = &*validator_release;
+            let mut released = lock.lock().expect("release lock");
+            while !*released {
+                released = signal.wait(released).expect("release wait");
+            }
+            Ok(())
+        });
+
+        let controller = Arc::new(
+            DurableQueuedIntentController::new(database.clone(), 16, 1).expect("controller starts"),
+        );
+        let first = controller
+            .submit(intent("durable/claimed", "yes"))
+            .expect("first admitted");
+
+        let (lock, signal) = &*entered;
+        let entered_deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = lock.lock().expect("entered lock");
+        while !*observed {
+            let remaining = entered_deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "validator was never entered");
+            let (next, timeout) = signal
+                .wait_timeout(observed, remaining)
+                .expect("entered wait");
+            observed = next;
+            assert!(
+                !timeout.timed_out() || *observed,
+                "validator entry timed out"
+            );
+        }
+        drop(observed);
+
+        let second = controller
+            .submit(intent("durable/queued", "no"))
+            .expect("second admitted");
+        let shutdown_controller = controller.clone();
+        let shutdown = thread::spawn(move || shutdown_controller.shutdown());
+
+        let state_deadline = Instant::now() + Duration::from_secs(5);
+        while controller.state() != DurableControllerState::Draining {
+            assert!(
+                Instant::now() < state_deadline,
+                "controller never began draining"
+            );
+            thread::yield_now();
+        }
+
+        let (lock, signal) = &*release;
+        *lock.lock().expect("release lock") = true;
+        signal.notify_all();
+
+        assert!(matches!(
+            first.wait().expect("claimed ticket resolves"),
+            DurableTicketOutcome::Accepted { .. }
+        ));
+        assert!(matches!(
+            second.wait().expect("queued ticket resolves"),
+            DurableTicketOutcome::Stopped(DurableTicketStopReason::ShutdownBeforeClaim)
+        ));
+        let report = shutdown.join().expect("shutdown joins");
+        assert_eq!(report.final_state, DurableControllerState::Closed);
+        assert_eq!(report.queued_stopped, 1);
+        assert!(matches!(
+            controller.submit(intent("durable/late", "no")),
+            Err(DurableSubmitError::Closed(_))
+        ));
+        assert_eq!(database.snapshot().version(), 1);
+        assert_eq!(database.frame_count(), 1);
+        drop(controller);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validator_panic_poison_fences_store_and_resolves_ticket() {
+        use std::time::{Duration, Instant};
+
+        let path = temp_path("worker-panic");
+        let store =
+            FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch).expect("epoch store opens");
+        let database = Arc::new(Database::new(store).expect("database opens"));
+        database.register_validator(|_| panic!("injected validator panic"));
+        let controller =
+            DurableQueuedIntentController::new(database.clone(), 16, 1).expect("controller starts");
+        let outcome = controller
+            .submit(intent("durable/panic", "never"))
+            .expect("intent admitted")
+            .wait()
+            .expect("ticket receives explicit worker outcome");
+        assert!(matches!(
+            outcome,
+            DurableTicketOutcome::Stopped(DurableTicketStopReason::WorkerFailed(_))
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.metrics().worker_alive {
+            assert!(Instant::now() < deadline, "worker did not terminate");
+            thread::yield_now();
+        }
+        assert_eq!(controller.state(), DurableControllerState::Poisoned);
+        assert_eq!(controller.store_state(), FileEpochState::Poisoned);
+        assert!(matches!(
+            controller.submit(intent("durable/after-panic", "no")),
+            Err(DurableSubmitError::Poisoned { .. })
+        ));
+        assert_eq!(database.snapshot().version(), 0);
+        assert_eq!(database.frame_count(), 0);
+        let report = controller.shutdown();
+        assert_eq!(report.final_state, DurableControllerState::Poisoned);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn lifecycle_metrics_measure_the_complete_epoch_path() {
+        let path = temp_path("timings");
+        let store =
+            FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch).expect("epoch store opens");
+        let database = Arc::new(Database::new(store).expect("database opens"));
+        let controller =
+            DurableQueuedIntentController::new(database, 16, 8).expect("controller starts");
+        controller
+            .submit(intent("durable/timing", "yes"))
+            .expect("intent admitted")
+            .wait()
+            .expect("ticket resolves");
+        controller.flush().expect("timing barrier completes");
+        let metrics = controller.metrics();
+        assert!(metrics.queue_wait_nanos > 0);
+        assert!(metrics.derive_nanos > 0);
+        assert!(metrics.persist_nanos > 0);
+        assert!(metrics.epoch_total_nanos >= metrics.derive_nanos);
+        let ceiling = metrics
+            .estimated_pipeline_speedup_ceiling()
+            .expect("derive and persist timings exist");
+        assert!((1.0..=2.0).contains(&ceiling));
+        controller.shutdown();
         let _ = fs::remove_file(path);
     }
 }
