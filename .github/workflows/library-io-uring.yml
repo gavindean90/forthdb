@@ -136,7 +136,8 @@ jobs:
                   handle.write(
                       "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n"
                   )
-                  for case in measured["cases"]:
+                  cases = measured["cases"]
+                  for case in cases:
                       ceiling = case["journal_ceiling"]
                       steady = case["steady_state"]
                       handle.write(
@@ -147,6 +148,31 @@ jobs:
                           f"{steady['publication_intents_per_second']:.1f}/s | "
                           f"{steady['maximum_durable_to_applied_lag']} | "
                           f"{steady['catch_up_elapsed_us'] / 1000:.2f} ms |\n"
+                      )
+                  if cases:
+                      fastest_admission = max(
+                          cases,
+                          key=lambda case: case["journal_ceiling"]["intents_per_second"],
+                      )
+                      fastest_publication = max(
+                          cases,
+                          key=lambda case: case["steady_state"]["publication_intents_per_second"],
+                      )
+                      admission_rate = fastest_admission["journal_ceiling"]["intents_per_second"]
+                      publication_rate = fastest_publication["steady_state"]["publication_intents_per_second"]
+                      handle.write(
+                          f"\nFastest raw durable admission: `{admission_rate:.1f}` intents/s "
+                          f"(`{fastest_admission['label']}`), "
+                          f"100k crossed: `{admission_rate >= 100_000}`.\n\n"
+                      )
+                      handle.write(
+                          f"Fastest semantic publication: `{publication_rate:.1f}` intents/s "
+                          f"(`{fastest_publication['label']}`).\n"
+                      )
+                  else:
+                      handle.write(
+                          f"\nAdmission benchmark unavailable: "
+                          f"`{measured.get('availability_error', 'unknown error')}`.\n"
                       )
           PY
 

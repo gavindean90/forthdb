@@ -14,7 +14,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     const RING_ENTRIES: u32 = 256;
-    const MAX_BATCH: usize = 64;
+    const MAX_BATCH: usize = 256;
     const STEADY_EPOCHS: usize = 64;
 
     #[derive(Serialize)]
@@ -125,6 +125,8 @@ mod linux {
             (32, 16, "window-32"),
             (8, 1, "epoch-width-1"),
             (8, 64, "epoch-width-64"),
+            (8, 128, "epoch-width-128"),
+            (8, 256, "epoch-width-256"),
         ];
         let mut cases = Vec::new();
         let mut availability_error = None;
