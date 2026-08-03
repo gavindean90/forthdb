@@ -2,7 +2,7 @@
 mod linux {
     use forthdb_core::{Atom, EntityId, Fact, ForthDb, Literal, Predicate, SlotId};
     use forthdb_world::{
-        Database, DurableQueuedIntentController, DurableSubmitError, DurableTicketOutcome,
+        CommitStore, Database, DurableQueuedIntentController, DurableSubmitError, DurableTicketOutcome,
         EpochFileIo, FileCommitStore, FileEpochMetrics, FileEpochStore, FileEpochStoreError,
         FileEpochSyncPolicy, IoUringEpochFileIo, IoUringEpochStrategy, QueuedIntent,
     };
