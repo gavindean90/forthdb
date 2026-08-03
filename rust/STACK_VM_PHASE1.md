@@ -40,9 +40,10 @@ epoch widths 16, 64, 128, and 256. The trace includes:
 
 ## Benchmark scope
 
-The `stack_vm_phase1` benchmark measures the current materializer and the POD
-kernel over the same intent counts and rejection schedule. It reports a
-**projection-kernel ratio**, not an end-to-end database speedup.
+The `stack_vm_phases` benchmark measures the current materializer and the POD
+kernel over the same fixed 8,192-intent trace and rejection schedule. It
+reports a **projection-kernel ratio**, not an end-to-end database speedup, and
+retains this Phase 1 configuration as the unindexed control for Phase 2.
 
 The experimental VM does not yet provide:
 

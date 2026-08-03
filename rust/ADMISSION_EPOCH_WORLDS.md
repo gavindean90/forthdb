@@ -98,6 +98,13 @@ record arenas, and private trial deltas. It intentionally does not change this
 journal or its recovery contract. Its benchmark ratio covers a reduced
 slot-head projection and must not be reported as complete database throughput.
 
+[`STACK_VM_PHASE2.md`](STACK_VM_PHASE2.md) layers POD SPO/POS/OSP delta streams,
+incremental semantic hashing, and immutable POD world-root descriptors over the
+same VM. It keeps the trace size constant across epoch widths and treats zero
+hot-path allocation plus parity across all seven query shapes as correctness
+gates. Compacted query bases and concurrent reader ownership remain subsequent
+work.
+
 ## Library reference
 
 The Rust library application groups seven domain intentions into five durable

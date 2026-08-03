@@ -146,6 +146,62 @@ pub struct SlotDelta {
     resulting_visible: u32,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexPermutation {
+    Spo,
+    Pos,
+    Osp,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IndexDelta {
+    permutation: IndexPermutation,
+    added: bool,
+    first: Cell,
+    second: Cell,
+    third: Cell,
+    record: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorldRoot {
+    parent: u32,
+    version: u64,
+    record_frontier: u32,
+    slot_delta_frontier: u32,
+    index_delta_frontier: u32,
+    allocator_head: u64,
+    world_id: u64,
+}
+
+impl WorldRoot {
+    pub const fn version(self) -> u64 {
+        self.version
+    }
+
+    pub const fn allocator_head(self) -> u64 {
+        self.allocator_head
+    }
+
+    pub const fn world_id(self) -> u64 {
+        self.world_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryPattern {
+    Subject(Cell),
+    Predicate(Cell),
+    Object(Cell),
+    SubjectPredicate(Cell, Cell),
+    SubjectObject(Cell, Cell),
+    PredicateObject(Cell, Cell),
+    Exact(Cell, Cell, Cell),
+}
+
 #[derive(Clone, Debug)]
 struct PodArena<T: Copy> {
     data: Vec<T>,
@@ -208,6 +264,7 @@ struct TrialCheckpoint {
     frame_base: usize,
     record_frontier: usize,
     delta_frontier: usize,
+    index_delta_frontier: usize,
     next_entity: u64,
 }
 
@@ -237,8 +294,14 @@ pub struct Workspace {
     frame_base: usize,
     records: PodArena<FactRecord>,
     deltas: PodArena<SlotDelta>,
+    index_deltas: PodArena<IndexDelta>,
+    roots: PodArena<WorldRoot>,
     accepted_heads: Vec<u32>,
     next_entity: u64,
+    last_root: u32,
+    version: u64,
+    semantic_hash: u64,
+    track_indexes: bool,
 }
 
 impl Workspace {
@@ -248,14 +311,55 @@ impl Workspace {
         record_capacity: usize,
         delta_capacity: usize,
     ) -> Self {
+        Self::new(
+            slot_count,
+            stack_capacity,
+            record_capacity,
+            delta_capacity,
+            false,
+        )
+    }
+
+    pub fn with_indexes(
+        slot_count: usize,
+        stack_capacity: usize,
+        record_capacity: usize,
+        delta_capacity: usize,
+    ) -> Self {
+        Self::new(
+            slot_count,
+            stack_capacity,
+            record_capacity,
+            delta_capacity,
+            true,
+        )
+    }
+
+    fn new(
+        slot_count: usize,
+        stack_capacity: usize,
+        record_capacity: usize,
+        delta_capacity: usize,
+        track_indexes: bool,
+    ) -> Self {
         Self {
             stack: vec![Cell::default(); stack_capacity],
             stack_pointer: 0,
             frame_base: 0,
             records: PodArena::with_capacity(record_capacity),
             deltas: PodArena::with_capacity(delta_capacity),
+            index_deltas: PodArena::with_capacity(if track_indexes {
+                record_capacity.saturating_mul(6)
+            } else {
+                0
+            }),
+            roots: PodArena::with_capacity(1_024),
             accepted_heads: vec![NONE; slot_count],
             next_entity: 1,
+            last_root: NONE,
+            version: 0,
+            semantic_hash: 0xcbf2_9ce4_8422_2325,
+            track_indexes,
         }
     }
 
@@ -295,11 +399,78 @@ impl Workspace {
         self.deltas.frontier()
     }
 
+    pub fn index_delta_count(&self) -> usize {
+        self.index_deltas.frontier()
+    }
+
     pub fn active_slot_count(&self) -> usize {
         self.accepted_heads
             .iter()
             .filter(|head| **head != NONE)
             .count()
+    }
+
+    /// Publish a POD world descriptor over the accepted arena frontiers.
+    /// The backing arenas remain append-only, so older roots continue to see
+    /// exactly their prefix without copying records or allocating an `Arc`.
+    pub fn publish_epoch(&mut self) -> Option<WorldRoot> {
+        let previous_record_frontier = if self.last_root == NONE {
+            0
+        } else {
+            self.roots.get(self.last_root).record_frontier as usize
+        };
+        if self.records.frontier() == previous_record_frontier {
+            return None;
+        }
+        self.version += 1;
+        let root = WorldRoot {
+            parent: self.last_root,
+            version: self.version,
+            record_frontier: self.records.frontier() as u32,
+            slot_delta_frontier: self.deltas.frontier() as u32,
+            index_delta_frontier: self.index_deltas.frontier() as u32,
+            allocator_head: self.next_entity,
+            world_id: self.semantic_hash,
+        };
+        self.last_root = self.roots.push(root);
+        Some(root)
+    }
+
+    pub fn resolve_object_at(&self, root: WorldRoot, slot: SlotToken) -> Option<Cell> {
+        self.deltas.active()[..root.slot_delta_frontier as usize]
+            .iter()
+            .rev()
+            .find(|delta| delta.slot == slot)
+            .and_then(|delta| {
+                (delta.resulting_visible != NONE)
+                    .then(|| self.records.get(delta.resulting_visible).object)
+            })
+    }
+
+    /// Query an immutable root through the three permutation-delta streams.
+    /// This Phase 2 reader intentionally favors a simple differential oracle;
+    /// compaction into searchable base segments is a later concern.
+    pub fn query_slots(&self, root: WorldRoot, pattern: QueryPattern) -> Vec<SlotToken> {
+        let mut active_records = Vec::<u32>::new();
+        for delta in &self.index_deltas.active()[..root.index_delta_frontier as usize] {
+            if !matches_index(*delta, pattern) {
+                continue;
+            }
+            if delta.added {
+                active_records.push(delta.record);
+            } else if let Some(position) = active_records
+                .iter()
+                .position(|record| *record == delta.record)
+            {
+                active_records.swap_remove(position);
+            }
+        }
+        let mut slots = active_records
+            .into_iter()
+            .map(|record| self.records.get(record).slot)
+            .collect::<Vec<_>>();
+        slots.sort_unstable_by_key(|slot| slot.0);
+        slots
     }
 
     fn checkpoint(&self) -> TrialCheckpoint {
@@ -308,6 +479,7 @@ impl Workspace {
             frame_base: self.frame_base,
             record_frontier: self.records.frontier(),
             delta_frontier: self.deltas.frontier(),
+            index_delta_frontier: self.index_deltas.frontier(),
             next_entity: self.next_entity,
         }
     }
@@ -318,12 +490,16 @@ impl Workspace {
         self.frame_base = checkpoint.frame_base;
         self.records.restore(checkpoint.record_frontier);
         self.deltas.restore(checkpoint.delta_frontier);
+        self.index_deltas.restore(checkpoint.index_delta_frontier);
         self.next_entity = checkpoint.next_entity;
     }
 
     fn accept(&mut self, checkpoint: TrialCheckpoint) {
         for delta in &self.deltas.active()[checkpoint.delta_frontier..] {
             self.accepted_heads[delta.slot.0 as usize] = delta.resulting_visible;
+        }
+        for record in &self.records.active()[checkpoint.record_frontier..] {
+            self.semantic_hash = hash_record(self.semantic_hash, *record);
         }
         self.stack_pointer = checkpoint.stack_pointer;
         self.frame_base = checkpoint.frame_base;
@@ -405,6 +581,7 @@ impl Workspace {
             previous_visible: previous,
             resulting_visible: record_index,
         });
+        self.append_index_transition(previous, record_index);
         Ok(())
     }
 
@@ -430,7 +607,49 @@ impl Workspace {
             previous_visible: previous,
             resulting_visible: revealed,
         });
+        self.append_index_transition(previous, revealed);
         Ok(())
+    }
+
+    fn append_index_transition(&mut self, previous: u32, resulting: u32) {
+        if !self.track_indexes {
+            return;
+        }
+        if previous != NONE {
+            let fact = *self.records.get(previous);
+            self.append_fact_indexes(fact, previous, false);
+        }
+        if resulting != NONE {
+            let fact = *self.records.get(resulting);
+            self.append_fact_indexes(fact, resulting, true);
+        }
+    }
+
+    fn append_fact_indexes(&mut self, fact: FactRecord, record: u32, added: bool) {
+        self.index_deltas.push(IndexDelta {
+            permutation: IndexPermutation::Spo,
+            added,
+            first: fact.subject,
+            second: fact.predicate,
+            third: fact.object,
+            record,
+        });
+        self.index_deltas.push(IndexDelta {
+            permutation: IndexPermutation::Pos,
+            added,
+            first: fact.predicate,
+            second: fact.object,
+            third: fact.subject,
+            record,
+        });
+        self.index_deltas.push(IndexDelta {
+            permutation: IndexPermutation::Osp,
+            added,
+            first: fact.object,
+            second: fact.subject,
+            third: fact.predicate,
+            record,
+        });
     }
 
     fn resolve_trial_object(
@@ -505,13 +724,68 @@ impl Workspace {
     }
 }
 
+fn matches_index(delta: IndexDelta, pattern: QueryPattern) -> bool {
+    match pattern {
+        QueryPattern::Subject(subject) => {
+            delta.permutation == IndexPermutation::Spo && delta.first == subject
+        }
+        QueryPattern::Predicate(predicate) => {
+            delta.permutation == IndexPermutation::Pos && delta.first == predicate
+        }
+        QueryPattern::Object(object) => {
+            delta.permutation == IndexPermutation::Osp && delta.first == object
+        }
+        QueryPattern::SubjectPredicate(subject, predicate) => {
+            delta.permutation == IndexPermutation::Spo
+                && delta.first == subject
+                && delta.second == predicate
+        }
+        QueryPattern::SubjectObject(subject, object) => {
+            delta.permutation == IndexPermutation::Osp
+                && delta.first == object
+                && delta.second == subject
+        }
+        QueryPattern::PredicateObject(predicate, object) => {
+            delta.permutation == IndexPermutation::Pos
+                && delta.first == predicate
+                && delta.second == object
+        }
+        QueryPattern::Exact(subject, predicate, object) => {
+            delta.permutation == IndexPermutation::Spo
+                && delta.first == subject
+                && delta.second == predicate
+                && delta.third == object
+        }
+    }
+}
+
+fn hash_record(mut hash: u64, record: FactRecord) -> u64 {
+    const PRIME: u64 = 0x100_0000_01b3;
+    for value in [
+        record.kind as u64,
+        record.slot.0 as u64,
+        record.subject.0,
+        record.predicate.0,
+        record.object.0,
+        record.previous_visible as u64,
+        record.resulting_visible as u64,
+    ] {
+        hash ^= value;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         Database, IntentFact, MemoryCommitStore, QueuedIntent, Validator, derive_epoch_world,
     };
-    use forthdb_core::{Atom, Literal, Predicate, SlotId};
+    use forthdb_core::{
+        Atom, EntityId, Fact, Literal, Pattern, Predicate, PredicateTerm, QueryOptions, SlotId,
+        Term, Variable,
+    };
     use std::sync::Arc;
 
     fn define_program(slot: u32, value: u64) -> IntentProgram {
@@ -630,12 +904,112 @@ mod tests {
             })
     }
 
+    fn current_query_slots(
+        world: &crate::World,
+        fact: &forthdb_core::Fact,
+        bound_subject: bool,
+        bound_predicate: bool,
+        bound_object: bool,
+    ) -> Vec<u32> {
+        let variable = |name| Variable::new(name).expect("valid variable");
+        let pattern = Pattern::new(
+            if bound_subject {
+                Term::Atom(fact.subject.clone())
+            } else {
+                Term::Variable(variable("subject"))
+            },
+            if bound_predicate {
+                PredicateTerm::Predicate(fact.predicate.clone())
+            } else {
+                PredicateTerm::Variable(variable("predicate"))
+            },
+            if bound_object {
+                Term::Atom(fact.object.clone())
+            } else {
+                Term::Variable(variable("object"))
+            },
+        );
+        let mut slots = world
+            .query(
+                &[pattern],
+                QueryOptions {
+                    distinct: false,
+                    include_provenance: true,
+                    ..QueryOptions::default()
+                },
+            )
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.provenance[0]
+                    .as_str()
+                    .strip_prefix("differential/")
+                    .expect("differential slot")
+                    .parse::<u32>()
+                    .expect("numeric slot")
+                    + 1
+            })
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        slots
+    }
+
+    fn assert_all_index_shapes(world: &crate::World, workspace: &Workspace, root: WorldRoot) {
+        let Some((slot, fact)) = (0..64).find_map(|slot| {
+            world
+                .resolve(&SlotId::new(format!("differential/{slot}")))
+                .map(|fact| (slot, fact))
+        }) else {
+            return;
+        };
+        let subject = match fact.subject {
+            Atom::Entity(entity) => Cell(entity.value()),
+            Atom::Literal(_) => panic!("differential subjects are entities"),
+        };
+        let predicate = Cell(7);
+        let object = match &fact.object {
+            Atom::Literal(value) => Cell(value.as_str().parse().expect("numeric object")),
+            Atom::Entity(_) => panic!("differential objects are literals"),
+        };
+        let cases = [
+            ((true, false, false), QueryPattern::Subject(subject)),
+            ((false, true, false), QueryPattern::Predicate(predicate)),
+            ((false, false, true), QueryPattern::Object(object)),
+            (
+                (true, true, false),
+                QueryPattern::SubjectPredicate(subject, predicate),
+            ),
+            (
+                (true, false, true),
+                QueryPattern::SubjectObject(subject, object),
+            ),
+            (
+                (false, true, true),
+                QueryPattern::PredicateObject(predicate, object),
+            ),
+            (
+                (true, true, true),
+                QueryPattern::Exact(subject, predicate, object),
+            ),
+        ];
+        for ((bound_subject, bound_predicate, bound_object), pattern) in cases {
+            let expected =
+                current_query_slots(world, fact, bound_subject, bound_predicate, bound_object);
+            let actual = workspace
+                .query_slots(root, pattern)
+                .into_iter()
+                .map(|slot| slot.0)
+                .collect::<Vec<_>>();
+            assert_eq!(expected, actual, "query shape mismatch at slot {slot}");
+        }
+    }
+
     #[test]
     fn deterministic_epoch_sweep_matches_current_slot_semantics() {
         for width in [16, 64, 128, 256] {
             let database = Database::new(MemoryCommitStore::new()).expect("genesis is valid");
             let mut world = database.snapshot();
-            let mut workspace = Workspace::with_capacity(65, 32, 4096, 4096);
+            let mut workspace = Workspace::with_indexes(65, 32, 4096, 4096);
             let reject_slot = SlotId::new("differential/reject");
             let validator_slot = reject_slot.clone();
             let validator: Validator = Arc::new(move |candidate| {
@@ -646,6 +1020,8 @@ mod tests {
                 }
             });
             let validators = [validator];
+            let mut first_root = None;
+            let mut first_root_value = None;
 
             for epoch in 0..(512 / width) {
                 let mut current = Vec::with_capacity(width);
@@ -685,6 +1061,28 @@ mod tests {
                             0,
                             vec![Instruction::forget(SlotToken((slot + 1) as u32))],
                         ));
+                    } else if index % 5 == 0 {
+                        let subject = (index % 4 + 1) as u64;
+                        let object = (index % 8) as u64;
+                        let mut intent = QueuedIntent::new();
+                        intent.define_fact(
+                            SlotId::new(format!("differential/{slot}")),
+                            Fact::new(
+                                Atom::Entity(EntityId::new(subject)),
+                                Predicate::new("state"),
+                                Atom::Literal(Literal::new(object.to_string())),
+                            ),
+                        );
+                        current.push(intent);
+                        programs.push(IntentProgram::new(
+                            0,
+                            vec![
+                                Instruction::push(Cell(subject)),
+                                Instruction::push(Cell(7)),
+                                Instruction::push(Cell(object)),
+                                Instruction::define(SlotToken((slot + 1) as u32)),
+                            ],
+                        ));
                     } else {
                         let mut intent = QueuedIntent::new();
                         let entity = intent.entity();
@@ -711,6 +1109,17 @@ mod tests {
                     );
                 }
                 world = plan.tail();
+                let root = workspace
+                    .publish_epoch()
+                    .expect("epoch has accepted effects");
+                assert_eq!(root.allocator_head(), world.next_entity());
+                assert_eq!(root.version(), (epoch + 1) as u64);
+                assert_ne!(root.world_id(), 0);
+                assert_all_index_shapes(&world, &workspace, root);
+                if first_root.is_none() {
+                    first_root = Some(root);
+                    first_root_value = Some(workspace.resolve_object_at(root, SlotToken(2)));
+                }
                 assert_eq!(world.next_entity(), workspace.next_entity());
                 for slot in 0..64 {
                     assert_eq!(
@@ -723,6 +1132,11 @@ mod tests {
                 }
             }
             assert_eq!(world.active_slot_count(), workspace.active_slot_count());
+            assert_eq!(
+                workspace.resolve_object_at(first_root.unwrap(), SlotToken(2)),
+                first_root_value.unwrap(),
+                "later epochs must not change an older root"
+            );
             assert_eq!(
                 world.resolve(&reject_slot),
                 None,

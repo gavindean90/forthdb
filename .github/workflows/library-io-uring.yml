@@ -61,13 +61,13 @@ jobs:
             --bin admission_window \
             -- "$RUNNER_TEMP/forthdb-library-artifacts/admission-window"
 
-      - name: Measure Phase 1 stack VM materialization
+      - name: Measure stack VM materialization phases
         run: |
-          FORTHDB_STACK_VM_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/stack-vm-phase1.json" \
+          FORTHDB_STACK_VM_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/stack-vm-phases.json" \
           cargo run --quiet --release \
             --manifest-path rust/Cargo.toml \
             -p forthdb-bench \
-            --bin stack_vm_phase1
+            --bin stack_vm_phases
 
       - name: Publish application summary
         if: always()
@@ -182,25 +182,32 @@ jobs:
                           f"\nAdmission benchmark unavailable: "
                           f"`{measured.get('availability_error', 'unknown error')}`.\n"
                       )
-              stack_vm = report.parent / "stack-vm-phase1.json"
+              stack_vm = report.parent / "stack-vm-phases.json"
               if stack_vm.exists():
                   measured = json.loads(stack_vm.read_text())
-                  handle.write("\n## Phase 1 stack VM\n\n")
+                  handle.write("\n## Stack VM materialization phases\n\n")
                   handle.write(
-                      "| Epoch width | Intents | Current engine | Stack VM | Kernel ratio | Projection parity |\n"
+                      "| Width | Current | Phase 1 | Phase 2 indexed | P2/P1 | P2 allocations | Parity |\n"
                   )
-                  handle.write(
-                      "| ---: | ---: | ---: | ---: | ---: | ---: |\n"
-                  )
+                  handle.write("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n")
                   for case in measured["cases"]:
                       handle.write(
-                          f"| {case['epoch_width']} | {case['intents']} | "
+                          f"| {case['epoch_width']} | "
                           f"{case['current_engine']['intents_per_second']:.1f}/s | "
-                          f"{case['stack_vm']['intents_per_second']:.1f}/s | "
-                          f"{case['projection_kernel_ratio']:.2f}x | "
+                          f"{case['stack_vm_phase1']['intents_per_second']:.1f}/s | "
+                          f"{case['stack_vm_phase2']['intents_per_second']:.1f}/s | "
+                          f"{case['phase2_retained_percent']:.1f}% | "
+                          f"{case['stack_vm_phase2']['hot_path_allocations']} | "
                           f"{case['projection_parity']} |\n"
                       )
-                  handle.write(f"\nScope: {measured['scope']}\n")
+                  handle.write(
+                      f"\nWidth 256 / width 16: "
+                      f"`{measured['phase2_width_256_vs_16_percent']:.1f}%`; "
+                      f"flat gate: `{measured['phase2_flat_gate_passed']}`; "
+                      f"zero-allocation gate: `{measured['zero_allocation_gate_passed']}`; "
+                      f"differential gate: `{measured['differential_gate_passed']}`.\n"
+                  )
+                  handle.write(f"\nPhase 2 scope: {measured['phase2_scope']}\n")
           PY
 
       - name: Upload application database and report
