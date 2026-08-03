@@ -67,7 +67,7 @@ A successful epoch requires:
 
 Any submission error, missing CQE, short write, failed write, failed synchronization, or malformed completion batch discards and recreates the ring before the existing file-epoch repair logic truncates and verifies the known-good checkpoint.
 
-Completion validation is a pure tested boundary. Tests cover out-of-order valid CQEs, missing completions, duplicate writes, unknown identifiers, short writes, negative write results, and negative synchronization results.
+Completion validation is a pure tested boundary. Tests cover out-of-order valid CQEs, missing completions, duplicate writes, unknown and out-of-range identifiers, noncanonical expected identifiers, short writes, negative write results, and negative synchronization results.
 
 ## Metrics
 
