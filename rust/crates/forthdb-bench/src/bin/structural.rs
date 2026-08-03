@@ -1,4 +1,6 @@
-use forthdb_core::{Atom, Fact, ForthDb, LegacyForthDb, Literal, Predicate, SlotId};
+use forthdb_core::{
+    Atom, Fact, ForthDb, LegacyForthDb, Literal, Predicate, ReaperMetrics, SlotId,
+};
 use forthdb_world::{Database, MemoryCommitStore, Transaction, World};
 use serde::Serialize;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -134,6 +136,14 @@ struct SnapshotRetirement {
     max_ns: u64,
     total_release_ns: u64,
     final_database_drop_ns: u64,
+    reaper_drain_ns: u64,
+    reaper_drained: bool,
+    queued_after_foreground: usize,
+    queued_after_drain: usize,
+    retired_roots_delta: u64,
+    reaped_roots_delta: u64,
+    overflow_enqueues_delta: u64,
+    worker_alive: bool,
     notes: &'static str,
 }
 
@@ -159,6 +169,7 @@ fn main() {
         candidate_scaling.push(measure_world_candidate(&prepared, size, samples, iterations));
         read_scaling.push(measure_resolve(&prepared, size));
         drop(prepared);
+        drain_reaper_or_panic("after prepared world");
     }
 
     let legacy_control = [100_u64, 1_000, 10_000]
@@ -202,7 +213,16 @@ fn dimensions(size: u64) -> (usize, u64) {
     }
 }
 
+fn drain_reaper_or_panic(context: &str) {
+    assert!(
+        ForthDb::drain_reaper(Duration::from_secs(30)),
+        "reaper did not drain {context}: {:?}",
+        ForthDb::reaper_metrics()
+    );
+}
+
 fn prepare_world(definitions: u64) -> PreparedWorld {
+    drain_reaper_or_panic("before preparing world");
     let database = Database::new(MemoryCommitStore::new()).expect("memory database opens");
     let mut initial = database.begin();
     for index in 0..definitions {
@@ -212,6 +232,7 @@ fn prepare_world(definitions: u64) -> PreparedWorld {
         );
     }
     database.commit(initial).expect("retained world commits");
+    drain_reaper_or_panic("after initial world commit");
     let snapshot = database.snapshot();
     let hot_slot = SlotId::new(format!("retained/{}", definitions.saturating_sub(1)));
     let mut transaction = database.begin();
@@ -238,6 +259,7 @@ fn measure_world_candidate(
     let mut checksum = 0_u64;
 
     for _ in 0..samples {
+        drain_reaper_or_panic("before candidate sample");
         let before = Counters::capture();
         let started = Instant::now();
         let mut candidates = Vec::with_capacity(iterations as usize);
@@ -258,6 +280,7 @@ fn measure_world_candidate(
         allocated.push(delta.allocated_bytes);
         allocations.push(delta.allocations);
         drop(candidates);
+        drain_reaper_or_panic("after candidate sample");
     }
 
     elapsed.sort_unstable();
@@ -279,11 +302,12 @@ fn measure_world_candidate(
         median_allocations_per_candidate: allocations[allocations.len() / 2] as f64
             / iterations as f64,
         checksum,
-        notes: "Clones the immutable shared world, applies one definition, performs incremental invariant validation, and calculates the canonical world identity without publishing.".to_owned(),
+        notes: "Reaper is drained before timing; candidates remain alive through the timed interval; allocation counters are captured before roots are retired; background drain occurs outside the sample.".to_owned(),
     }
 }
 
 fn measure_legacy_clone(retained: u64) -> CandidateMeasurement {
+    drain_reaper_or_panic("before legacy control");
     let mut base = LegacyForthDb::new();
     for index in 0..retained {
         base.define(
@@ -340,6 +364,7 @@ fn measure_legacy_clone(retained: u64) -> CandidateMeasurement {
 }
 
 fn measure_resolve(prepared: &PreparedWorld, retained: u64) -> ReadMeasurement {
+    drain_reaper_or_panic("before read measurement");
     const ITERATIONS: u64 = 1_000_000;
     let mut samples = Vec::with_capacity(3);
     let mut checksum = 0_u64;
@@ -369,6 +394,8 @@ fn measure_snapshot_retirement(
     base_definitions: u64,
     snapshot_count: usize,
 ) -> SnapshotRetirement {
+    drain_reaper_or_panic("before snapshot retirement");
+    let before_metrics = ForthDb::reaper_metrics();
     let database = Database::new(MemoryCommitStore::new()).expect("memory database opens");
     let mut initial = database.begin();
     for index in 0..base_definitions {
@@ -403,6 +430,12 @@ fn measure_snapshot_retirement(
     let drop_started = Instant::now();
     drop(database);
     let final_database_drop_ns = duration_nanos(drop_started.elapsed());
+    let after_foreground = ForthDb::reaper_metrics();
+
+    let drain_started = Instant::now();
+    let reaper_drained = ForthDb::drain_reaper(Duration::from_secs(30));
+    let reaper_drain_ns = duration_nanos(drain_started.elapsed());
+    let after_drain = ForthDb::reaper_metrics();
 
     SnapshotRetirement {
         base_definitions,
@@ -413,8 +446,28 @@ fn measure_snapshot_retirement(
         max_ns: *drops.last().unwrap_or(&0),
         total_release_ns,
         final_database_drop_ns,
-        notes: "Foreground Arc<World> release with the latest database world still alive. No background reaper is installed in this measurement.",
+        reaper_drain_ns,
+        reaper_drained,
+        queued_after_foreground: after_foreground.queued_roots,
+        queued_after_drain: after_drain.queued_roots,
+        retired_roots_delta: counter_delta(after_drain.retired_roots, before_metrics.retired_roots),
+        reaped_roots_delta: counter_delta(after_drain.reaped_roots, before_metrics.reaped_roots),
+        overflow_enqueues_delta: counter_delta(
+            after_drain.overflow_enqueues,
+            before_metrics.overflow_enqueues,
+        ),
+        worker_alive: after_drain.worker_alive,
+        notes: "Foreground releases enqueue shared kernels; final decrement and recursive destruction occur on the background reaper. Drain time is reported separately and excluded from foreground percentiles.",
     }
+}
+
+fn counter_delta(after: u64, before: u64) -> u64 {
+    after.saturating_sub(before)
+}
+
+#[allow(dead_code)]
+fn _assert_metrics_shape(metrics: ReaperMetrics) -> usize {
+    metrics.queued_roots
 }
 
 fn percentile(sorted: &[u64], percentile: usize) -> u64 {
