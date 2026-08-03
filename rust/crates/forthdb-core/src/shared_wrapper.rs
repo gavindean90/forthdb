@@ -10,6 +10,6 @@ pub use legacy::{
 pub use legacy::ForthDb as LegacyForthDb;
 
 mod shared {
-    include!("shared_v4.rs");
+    include!("shared_reaped.rs");
 }
-pub use shared::{ForthDb, StructuralMetrics};
+pub use shared::{ForthDb, ReaperMetrics, StructuralMetrics};
