@@ -2,6 +2,7 @@ use forthdb_core::{
     Atom, Fact, ForthDb, LegacyForthDb, Literal, Pattern, Predicate, PredicateTerm, QueryOptions,
     SlotId, Term, Variable,
 };
+use std::time::Duration;
 
 fn fact(subject: &str, predicate: &str, object: &str) -> Fact {
     Fact::new(
@@ -45,7 +46,8 @@ fn shared_kernel_matches_legacy_define_forget_and_history() {
     for slot in &slots {
         assert_slot_parity(&shared, &legacy, slot);
     }
-    shared.validate().expect("shared invariants");
+    shared.validate().expect("shared incremental invariants");
+    shared.validate_full().expect("shared full audit");
     legacy.validate().expect("legacy invariants");
 }
 
@@ -111,6 +113,7 @@ fn shared_kernel_matches_legacy_queries_and_provenance() {
         ..QueryOptions::default()
     };
     assert_eq!(shared.query(&patterns, options), legacy.query(&patterns, options));
+    shared.validate_full().expect("query fixture full audit");
 }
 
 #[test]
@@ -134,4 +137,59 @@ fn cloning_and_mutating_shared_kernel_preserves_base_snapshot() {
     assert_eq!(base.record_count(), 10_000);
     assert_eq!(candidate.record_count(), 10_001);
     assert!(base_metrics.log_chunks >= 9);
+    base.validate_full().expect("base full audit");
+    candidate.validate_full().expect("candidate full audit");
+}
+
+#[test]
+fn deterministic_random_sequence_matches_legacy_after_every_checkpoint() {
+    let slots: Vec<_> = (0..256)
+        .map(|index| SlotId::new(format!("random/{index}")))
+        .collect();
+    let mut shared = ForthDb::new();
+    let mut legacy = LegacyForthDb::new();
+    let mut state = 0x7b5d_3a19_4c2e_810f_u64;
+
+    for step in 0..10_000_u64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let slot_index = state as usize & (slots.len() - 1);
+        let slot = slots[slot_index].clone();
+
+        if state % 7 == 0 {
+            shared.forget(slot.clone());
+            legacy.forget(slot);
+        } else {
+            let value = fact(
+                &format!("subject/{}", state & 31),
+                &format!("predicate/{}", (state >> 5) & 15),
+                &format!("value/{step}/{}", state >> 9),
+            );
+            shared.define(slot.clone(), value.clone());
+            legacy.define(slot, value);
+        }
+
+        if step % 97 == 0 {
+            assert_eq!(shared.active_slot_count(), legacy.active_slot_count());
+            assert_eq!(shared.record_count(), legacy.record_count());
+            for probe in (0..slots.len()).step_by(17) {
+                assert_slot_parity(&shared, &legacy, &slots[probe]);
+            }
+            shared.validate().expect("incremental audit at checkpoint");
+        }
+        if step % 997 == 0 {
+            shared.validate_full().expect("full structural audit at checkpoint");
+            legacy.validate().expect("legacy audit at checkpoint");
+        }
+    }
+
+    for slot in &slots {
+        assert_slot_parity(&shared, &legacy, slot);
+    }
+    shared.validate_full().expect("final full structural audit");
+    legacy.validate().expect("final legacy audit");
+    drop(shared);
+    assert!(ForthDb::drain_reaper(Duration::from_secs(10)));
+    assert_eq!(ForthDb::reaper_metrics().queued_roots, 0);
 }
