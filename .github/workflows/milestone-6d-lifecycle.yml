@@ -35,21 +35,52 @@ jobs:
       - name: Run complete Rust tests
         run: cargo test --manifest-path rust/Cargo.toml
 
+      - name: Observe lifecycle phase timing
+        env:
+          FORTHDB_M6D_RETAINED_DEFINITIONS: "100000"
+          FORTHDB_M6D_INTENTS: "2048"
+        run: |
+          mkdir -p "$RUNNER_TEMP/forthdb-m6d-artifacts"
+          FORTHDB_M6D_TIMING_REPORT="$RUNNER_TEMP/forthdb-m6d-artifacts/rust-lifecycle-timing.json" \
+            cargo run --quiet --release --manifest-path rust/Cargo.toml \
+              -p forthdb-bench --bin lifecycle_timing
+
       - name: Publish lifecycle summary
         if: always()
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          # Milestone 6D Lifecycle Safety
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-          The dedicated process harness tests:
+          report = Path(os.environ["RUNNER_TEMP"]) / "forthdb-m6d-artifacts" / "rust-lifecycle-timing.json"
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("# Milestone 6D Lifecycle Safety\n\n")
+              handle.write("The process harness verifies exclusive writer ownership, OS lock release after SIGKILL, truthful crash-prefix recovery, and writable restart.\n\n")
+              if report.exists():
+                  data = json.loads(report.read_text())
+                  handle.write("| Metric | Observation |\n| --- | ---: |\n")
+                  handle.write(f"| Intents | {data['intents']:,} |\n")
+                  handle.write(f"| Epochs | {data['epochs']:,} |\n")
+                  handle.write(f"| Average batch | {data['average_batch']:.2f} |\n")
+                  handle.write(f"| Throughput | {data['intents_per_second']:.0f}/s |\n")
+                  handle.write(f"| Derive per epoch | {data['derive_nanos_per_epoch'] / 1000:.2f} µs |\n")
+                  handle.write(f"| Persist per epoch | {data['persist_nanos_per_epoch'] / 1000:.2f} µs |\n")
+                  handle.write(f"| Core overlap ceiling | {data['core_stage_speedup_ceiling']:.3f}× |\n")
+                  handle.write(f"| Full-pipeline ceiling | {data['full_pipeline_speedup_ceiling']:.3f}× |\n")
+              else:
+                  handle.write("\nNo lifecycle timing report was produced.\n")
+          PY
 
-          - exclusive process-scoped writer ownership
-          - operating-system lock release after `SIGKILL`
-          - cold recovery before persistence
-          - cold recovery after durable persistence but before publication
-          - cold recovery after publication but before ticket delivery
-          - successful writable restart after each crash window
-          EOF
+      - name: Upload Milestone 6D evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: forthdb-milestone-6d-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/forthdb-m6d-artifacts
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Verify repository remains clean
         run: |
