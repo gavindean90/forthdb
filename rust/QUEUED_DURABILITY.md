@@ -112,6 +112,24 @@ The 10,000-intent test exposed recursive destruction of a uniquely owned `Histor
 
 This changes reclamation mechanics, not world identity, frame bytes, or recovery.
 
+## Accepted semantic observation
+
+GitHub Actions run `30785402013` used a release build on a shared Linux x86-64 runner. Each observation timed one complete private epoch over a 100,000-definition base. Intent construction occurred before timing; every intermediate world remained alive until the timer stopped; semantic-kernel reclamation was drained before and after every epoch.
+
+| Accepted intents | Median epoch | Median per intent | P95 per intent |
+| ---: | ---: | ---: | ---: |
+| 1 | 38.71 µs | 38.71 µs | 43.20 µs |
+| 2 | 64.29 µs | 32.15 µs | 35.99 µs |
+| 4 | 121.22 µs | 30.30 µs | 37.50 µs |
+| 8 | 221.64 µs | 27.70 µs | 31.44 µs |
+| 16 | 438.90 µs | 27.43 µs | 34.74 µs |
+| 32 | 796.00 µs | 24.88 µs | 25.68 µs |
+| 64 | 1.63 ms | 25.54 µs | 26.26 µs |
+
+Private epoch cost remains approximately proportional to the accepted-intent count. Per-intent derivation stayed in roughly the 25–39 µs range and did not degrade as the chain length increased. Larger epochs amortized fixed planner overhead but did not remove the single-committer CPU cost.
+
+This establishes a semantic control, not a durability-throughput result. Stage 6B must compare the cost of one synchronized epoch against the same frames committed through separate synchronization barriers.
+
 ## Stage boundaries
 
 ### 6A — semantic control
