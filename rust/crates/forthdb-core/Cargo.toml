@@ -10,3 +10,4 @@ path = "src/shared_wrapper.rs"
 test = false
 
 [dependencies]
+im = "15"
