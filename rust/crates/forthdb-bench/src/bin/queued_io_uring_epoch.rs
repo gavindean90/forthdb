@@ -4,8 +4,7 @@ mod linux {
     use forthdb_world::{
         CommitStore, Database, DurableQueuedIntentController, DurableSubmitError,
         DurableTicketOutcome, EpochFileIo, FileCommitStore, FileEpochMetrics, FileEpochStore,
-        FileEpochStoreError, FileEpochSyncPolicy, IoUringEpochFileIo, IoUringEpochStrategy,
-        QueuedIntent,
+        FileEpochStoreError, FileEpochSyncPolicy, IoUringEpochFileIo, QueuedIntent,
     };
     use serde::Serialize;
     use std::env;
@@ -27,28 +26,16 @@ mod linux {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Variant {
         Ordinary,
-        RingContiguous,
         RingSpeculative,
-        RingVectored,
-        RingPipelined,
     }
 
     impl Variant {
-        const ALL: [Self; 5] = [
-            Self::Ordinary,
-            Self::RingContiguous,
-            Self::RingSpeculative,
-            Self::RingVectored,
-            Self::RingPipelined,
-        ];
+        const ALL: [Self; 2] = [Self::Ordinary, Self::RingSpeculative];
 
         const fn label(self) -> &'static str {
             match self {
                 Self::Ordinary => "ordinary_per_epoch",
-                Self::RingContiguous => "io_uring_contiguous_write",
                 Self::RingSpeculative => "io_uring_speculative_one_ahead",
-                Self::RingVectored => "io_uring_writev",
-                Self::RingPipelined => "io_uring_pipelined_writes",
             }
         }
     }
@@ -121,7 +108,7 @@ mod linux {
         fn new(label: &str) -> Self {
             let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
             let path = env::temp_dir().join(format!(
-                "forthdb-m6c-{label}-{}-{sequence}.db",
+                "forthdb-speculative-io-uring-{label}-{}-{sequence}.db",
                 std::process::id()
             ));
             let _ = fs::remove_file(&path);
@@ -142,15 +129,12 @@ mod linux {
     pub fn main() {
         let total_started = Instant::now();
         let probe = TempFile::new("probe");
-        let availability_error = match IoUringEpochFileIo::open_store_with_entries(
-            probe.path(),
-            IoUringEpochStrategy::ContiguousWrite,
-            RING_ENTRIES,
-        ) {
-            Ok(_) => None,
-            Err(error) if unavailable(&error) => Some(error.to_string()),
-            Err(error) => panic!("io_uring epoch probe failed unexpectedly: {error}"),
-        };
+        let availability_error =
+            match IoUringEpochFileIo::open_store_with_entries(probe.path(), RING_ENTRIES) {
+                Ok(_) => None,
+                Err(error) if unavailable(&error) => Some(error.to_string()),
+                Err(error) => panic!("io_uring epoch probe failed unexpectedly: {error}"),
+            };
 
         let configurations = if availability_error.is_some() {
             Vec::new()
@@ -197,7 +181,7 @@ mod linux {
             } else {
                 "observational"
             },
-            scope: "io-uring-durability-epochs",
+            scope: "speculative-io-uring-durability",
             retained_definitions: RETAINED_DEFINITIONS,
             capacity: CAPACITY,
             producers: PRODUCERS,
@@ -280,41 +264,10 @@ mod linux {
                     .expect("ordinary epoch store opens");
                 run_controller(temp, store, max_batch, intents_per_producer)
             }
-            Variant::RingContiguous => {
-                let store = IoUringEpochFileIo::open_store_with_entries(
-                    temp.path(),
-                    IoUringEpochStrategy::ContiguousWrite,
-                    RING_ENTRIES,
-                )
-                .expect("contiguous ring epoch store opens");
-                run_controller(temp, store, max_batch, intents_per_producer)
-            }
             Variant::RingSpeculative => {
-                let store = IoUringEpochFileIo::open_store_with_entries(
-                    temp.path(),
-                    IoUringEpochStrategy::ContiguousWrite,
-                    RING_ENTRIES,
-                )
-                .expect("speculative ring epoch store opens");
+                let store = IoUringEpochFileIo::open_store_with_entries(temp.path(), RING_ENTRIES)
+                    .expect("speculative ring epoch store opens");
                 run_speculative_controller(temp, store, max_batch, intents_per_producer)
-            }
-            Variant::RingVectored => {
-                let store = IoUringEpochFileIo::open_store_with_entries(
-                    temp.path(),
-                    IoUringEpochStrategy::VectoredWrite,
-                    RING_ENTRIES,
-                )
-                .expect("vectored ring epoch store opens");
-                run_controller(temp, store, max_batch, intents_per_producer)
-            }
-            Variant::RingPipelined => {
-                let store = IoUringEpochFileIo::open_store_with_entries(
-                    temp.path(),
-                    IoUringEpochStrategy::PipelinedWrites,
-                    RING_ENTRIES,
-                )
-                .expect("pipelined ring epoch store opens");
-                run_controller(temp, store, max_batch, intents_per_producer)
             }
         }
     }

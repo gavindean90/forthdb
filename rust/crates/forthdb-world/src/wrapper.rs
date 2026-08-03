@@ -5,7 +5,6 @@ mod file_epoch_store;
 mod file_store;
 mod history_lifecycle;
 mod io_uring_epoch_io;
-mod io_uring_store;
 mod mmap_store;
 mod queued;
 mod queued_controller;
@@ -23,8 +22,7 @@ pub use file_epoch_store::{
     FileEpochStore, FileEpochStoreError, FileEpochSyncPolicy, StdEpochFileIo,
 };
 pub use file_store::{FileCommitStore, FileCommitStoreError};
-pub use io_uring_epoch_io::{IoUringEpochFileIo, IoUringEpochStore, IoUringEpochStrategy};
-pub use io_uring_store::{IoUringCommitStore, IoUringCommitStoreError};
+pub use io_uring_epoch_io::{IoUringEpochFileIo, IoUringEpochStore};
 pub use mmap_store::{MmapCommitStore, MmapCommitStoreError};
 pub use queued::{
     AcceptedIntent, EpochOutcome, EpochPlan, IntentAtom, IntentFact, IntentPrecondition,

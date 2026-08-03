@@ -1,4 +1,4 @@
-name: Milestone 6C io_uring Epochs
+name: Speculative io_uring Durability
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   io-uring-epochs:
-    name: Falsify io_uring epoch transports
+    name: Compare speculative overlap with ordinary durability
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -27,7 +27,7 @@ jobs:
       - name: Run complete Rust tests
         run: cargo test --manifest-path rust/Cargo.toml
 
-      - name: Run repeated transport benchmark
+      - name: Run repeated overlap benchmark
         run: |
           mkdir -p "$RUNNER_TEMP/forthdb-m6c-artifacts"
           FORTHDB_IO_URING_EPOCH_REPORT="$RUNNER_TEMP/forthdb-m6c-artifacts/rust-io-uring-epoch-benchmarks.json" \
@@ -47,7 +47,7 @@ jobs:
           report = Path(os.environ["RUNNER_TEMP"]) / "forthdb-m6c-artifacts" / "rust-io-uring-epoch-benchmarks.json"
           summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
           with summary.open("a", encoding="utf-8") as handle:
-              handle.write("# Milestone 6C io_uring Durability Epochs\n\n")
+              handle.write("# Speculative io_uring Durability\n\n")
               if not report.exists():
                   handle.write("No io_uring epoch report was produced.\n")
                   raise SystemExit(0)
@@ -74,12 +74,12 @@ jobs:
                       f"{item['median_arena_bytes_copied']} | {item['median_iovecs_submitted']} |\n"
                   )
               handle.write(
-                  "\nAll variants use the same queued-intent planner, bounded ingress, ticket routing, "
+                  "\nBoth variants use the same queued-intent planner, bounded ingress, ticket routing, "
                   "canonical records, verified repair, publication ordering, and recovery parser.\n"
               )
           PY
 
-      - name: Upload Milestone 6C evidence
+      - name: Upload speculative io_uring evidence
         if: always()
         uses: actions/upload-artifact@v6
         with:

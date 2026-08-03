@@ -1,5 +1,10 @@
 # Milestone 6C: io_uring Durability Transports
 
+> Historical experiment record. The synchronous transports described here
+> were slower than the ordinary-file control and have been removed. The only
+> current io_uring path is the opt-in speculative controller documented in
+> [`SPECULATIVE_IO_URING.md`](SPECULATIVE_IO_URING.md).
+
 ## Purpose
 
 Milestone 6C asks which Linux io_uring submission shape best executes the ordinary-file durability epoch contract proved in Milestone 6B.

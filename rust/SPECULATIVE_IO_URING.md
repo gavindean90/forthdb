@@ -54,12 +54,21 @@ shutdown contracts.
 
 ## Measurement
 
-The existing io_uring epoch benchmark adds
-`io_uring_speculative_one_ahead` beside the unchanged ordinary per-epoch and
-synchronous ring arms. It records how many successors were prepared and how
-many required rederivation.
+The io_uring epoch benchmark compares `io_uring_speculative_one_ahead` directly
+with the unchanged ordinary per-epoch control. The retired synchronous ring
+transports are preserved only in the Milestone 6C history. The benchmark
+records how many successors were prepared and how many required rederivation.
 
 This experiment succeeds only if it preserves canonical recovery and ticket
 ordering. A throughput win is workload-dependent rather than a correctness
 requirement. The decisive comparison remains the ordinary per-epoch control.
 
+## Accepted observation
+
+GitHub Actions run `30838953811` showed the speculative controller preparing
+every possible successor without rederivation. Median throughput was 2,566
+intents/s versus 2,007 for ordinary durability at batch size one, and 9,288
+versus 6,915 at batch size sixteen. The write, synchronization, submission and
+CQE counts matched the synchronous contiguous-ring experiment, so the gain is
+consistent with overlapping private preparation with kernel durability rather
+than a faster write syscall.

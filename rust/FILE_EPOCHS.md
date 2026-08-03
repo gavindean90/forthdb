@@ -211,16 +211,15 @@ Milestone 6B does not change:
 - temporary-entity scoping
 - semantic rejection behavior
 - stale strict-transaction behavior
-- `FileCommitStore`, `MmapCommitStore`, or `IoUringCommitStore`
+- `FileCommitStore` or `MmapCommitStore`
 
 It adds a new ordinary-file epoch transport and a durable controller around the existing semantic planner.
 
-## Next experiment
+## Subsequent experiment
 
-Milestone 6C compares three Linux io_uring transports against this ordinary-file control:
-
-1. contiguous `WRITE` linked to `FSYNC(DATASYNC)`
-2. `WRITEV` linked to `FSYNC(DATASYNC)`
-3. independent positional writes followed by a drained synchronization barrier
+Synchronous io_uring submission shapes did not beat this ordinary-file
+control and have been retired. The remaining opt-in experiment instead uses
+io_uring to overlap durability of epoch N with private preparation of epoch
+N+1; see [`SPECULATIVE_IO_URING.md`](SPECULATIVE_IO_URING.md).
 
 The third form is the true queue-depth experiment. Linking all writes to one another would serialize them and is not an acceptable QD > 1 control.

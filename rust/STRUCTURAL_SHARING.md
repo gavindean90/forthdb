@@ -19,7 +19,6 @@ Milestone 5 does not change:
 - `MemoryCommitStore`
 - `FileCommitStore`
 - `MmapCommitStore`
-- `IoUringCommitStore`
 - file recovery and corruption rules
 
 The final branch diff contains no source changes to any commit-store implementation.

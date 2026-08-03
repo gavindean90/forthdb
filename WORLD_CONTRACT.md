@@ -88,11 +88,11 @@ History is authoritative. Rollback creates a new World rather than erasing prior
 1. `MemoryCommitStore`
 2. `FileCommitStore`
 3. `MmapCommitStore`
-4. `IoUringCommitStore`
-5. Structurally shared worlds and background semantic-kernel retirement
-6. Queued-intent semantic epoch control
-7. Bounded ingress and commit-ticket lifecycle
-8. Ordinary-file durability epochs with verified repair and poisoning
+4. Structurally shared worlds and background semantic-kernel retirement
+5. Queued-intent semantic epoch control
+6. Bounded ingress and commit-ticket lifecycle
+7. Ordinary-file durability epochs with verified repair and poisoning
+8. Opt-in speculative io_uring durability overlap on Linux
 
 Detailed Milestone 6 contracts:
 

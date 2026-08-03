@@ -700,11 +700,7 @@ impl DurableQueuedIntentController<IoUringEpochFileIo> {
     ) -> Result<Self, DurableControllerOpenError> {
         let path = path.as_ref();
         let lease = WriterLease::acquire(path)?;
-        let store = IoUringEpochFileIo::open_store_with_entries(
-            path,
-            IoUringEpochStrategy::ContiguousWrite,
-            ring_entries,
-        )?;
+        let store = IoUringEpochFileIo::open_store_with_entries(path, ring_entries)?;
         let database = Arc::new(Database::new(store)?);
         Self::new_with_runner(
             database,
@@ -2160,11 +2156,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let path = temp_path("speculative-io-uring");
-        let store = match IoUringEpochFileIo::open_store_with_entries(
-            &path,
-            IoUringEpochStrategy::ContiguousWrite,
-            64,
-        ) {
+        let store = match IoUringEpochFileIo::open_store_with_entries(&path, 64) {
             Ok(store) => store,
             Err(FileEpochStoreError::Io { source, .. })
                 if matches!(source.raw_os_error(), Some(1 | 38 | 95)) =>
