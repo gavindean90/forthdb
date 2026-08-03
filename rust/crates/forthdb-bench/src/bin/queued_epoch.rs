@@ -1,4 +1,4 @@
-use forthdb_core::{Atom, Fact, ForthDb, IntentAtomPlaceholder, Literal, Predicate, SlotId};
+use forthdb_core::{Atom, Fact, ForthDb, Literal, Predicate, SlotId};
 use forthdb_world::{
     derive_epoch, Database, IntentFact, MemoryCommitStore, QueuedIntent, World,
 };
