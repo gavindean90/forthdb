@@ -12,6 +12,7 @@ This workspace contains the Rust semantic kernel and committed-world engine.
 6. Bounded ingress and commit tickets
 7. Ordinary-file durability epochs
 8. Opt-in speculative io_uring durability overlap
+9. Durable admission journal with immutable epoch worlds
 
 All stores implement the same `CommitStore` contract. Strict transactions derive and validate a private candidate, append its canonical `CommitFrame`, wait for required durability, and only then publish the immutable successor.
 
@@ -25,12 +26,15 @@ Milestone 6B adds `FileEpochStore` and `DurableQueuedIntentController`. The pair
 
 Milestone 6C tested three synchronous Linux io_uring epoch transports. None outperformed the ordinary-file epoch control, so those transports were retired. The remaining opt-in io_uring controller uses one contiguous `WRITE` plus `FSYNC(DATASYNC)` to overlap durability of epoch N with private preparation of epoch N+1. The ordinary-file per-epoch transport remains the default.
 
+The current draft direction separates durable admission from semantic publication. Ordered intents are encoded into one checksummed admission epoch and become durable through one io_uring `WRITE -> DATASYNC`. The admitted epoch is then evaluated deterministically and publishes at most one immutable world. Recovery replays admission epochs rather than requiring a second synchronized outcome log. Multiple accepted intents in one epoch share the same published world and preserve individual accepted or rejected outcomes.
+
 Design and evidence:
 
 - [`STRUCTURAL_SHARING.md`](STRUCTURAL_SHARING.md)
 - [`QUEUED_DURABILITY.md`](QUEUED_DURABILITY.md)
 - [`FILE_EPOCHS.md`](FILE_EPOCHS.md)
 - [`IO_URING_EPOCHS.md`](IO_URING_EPOCHS.md)
+- [`ADMISSION_EPOCH_WORLDS.md`](ADMISSION_EPOCH_WORLDS.md)
 - [`FILE_FORMAT.md`](../FILE_FORMAT.md)
 - [`WORLD_CONTRACT.md`](../WORLD_CONTRACT.md)
 

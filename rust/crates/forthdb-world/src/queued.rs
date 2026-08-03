@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_INTENT_NAMESPACE: AtomicU64 = AtomicU64::new(1);
@@ -181,6 +182,236 @@ impl QueuedIntent {
     pub fn forget(&mut self, slot: SlotId) {
         self.operations.push(IntentOperation::Forget { slot });
     }
+}
+
+pub(crate) fn encode_queued_intent(intent: &QueuedIntent, output: &mut Vec<u8>) {
+    put_u64(output, intent.namespace);
+    put_u32(output, intent.next_temporary);
+    put_u32(output, intent.preconditions.len() as u32);
+    for precondition in &intent.preconditions {
+        match precondition {
+            IntentPrecondition::ExpectedWorld(world) => {
+                output.push(0);
+                put_u64(output, world.value());
+            }
+            IntentPrecondition::ExpectedSlot { slot, expected } => {
+                output.push(1);
+                put_string(output, slot.as_str());
+                match expected {
+                    Some(fact) => {
+                        output.push(1);
+                        encode_fact(output, fact);
+                    }
+                    None => output.push(0),
+                }
+            }
+        }
+    }
+    put_u32(output, intent.operations.len() as u32);
+    for operation in &intent.operations {
+        match operation {
+            IntentOperation::AllocateEntity { temporary } => {
+                output.push(0);
+                encode_temporary(output, *temporary);
+            }
+            IntentOperation::Define { slot, fact } => {
+                output.push(1);
+                put_string(output, slot.as_str());
+                encode_intent_fact(output, fact);
+            }
+            IntentOperation::Forget { slot } => {
+                output.push(2);
+                put_string(output, slot.as_str());
+            }
+        }
+    }
+}
+
+pub(crate) fn decode_queued_intent(input: &mut Cursor<&[u8]>) -> Result<QueuedIntent, String> {
+    let namespace = take_u64(input)?;
+    let next_temporary = take_u32(input)?;
+    let precondition_count = take_u32(input)? as usize;
+    let mut preconditions = Vec::with_capacity(precondition_count);
+    for _ in 0..precondition_count {
+        preconditions.push(match take_u8(input)? {
+            0 => IntentPrecondition::ExpectedWorld(WorldId::new(take_u64(input)?)),
+            1 => {
+                let slot = SlotId::new(take_string(input)?);
+                let expected = match take_u8(input)? {
+                    0 => None,
+                    1 => Some(decode_fact(input)?),
+                    tag => return Err(format!("invalid expected-fact tag {tag}")),
+                };
+                IntentPrecondition::ExpectedSlot { slot, expected }
+            }
+            tag => return Err(format!("invalid intent precondition tag {tag}")),
+        });
+    }
+    let operation_count = take_u32(input)? as usize;
+    let mut operations = Vec::with_capacity(operation_count);
+    for _ in 0..operation_count {
+        operations.push(match take_u8(input)? {
+            0 => IntentOperation::AllocateEntity {
+                temporary: decode_temporary(input)?,
+            },
+            1 => IntentOperation::Define {
+                slot: SlotId::new(take_string(input)?),
+                fact: decode_intent_fact(input)?,
+            },
+            2 => IntentOperation::Forget {
+                slot: SlotId::new(take_string(input)?),
+            },
+            tag => return Err(format!("invalid intent operation tag {tag}")),
+        });
+    }
+    NEXT_INTENT_NAMESPACE.fetch_max(namespace.saturating_add(1), Ordering::Relaxed);
+    Ok(QueuedIntent {
+        namespace,
+        next_temporary,
+        preconditions,
+        operations,
+    })
+}
+
+fn encode_temporary(output: &mut Vec<u8>, temporary: TempEntity) {
+    put_u64(output, temporary.namespace);
+    put_u32(output, temporary.index);
+}
+
+fn decode_temporary(input: &mut Cursor<&[u8]>) -> Result<TempEntity, String> {
+    Ok(TempEntity {
+        namespace: take_u64(input)?,
+        index: take_u32(input)?,
+    })
+}
+
+fn encode_intent_fact(output: &mut Vec<u8>, fact: &IntentFact) {
+    encode_intent_atom(output, &fact.subject);
+    put_string(output, fact.predicate.as_str());
+    encode_intent_atom(output, &fact.object);
+}
+
+fn decode_intent_fact(input: &mut Cursor<&[u8]>) -> Result<IntentFact, String> {
+    Ok(IntentFact {
+        subject: decode_intent_atom(input)?,
+        predicate: Predicate::new(take_string(input)?),
+        object: decode_intent_atom(input)?,
+    })
+}
+
+fn encode_intent_atom(output: &mut Vec<u8>, atom: &IntentAtom) {
+    match atom {
+        IntentAtom::Entity(entity) => {
+            output.push(0);
+            put_u64(output, entity.value());
+        }
+        IntentAtom::Temporary(temporary) => {
+            output.push(1);
+            encode_temporary(output, *temporary);
+        }
+        IntentAtom::Literal(literal) => {
+            output.push(2);
+            put_string(output, literal.as_str());
+        }
+    }
+}
+
+fn decode_intent_atom(input: &mut Cursor<&[u8]>) -> Result<IntentAtom, String> {
+    match take_u8(input)? {
+        0 => Ok(IntentAtom::Entity(EntityId::new(take_u64(input)?))),
+        1 => Ok(IntentAtom::Temporary(decode_temporary(input)?)),
+        2 => Ok(IntentAtom::Literal(Literal::new(take_string(input)?))),
+        tag => Err(format!("invalid intent atom tag {tag}")),
+    }
+}
+
+fn encode_fact(output: &mut Vec<u8>, fact: &Fact) {
+    encode_atom(output, &fact.subject);
+    put_string(output, fact.predicate.as_str());
+    encode_atom(output, &fact.object);
+}
+
+fn decode_fact(input: &mut Cursor<&[u8]>) -> Result<Fact, String> {
+    Ok(Fact::new(
+        decode_atom(input)?,
+        Predicate::new(take_string(input)?),
+        decode_atom(input)?,
+    ))
+}
+
+fn encode_atom(output: &mut Vec<u8>, atom: &Atom) {
+    match atom {
+        Atom::Entity(entity) => {
+            output.push(0);
+            put_u64(output, entity.value());
+        }
+        Atom::Literal(literal) => {
+            output.push(1);
+            put_string(output, literal.as_str());
+        }
+    }
+}
+
+fn decode_atom(input: &mut Cursor<&[u8]>) -> Result<Atom, String> {
+    match take_u8(input)? {
+        0 => Ok(Atom::Entity(EntityId::new(take_u64(input)?))),
+        1 => Ok(Atom::Literal(Literal::new(take_string(input)?))),
+        tag => Err(format!("invalid fact atom tag {tag}")),
+    }
+}
+
+fn put_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_string(output: &mut Vec<u8>, value: &str) {
+    put_u32(output, value.len() as u32);
+    output.extend_from_slice(value.as_bytes());
+}
+
+fn take_u8(input: &mut Cursor<&[u8]>) -> Result<u8, String> {
+    let mut bytes = [0; 1];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes[0])
+}
+
+fn take_u32(input: &mut Cursor<&[u8]>) -> Result<u32, String> {
+    let mut bytes = [0; 4];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn take_u64(input: &mut Cursor<&[u8]>) -> Result<u64, String> {
+    let mut bytes = [0; 8];
+    input
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn take_string(input: &mut Cursor<&[u8]>) -> Result<String, String> {
+    let length = take_u32(input)? as usize;
+    let start = input.position() as usize;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| "intent string length overflow".to_owned())?;
+    let bytes = input.get_ref();
+    if end > bytes.len() {
+        return Err("truncated intent string".to_owned());
+    }
+    let value = std::str::from_utf8(&bytes[start..end])
+        .map_err(|error| error.to_string())?
+        .to_owned();
+    input.set_position(end as u64);
+    Ok(value)
 }
 
 #[derive(Debug)]
@@ -380,10 +611,7 @@ pub fn derive_epoch(
                     entities,
                 }));
             }
-            Err(error) => outcomes.push(EpochOutcome::Rejected(RejectedIntent {
-                position,
-                error,
-            })),
+            Err(error) => outcomes.push(EpochOutcome::Rejected(RejectedIntent { position, error })),
         }
     }
 
@@ -395,18 +623,50 @@ pub fn derive_epoch(
     }
 }
 
+/// Construct one immutable successor world for an ordered admission epoch.
+///
+/// Intents are still evaluated in ingress order against a private evolving
+/// candidate so preconditions, allocation, and independent rejection retain
+/// their established meaning. Accepted operations are then collapsed into one
+/// canonical frame rooted at the published predecessor. Every accepted ticket
+/// observes the same epoch world; no intermediate private candidate is
+/// externally publishable.
+pub fn derive_epoch_world(
+    base: Arc<World>,
+    intents: Vec<QueuedIntent>,
+    validators: &[Validator],
+) -> EpochPlan {
+    let mut plan = derive_epoch(base.clone(), intents, validators);
+    if plan.frames.is_empty() {
+        return plan;
+    }
+
+    let operations = plan
+        .frames
+        .iter()
+        .flat_map(|frame| frame.operations().iter().cloned())
+        .collect::<Vec<_>>();
+    let candidate = CandidateWorld::construct(base.as_ref(), operations)
+        .expect("accepted private successors must collapse into one valid epoch candidate");
+    let frame = candidate.commit_frame();
+    let world = Arc::new(candidate.into_world(frame.clone(), base.history.clone()));
+
+    for outcome in &mut plan.outcomes {
+        if let EpochOutcome::Accepted(accepted) = outcome {
+            accepted.world = world.clone();
+            accepted.frame = frame.clone();
+        }
+    }
+    plan.tail = world;
+    plan.frames = vec![frame];
+    plan
+}
+
 fn derive_intent(
     predecessor: Arc<World>,
     intent: QueuedIntent,
     validators: &[Validator],
-) -> Result<
-    (
-        Arc<World>,
-        Arc<CommitFrame>,
-        BTreeMap<TempEntity, EntityId>,
-    ),
-    IntentRejection,
-> {
+) -> Result<(Arc<World>, Arc<CommitFrame>, BTreeMap<TempEntity, EntityId>), IntentRejection> {
     check_preconditions(&predecessor, &intent.preconditions)?;
     let (operations, entities) =
         resolve_operations(&predecessor, intent.namespace, intent.operations)?;
@@ -587,7 +847,9 @@ mod tests {
                 Operation::Forget { slot } => transaction.forget(slot.clone()),
             }
         }
-        database.commit(transaction).expect("oracle commit succeeds")
+        database
+            .commit(transaction)
+            .expect("oracle commit succeeds")
     }
 
     #[test]
@@ -673,7 +935,11 @@ mod tests {
         assert_eq!(plan.tail().next_entity(), 3);
         let last = plan.outcomes()[2].accepted().expect("last accepted");
         assert_eq!(last.entity(last_entity), Some(EntityId::new(2)));
-        assert!(plan.tail().resolve(&SlotId::new("rejected/state")).is_none());
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("rejected/state"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -722,7 +988,11 @@ mod tests {
         ));
         assert!(plan.outcomes()[2].accepted().is_some());
         assert_eq!(plan.tail().resolve(&slot), Some(&updated));
-        assert!(plan.tail().resolve(&SlotId::new("should/not/exist")).is_none());
+        assert!(
+            plan.tail()
+                .resolve(&SlotId::new("should/not/exist"))
+                .is_none()
+        );
         assert!(plan.tail().resolve(&SlotId::new("should/exist")).is_some());
     }
 
@@ -875,11 +1145,16 @@ mod tests {
                         Operation::Forget { slot } => transaction.forget(slot.clone()),
                     }
                 }
-                database.commit(transaction).expect("strict commit succeeds");
+                database
+                    .commit(transaction)
+                    .expect("strict commit succeeds");
             }
         }
 
-        assert_eq!(fs::read(&queued_path).unwrap(), fs::read(&strict_path).unwrap());
+        assert_eq!(
+            fs::read(&queued_path).unwrap(),
+            fs::read(&strict_path).unwrap()
+        );
         let _ = fs::remove_file(queued_path);
         let _ = fs::remove_file(strict_path);
     }

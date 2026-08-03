@@ -5,9 +5,9 @@ mod linux {
         QueryOptions, Symbol, Term, Variable,
     };
     use forthdb_world::{
-        Database, DurableCommitTicket, DurableQueuedControllerMetrics,
-        DurableQueuedIntentController, DurableSubmitError, DurableTicketOutcome, FileCommitStore,
-        IntentFact, IoUringEpochFileIo, QueuedIntent, TempEntity, World,
+        AdmissionEpochBatchSubmitError, AdmissionEpochController, AdmissionEpochMetrics,
+        AdmissionEpochSubmitError, AdmissionEpochTicket, AdmissionEpochTicketOutcome, IntentFact,
+        QueuedIntent, TempEntity, World,
     };
     use serde::Serialize;
     use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ mod linux {
 
     const NAMESPACE: &str = "library";
     const CAPACITY: usize = 64;
-    const MAX_BATCH: usize = 1;
+    const MAX_BATCH: usize = 16;
     const RING_ENTRIES: u32 = 64;
 
     #[derive(Serialize)]
@@ -55,11 +55,14 @@ mod linux {
 
     #[derive(Serialize)]
     struct ControllerObservation {
-        submitted: u64,
-        accepted: u64,
-        epochs: u64,
-        speculative_epochs_prepared: u64,
-        speculative_epochs_rederived: u64,
+        submitted_intents: u64,
+        accepted_intents: u64,
+        rejected_intents: u64,
+        durable_epochs: u64,
+        applied_epochs: u64,
+        published_worlds: u64,
+        maximum_semantic_lag: u64,
+        admitted_bytes: u64,
         data_writes: u64,
         data_syncs: u64,
         completion_events: u64,
@@ -92,13 +95,7 @@ mod linux {
 
     fn run_library(path: &Path) -> Result<Report, Box<dyn Error>> {
         let started = Instant::now();
-        let controller = DurableQueuedIntentController::open_owned_speculative(
-            path,
-            CAPACITY,
-            MAX_BATCH,
-            RING_ENTRIES,
-        )?;
-        let database = controller.database();
+        let controller = AdmissionEpochController::open(path, CAPACITY, MAX_BATCH, RING_ENTRIES)?;
 
         let named = [
             ("Asimov", "Isaac Asimov"),
@@ -151,8 +148,6 @@ mod linux {
                 ),
             );
         }
-        wait_accepted(submit(&controller, metadata)?)?;
-
         let asimov = entities["Asimov"];
         let foundation = entities["Foundation"];
         let science_fiction = entities["Science_Fiction"];
@@ -207,7 +202,12 @@ mod linux {
             "located_at",
             shelf_b1,
         );
-        let catalog_world = wait_accepted(submit(&controller, catalog)?)?.world;
+        let mut foundation_epoch = submit_epoch(&controller, vec![metadata, catalog])?;
+        let metadata_world = wait_accepted(foundation_epoch.remove(0))?.world;
+        let catalog_world = wait_accepted(foundation_epoch.remove(0))?.world;
+        if metadata_world.id() != catalog_world.id() {
+            return Err("metadata and catalog did not publish as one epoch world".into());
+        }
 
         let who_wrote = pattern_entity_variable(foundation, "written_by", "author")?;
         let copies_and_shelves = copies_and_shelves(foundation)?;
@@ -232,12 +232,12 @@ mod linux {
             shelf_c3,
         );
 
-        // Submit both before waiting so the controller can prepare relocation
-        // while checkout durability is in flight.
-        let checkout_ticket = submit(&controller, checkout)?;
-        let relocate_ticket = submit(&controller, relocate)?;
-        let checkout_world = wait_accepted(checkout_ticket)?.world;
-        let relocated_world = wait_accepted(relocate_ticket)?.world;
+        let mut circulation_epoch = submit_epoch(&controller, vec![checkout, relocate])?;
+        let checkout_world = wait_accepted(circulation_epoch.remove(0))?.world;
+        let relocated_world = wait_accepted(circulation_epoch.remove(0))?.world;
+        if checkout_world.id() != relocated_world.id() {
+            return Err("checkout and relocation did not publish as one epoch world".into());
+        }
 
         let alice_holdings_pattern = vec![
             pattern_variable_entity("copy", "borrowed_by", alice)?,
@@ -249,7 +249,7 @@ mod linux {
         ];
         let alice_holdings = query(&checkout_world, &alice_holdings_pattern);
         let copy_87_before_move = query(
-            &checkout_world,
+            &catalog_world,
             &[pattern_entity_variable(copy_87, "located_at", "shelf")?],
         );
         let copy_87_after_move = query(
@@ -282,10 +282,10 @@ mod linux {
         let mut returned = QueuedIntent::new();
         returned.forget(borrower_slot);
 
-        let rename_ticket = submit(&controller, rename_and_rebind)?;
-        let return_ticket = submit(&controller, returned)?;
-        let renamed_world = wait_accepted(rename_ticket)?.world;
-        let final_world = wait_accepted(return_ticket)?.world;
+        let renamed_world =
+            wait_accepted(submit_epoch(&controller, vec![rename_and_rebind])?.remove(0))?.world;
+        let final_world =
+            wait_accepted(submit_epoch(&controller, vec![returned])?.remove(0))?.world;
         controller.flush()?;
 
         let old_compiled_after_rename_and_rebind =
@@ -302,22 +302,20 @@ mod linux {
         );
 
         let controller_metrics = controller.metrics();
-        let store_metrics = controller.store_metrics();
-        let observation = observation(&controller_metrics, &store_metrics);
+        let observation = observation(&controller_metrics);
         let expected_world = final_world.id();
         let expected_version = final_world.version();
-        let expected_frames = database.frame_count();
+        let expected_frames = final_world.frames().len();
         controller.shutdown();
         drop(controller);
-        drop(database);
 
-        let recovered = Database::new(FileCommitStore::open(path)?)?;
+        let recovered = AdmissionEpochController::open(path, CAPACITY, MAX_BATCH, RING_ENTRIES)?;
         let recovered_world = recovered.snapshot();
         let recovered_locations = query(&recovered_world, &copies_and_shelves);
         let recovery = Recovery {
             same_world: recovered_world.id() == expected_world,
             same_version: recovered_world.version() == expected_version,
-            same_frame_count: recovered.frame_count() == expected_frames,
+            same_frame_count: recovered_world.frames().len() == expected_frames,
             copies_and_shelves: recovered_locations,
         };
 
@@ -327,18 +325,18 @@ mod linux {
         if after_return != Vec::<BTreeMap<String, String>>::new() {
             return Err("returned copy remained checked out".into());
         }
-        if observation.speculative_epochs_prepared == 0 {
-            return Err("library workload did not exercise speculative preparation".into());
+        if observation.durable_epochs != observation.applied_epochs {
+            return Err("durable admission and semantic publication did not converge".into());
         }
 
         Ok(Report {
             status: "ok",
-            engine: "speculative_io_uring_one_epoch_ahead",
+            engine: "io_uring_admission_journal_epoch_worlds",
             database_path: path.display().to_string(),
             elapsed_us: started.elapsed().as_micros(),
             world_version: recovered_world.version(),
             world_id: recovered_world.id().to_string(),
-            frame_count: recovered.frame_count(),
+            frame_count: recovered_world.frames().len(),
             active_slots: recovered_world.active_slot_count(),
             immutable_records: recovered_world.record_count(),
             author,
@@ -372,37 +370,55 @@ mod linux {
     }
 
     fn submit(
-        controller: &DurableQueuedIntentController<IoUringEpochFileIo>,
+        controller: &AdmissionEpochController,
         mut intent: QueuedIntent,
-    ) -> Result<DurableCommitTicket, Box<dyn Error>> {
+    ) -> Result<AdmissionEpochTicket, Box<dyn Error>> {
         loop {
             match controller.submit(intent) {
                 Ok(ticket) => return Ok(ticket),
-                Err(DurableSubmitError::Full(returned)) => {
+                Err(AdmissionEpochSubmitError::Full(returned)) => {
                     intent = returned;
                     std::thread::yield_now();
                 }
-                Err(DurableSubmitError::Closed(_)) => return Err("controller closed".into()),
-                Err(DurableSubmitError::Poisoned { reason, .. }) => {
-                    return Err(format!("controller poisoned: {reason}").into());
+                Err(AdmissionEpochSubmitError::Closed(_)) => return Err("controller closed".into()),
+            }
+        }
+    }
+
+    fn submit_epoch(
+        controller: &AdmissionEpochController,
+        mut intents: Vec<QueuedIntent>,
+    ) -> Result<Vec<AdmissionEpochTicket>, Box<dyn Error>> {
+        loop {
+            match controller.submit_epoch(intents) {
+                Ok(tickets) => return Ok(tickets),
+                Err(AdmissionEpochBatchSubmitError::Full(returned)) => {
+                    intents = returned;
+                    std::thread::yield_now();
+                }
+                Err(AdmissionEpochBatchSubmitError::Closed(_)) => {
+                    return Err("controller closed".into());
                 }
             }
         }
     }
 
-    fn wait_accepted(ticket: DurableCommitTicket) -> Result<Accepted, Box<dyn Error>> {
+    fn wait_accepted(ticket: AdmissionEpochTicket) -> Result<Accepted, Box<dyn Error>> {
+        let admitted = ticket.wait_admitted()?;
         match ticket.wait()? {
-            DurableTicketOutcome::Accepted {
-                world, entities, ..
-            } => Ok(Accepted { world, entities }),
-            DurableTicketOutcome::Rejected(error) => {
+            AdmissionEpochTicketOutcome::Accepted {
+                receipt,
+                world,
+                entities,
+            } if receipt == admitted => Ok(Accepted { world, entities }),
+            AdmissionEpochTicketOutcome::Accepted { .. } => {
+                Err("admission receipt and semantic outcome disagree".into())
+            }
+            AdmissionEpochTicketOutcome::Rejected { error, .. } => {
                 Err(format!("intent rejected: {error}").into())
             }
-            DurableTicketOutcome::DurabilityFailed(error) => {
-                Err(format!("durability failed: {error}").into())
-            }
-            DurableTicketOutcome::Stopped(reason) => {
-                Err(format!("controller stopped: {reason:?}").into())
+            AdmissionEpochTicketOutcome::Failed(error) => {
+                Err(format!("admission/materialization failed: {error}").into())
             }
         }
     }
@@ -476,19 +492,19 @@ mod linux {
         }
     }
 
-    fn observation(
-        controller: &DurableQueuedControllerMetrics,
-        store: &forthdb_world::FileEpochMetrics,
-    ) -> ControllerObservation {
+    fn observation(controller: &AdmissionEpochMetrics) -> ControllerObservation {
         ControllerObservation {
-            submitted: controller.submitted,
-            accepted: controller.accepted,
-            epochs: controller.epochs,
-            speculative_epochs_prepared: controller.speculative_epochs_prepared,
-            speculative_epochs_rederived: controller.speculative_epochs_rederived,
-            data_writes: store.data_writes,
-            data_syncs: store.data_syncs,
-            completion_events: store.completion_events,
+            submitted_intents: controller.submitted_intents,
+            accepted_intents: controller.accepted_intents,
+            rejected_intents: controller.rejected_intents,
+            durable_epochs: controller.durable_epochs,
+            applied_epochs: controller.applied_epochs,
+            published_worlds: controller.published_worlds,
+            maximum_semantic_lag: controller.maximum_semantic_lag,
+            admitted_bytes: controller.admitted_bytes,
+            data_writes: controller.data_writes,
+            data_syncs: controller.data_syncs,
+            completion_events: controller.completion_events,
         }
     }
 }

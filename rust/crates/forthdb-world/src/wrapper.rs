@@ -1,5 +1,6 @@
 include!("lib.rs");
 
+mod admission_epoch;
 mod file_epoch_controller;
 mod file_epoch_store;
 mod file_store;
@@ -10,6 +11,11 @@ mod queued;
 mod queued_controller;
 mod writer_lock;
 
+pub use admission_epoch::{
+    AdmissionEpochBatchSubmitError, AdmissionEpochController, AdmissionEpochMetrics,
+    AdmissionEpochOpenError, AdmissionEpochReceipt, AdmissionEpochSubmitError,
+    AdmissionEpochTicket, AdmissionEpochTicketOutcome,
+};
 pub use file_epoch_controller::{
     DurableCommitTicket, DurableControllerConfigError, DurableControllerOpenError,
     DurableControllerState, DurableControllerStopped, DurableQueuedControllerMetrics,
@@ -26,7 +32,7 @@ pub use io_uring_epoch_io::{IoUringEpochFileIo, IoUringEpochStore};
 pub use mmap_store::{MmapCommitStore, MmapCommitStoreError};
 pub use queued::{
     AcceptedIntent, EpochOutcome, EpochPlan, IntentAtom, IntentFact, IntentPrecondition,
-    IntentRejection, QueuedIntent, RejectedIntent, TempEntity, derive_epoch,
+    IntentRejection, QueuedIntent, RejectedIntent, TempEntity, derive_epoch, derive_epoch_world,
 };
 pub use queued_controller::{
     CommitTicket, ControllerConfigError, ControllerStopped, QueuedControllerMetrics,

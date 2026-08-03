@@ -1,4 +1,4 @@
-name: Library App on Speculative io_uring
+name: Library App on Admission Epoch Worlds
 
 on:
   pull_request:
@@ -27,7 +27,7 @@ jobs:
       - name: Test workspace
         run: cargo test --manifest-path rust/Cargo.toml
 
-      - name: Run library on speculative io_uring
+      - name: Run library on io_uring admission journal
         run: |
           mkdir -p "$RUNNER_TEMP/forthdb-library-artifacts"
           FORTHDB_LIBRARY_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/library-report.json" \
@@ -54,7 +54,7 @@ jobs:
           report = Path(os.environ["RUNNER_TEMP"]) / "forthdb-library-artifacts" / "library-report.json"
           summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
           with summary.open("a", encoding="utf-8") as handle:
-              handle.write("# Library App on Speculative io_uring\n\n")
+              handle.write("# Library App on Admission Epoch Worlds\n\n")
               if not report.exists():
                   handle.write("No application report was produced.\n")
                   raise SystemExit(0)
@@ -63,9 +63,10 @@ jobs:
               recovery = data["recovery"]
               handle.write(f"World: `{data['world_id']}` at version `{data['world_version']}`.\n\n")
               handle.write(
-                  f"The application committed `{data['frame_count']}` frames in `{control['epochs']}` epochs, "
-                  f"prepared `{control['speculative_epochs_prepared']}` speculative successors, and "
-                  f"rederived `{control['speculative_epochs_rederived']}`.\n\n"
+                  f"The application durably admitted `{control['submitted_intents']}` intents in "
+                  f"`{control['durable_epochs']}` epochs and published "
+                  f"`{control['published_worlds']}` immutable epoch worlds. Maximum semantic lag was "
+                  f"`{control['maximum_semantic_lag']}` epoch(s).\n\n"
               )
               handle.write(
                   f"Recovery parity: world `{recovery['same_world']}`, version "

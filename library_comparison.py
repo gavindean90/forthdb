@@ -118,13 +118,11 @@ def run(binary: Path, rounds: int) -> dict[str, Any]:
             **python_summary,
         },
         "rust": {
-            "engine": "rust_speculative_io_uring_one_epoch_ahead",
-            "durable_commits_per_round": rust_report["controller"]["epochs"],
-            "speculative_epochs_prepared_last_round": rust_report["controller"][
-                "speculative_epochs_prepared"
-            ],
-            "speculative_epochs_rederived_last_round": rust_report["controller"][
-                "speculative_epochs_rederived"
+            "engine": "rust_io_uring_admission_journal_epoch_worlds",
+            "durable_commits_per_round": rust_report["controller"]["durable_epochs"],
+            "published_worlds_per_round": rust_report["controller"]["published_worlds"],
+            "maximum_semantic_lag_last_round": rust_report["controller"][
+                "maximum_semantic_lag"
             ],
             **rust_summary,
         },
@@ -134,8 +132,8 @@ def run(binary: Path, rounds: int) -> dict[str, Any]:
         "semantic_projection_equal": True,
         "caveat": (
             "The implementations preserve the same application projection, but Rust uses "
-            "seven durable epochs because entity allocation and metadata attachment are "
-            "separate; Python uses six. Timings are hosted-runner observations."
+            "five durable admission epochs and publishes five epoch worlds; Python uses "
+            "six durable per-transaction worlds. Timings are hosted-runner observations."
         ),
     }
 

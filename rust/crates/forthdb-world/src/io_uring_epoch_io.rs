@@ -106,7 +106,7 @@ impl IoUringEpochFileIo {
     }
 
     #[cfg(target_os = "linux")]
-    fn open(path: impl AsRef<Path>, ring_entries: u32) -> std::io::Result<Self> {
+    pub(crate) fn open(path: impl AsRef<Path>, ring_entries: u32) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new().read(true).write(true).open(&path)?;
         let ring = IoUring::new(ring_entries)?;
