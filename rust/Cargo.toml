@@ -4,6 +4,7 @@ members = [
     "crates/forthdb-conformance",
     "crates/forthdb-world",
     "crates/forthdb-bench",
+    "crates/forthdb-library",
 ]
 resolver = "3"
 

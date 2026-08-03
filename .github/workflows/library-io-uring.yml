@@ -1,0 +1,76 @@
+name: Library App on Speculative io_uring
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  library-io-uring:
+    name: Run library workflow and recover it
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: /tmp/forthdb-library-cargo-target
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test workspace
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Run library on speculative io_uring
+        run: |
+          mkdir -p "$RUNNER_TEMP/forthdb-library-artifacts"
+          FORTHDB_LIBRARY_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/library-report.json" \
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-library \
+            -- "$RUNNER_TEMP/forthdb-library-artifacts/library.fdb"
+
+      - name: Publish application summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path(os.environ["RUNNER_TEMP"]) / "forthdb-library-artifacts" / "library-report.json"
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("# Library App on Speculative io_uring\n\n")
+              if not report.exists():
+                  handle.write("No application report was produced.\n")
+                  raise SystemExit(0)
+              data = json.loads(report.read_text())
+              control = data["controller"]
+              recovery = data["recovery"]
+              handle.write(f"World: `{data['world_id']}` at version `{data['world_version']}`.\n\n")
+              handle.write(
+                  f"The application committed `{data['frame_count']}` frames in `{control['epochs']}` epochs, "
+                  f"prepared `{control['speculative_epochs_prepared']}` speculative successors, and "
+                  f"rederived `{control['speculative_epochs_rederived']}`.\n\n"
+              )
+              handle.write(
+                  f"Recovery parity: world `{recovery['same_world']}`, version "
+                  f"`{recovery['same_version']}`, frames `{recovery['same_frame_count']}`.\n"
+              )
+          PY
+
+      - name: Upload application database and report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: forthdb-library-io-uring-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/forthdb-library-artifacts
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,12 @@
+[package]
+name = "forthdb-library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+forthdb-core = { path = "../forthdb-core" }
+forthdb-world = { path = "../forthdb-world" }
+serde.workspace = true
+serde_json.workspace = true

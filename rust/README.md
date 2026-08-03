@@ -66,6 +66,9 @@ cargo run --quiet --release --manifest-path rust/Cargo.toml \
 
 cargo run --quiet --release --manifest-path rust/Cargo.toml \
   -p forthdb-bench --bin queued_io_uring_epoch
+
+cargo run --quiet --release --manifest-path rust/Cargo.toml \
+  -p forthdb-library -- /tmp/forthdb-library.fdb
 ```
 
 The speculative io_uring controller is Linux-only and reports unavailability when ring creation is denied by the running kernel or security policy.
