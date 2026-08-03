@@ -52,6 +52,15 @@ jobs:
             --bin ramped \
             -- "$RUNNER_TEMP/forthdb-library-artifacts/ramped"
 
+      - name: Measure bounded admission versus publication
+        run: |
+          FORTHDB_ADMISSION_WINDOW_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/admission-window.json" \
+          cargo run --quiet --release \
+            --manifest-path rust/Cargo.toml \
+            -p forthdb-bench \
+            --bin admission_window \
+            -- "$RUNNER_TEMP/forthdb-library-artifacts/admission-window"
+
       - name: Publish application summary
         if: always()
         run: |
@@ -116,6 +125,29 @@ jobs:
                       f"`{scaled['branch_rush_sync_reduction_percent']:.1f}%`; exact semantic "
                       f"projection: `{scaled['semantic_projection_equal']}`.\n"
                   )
+              windowed = report.parent / "admission-window.json"
+              if windowed.exists():
+                  measured = json.loads(windowed.read_text())
+                  handle.write("\n## Admission versus publication\n\n")
+                  handle.write(
+                      "| Case | Window | Intents/epoch | Journal ceiling | "
+                      "Steady admission | Publication | Max lag | Catch-up |\n"
+                  )
+                  handle.write(
+                      "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n"
+                  )
+                  for case in measured["cases"]:
+                      ceiling = case["journal_ceiling"]
+                      steady = case["steady_state"]
+                      handle.write(
+                          f"| {case['label']} | {case['max_unapplied_epochs']} | "
+                          f"{case['intents_per_epoch']} | "
+                          f"{ceiling['intents_per_second']:.1f}/s | "
+                          f"{steady['admission_intents_per_second']:.1f}/s | "
+                          f"{steady['publication_intents_per_second']:.1f}/s | "
+                          f"{steady['maximum_durable_to_applied_lag']} | "
+                          f"{steady['catch_up_elapsed_us'] / 1000:.2f} ms |\n"
+                      )
           PY
 
       - name: Upload application database and report

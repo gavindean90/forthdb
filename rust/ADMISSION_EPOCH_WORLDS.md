@@ -69,8 +69,25 @@ durable admission as a production ingestion API.
 
 Fast durable admission does not remove the semantic throughput ceiling. The
 controller reports durable and applied epochs separately and measures maximum
-semantic lag. A production policy must bound this lag rather than allowing the
-journal to outrun materialization indefinitely.
+semantic lag. `open_with_window` configures the maximum number of durable but
+unapplied epochs; `open` retains the conservative one-epoch default. Once the
+window is full, further durability progresses only as semantic materialization
+advances the applied watermark. A production policy must derive this bound from
+acceptable semantic staleness, recovery time, journal capacity, and outstanding
+ticket memory rather than allowing the journal to outrun materialization
+indefinitely.
+
+The `admission_window` benchmark separates three observations:
+
+1. a gated journal-ceiling phase fills the configured window while semantic
+   publication is deliberately paused
+2. a steady-state phase runs admission and publication concurrently
+3. a catch-up phase measures the interval from the final durable receipt to the
+   final semantic outcome
+
+The benchmark sweeps unapplied windows of 1, 2, 8, and 32 epochs at 16 intents
+per epoch, plus epoch widths of 1 and 64 at an eight-epoch window. During the
+gated phase it asserts that the reader-visible world remains unchanged.
 
 ## Library reference
 

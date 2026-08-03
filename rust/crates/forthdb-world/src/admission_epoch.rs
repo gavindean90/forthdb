@@ -220,7 +220,31 @@ impl AdmissionEpochController {
         max_batch: usize,
         ring_entries: u32,
     ) -> Result<Self, AdmissionEpochOpenError> {
-        Self::open_with_validators(path, capacity, max_batch, ring_entries, Vec::new())
+        Self::open_with_validators_and_window(
+            path,
+            capacity,
+            max_batch,
+            ring_entries,
+            1,
+            Vec::new(),
+        )
+    }
+
+    pub fn open_with_window(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        max_batch: usize,
+        ring_entries: u32,
+        max_unapplied_epochs: usize,
+    ) -> Result<Self, AdmissionEpochOpenError> {
+        Self::open_with_validators_and_window(
+            path,
+            capacity,
+            max_batch,
+            ring_entries,
+            max_unapplied_epochs,
+            Vec::new(),
+        )
     }
 
     pub fn open_with_validators(
@@ -230,9 +254,27 @@ impl AdmissionEpochController {
         ring_entries: u32,
         validators: Vec<Validator>,
     ) -> Result<Self, AdmissionEpochOpenError> {
-        if capacity == 0 || max_batch == 0 {
+        Self::open_with_validators_and_window(
+            path,
+            capacity,
+            max_batch,
+            ring_entries,
+            1,
+            validators,
+        )
+    }
+
+    pub fn open_with_validators_and_window(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        max_batch: usize,
+        ring_entries: u32,
+        max_unapplied_epochs: usize,
+        validators: Vec<Validator>,
+    ) -> Result<Self, AdmissionEpochOpenError> {
+        if capacity == 0 || max_batch == 0 || max_unapplied_epochs == 0 {
             return Err(AdmissionEpochOpenError::Config(
-                "capacity and maximum batch must both be nonzero".to_owned(),
+                "capacity, maximum batch, and maximum unapplied epochs must be nonzero".to_owned(),
             ));
         }
         #[cfg(not(target_os = "linux"))]
@@ -280,6 +322,7 @@ impl AdmissionEpochController {
                         recovered.epochs.len() as u64 + 1,
                         receiver,
                         max_batch,
+                        max_unapplied_epochs,
                         worker_current,
                         worker_validators,
                         worker_metrics,
@@ -483,96 +526,158 @@ fn run_worker(
     mut next_epoch: u64,
     receiver: Receiver<Command>,
     max_batch: usize,
+    max_unapplied_epochs: usize,
     current: Arc<RwLock<Arc<World>>>,
     validators: Arc<RwLock<Vec<Validator>>>,
     metrics: Arc<Metrics>,
 ) {
     let mut pending_commands = VecDeque::new();
+    let mut durable_backlog = VecDeque::new();
+    let mut barrier = None;
+    let mut disconnected = false;
     loop {
-        let command = match pending_commands.pop_front() {
-            Some(command) => command,
-            None => match receiver.recv() {
-                Ok(command) => command,
-                Err(_) => break,
-            },
-        };
-        let batch = match command {
-            Command::Barrier(completed) => {
-                let _ = completed.send(Ok(()));
-                continue;
-            }
-            Command::Intent(first) => {
-                claim_batch(first, &receiver, &mut pending_commands, max_batch)
-            }
-            Command::Epoch(batch) => batch,
-        };
-        {
-            let epoch = EpochBatch {
-                id: next_epoch,
-                staged: batch,
+        while durable_backlog.len() < max_unapplied_epochs && barrier.is_none() && !disconnected {
+            let command = match pending_commands.pop_front() {
+                Some(command) => Some(command),
+                None if durable_backlog.is_empty() => match receiver.recv() {
+                    Ok(command) => Some(command),
+                    Err(_) => {
+                        disconnected = true;
+                        None
+                    }
+                },
+                None => match receiver.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(TryRecvError::Empty) => None,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        None
+                    }
+                },
             };
-            next_epoch += 1;
-            let mut pending = match submit_admission(&mut io, file_len, epoch) {
-                Ok(pending) => pending,
-                Err((batch, error)) => {
-                    fail_batch(batch, error);
+            let Some(command) = command else {
+                break;
+            };
+            let staged = match command {
+                Command::Barrier(completed) => {
+                    barrier = Some(completed);
                     break;
                 }
+                Command::Intent(first) => {
+                    claim_batch(first, &receiver, &mut pending_commands, max_batch)
+                }
+                Command::Epoch(batch) => batch,
             };
+            let epoch = EpochBatch {
+                id: next_epoch,
+                staged,
+            };
+            next_epoch += 1;
+            let pending = match submit_admission(&mut io, file_len, epoch) {
+                Ok(pending) => pending,
+                Err((batch, error)) => {
+                    fail_batch(batch, error.clone());
+                    fail_durable_backlog(&mut durable_backlog, error);
+                    return;
+                }
+            };
+            match complete_admission(&mut io, &mut file_len, pending, &metrics) {
+                Ok(durable) => {
+                    notify_admitted(&durable);
+                    durable_backlog.push_back(durable);
+                }
+                Err((batch, error)) => {
+                    fail_batch(batch, error.clone());
+                    fail_durable_backlog(&mut durable_backlog, error);
+                    return;
+                }
+            }
+        }
 
-            loop {
+        if let Some(durable) = durable_backlog.pop_front() {
+            let mut pending_successor = None;
+            if barrier.is_none() && !disconnected && durable_backlog.len() < max_unapplied_epochs {
+                let command = match pending_commands.pop_front() {
+                    Some(command) => Some(command),
+                    None => match receiver.try_recv() {
+                        Ok(command) => Some(command),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            None
+                        }
+                    },
+                };
+                if let Some(command) = command {
+                    let staged = match command {
+                        Command::Barrier(completed) => {
+                            barrier = Some(completed);
+                            None
+                        }
+                        Command::Intent(first) => Some(claim_batch(
+                            first,
+                            &receiver,
+                            &mut pending_commands,
+                            max_batch,
+                        )),
+                        Command::Epoch(batch) => Some(batch),
+                    };
+                    if let Some(staged) = staged {
+                        let epoch = EpochBatch {
+                            id: next_epoch,
+                            staged,
+                        };
+                        next_epoch += 1;
+                        match submit_admission(&mut io, file_len, epoch) {
+                            Ok(pending) => pending_successor = Some(pending),
+                            Err((batch, error)) => {
+                                fail_batch(batch, error.clone());
+                                fail_outcomes(durable, error.clone());
+                                fail_durable_backlog(&mut durable_backlog, error);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Err((batch, error)) = materialize(durable, &current, &validators, &metrics) {
+                fail_outcomes(batch, error.clone());
+                if let Some(pending) = pending_successor {
+                    match complete_admission(&mut io, &mut file_len, pending, &metrics) {
+                        Ok(batch) => {
+                            notify_admitted(&batch);
+                            fail_outcomes(batch, error.clone());
+                        }
+                        Err((batch, failure)) => fail_batch(batch, failure),
+                    }
+                }
+                fail_durable_backlog(&mut durable_backlog, error);
+                return;
+            }
+
+            if let Some(pending) = pending_successor {
                 match complete_admission(&mut io, &mut file_len, pending, &metrics) {
                     Ok(durable) => {
                         notify_admitted(&durable);
-                        let successor =
-                            try_claim_batch(&receiver, &mut pending_commands, max_batch).map(
-                                |staged| {
-                                    let epoch = EpochBatch {
-                                        id: next_epoch,
-                                        staged,
-                                    };
-                                    next_epoch += 1;
-                                    submit_admission(&mut io, file_len, epoch)
-                                },
-                            );
-                        if let Err((batch, error)) =
-                            materialize(durable, &current, &validators, &metrics)
-                        {
-                            fail_batch(batch, error.clone());
-                            if let Some(successor) = successor {
-                                match successor {
-                                    Ok(pending_successor) => match complete_admission(
-                                        &mut io,
-                                        &mut file_len,
-                                        pending_successor,
-                                        &metrics,
-                                    ) {
-                                        Ok(batch) => {
-                                            notify_admitted(&batch);
-                                            fail_outcomes(batch, error);
-                                        }
-                                        Err((batch, failure)) => fail_batch(batch, failure),
-                                    },
-                                    Err((batch, failure)) => fail_batch(batch, failure),
-                                }
-                            }
-                            return;
-                        }
-                        match successor {
-                            Some(Ok(next)) => pending = next,
-                            Some(Err((batch, error))) => {
-                                fail_batch(batch, error);
-                                return;
-                            }
-                            None => break,
-                        }
+                        durable_backlog.push_back(durable);
                     }
                     Err((batch, error)) => {
-                        fail_batch(batch, error);
+                        fail_batch(batch, error.clone());
+                        fail_durable_backlog(&mut durable_backlog, error);
                         return;
                     }
                 }
             }
+            continue;
+        }
+
+        if let Some(completed) = barrier.take() {
+            let _ = completed.send(Ok(()));
+            continue;
+        }
+        if disconnected {
+            break;
         }
     }
 }
@@ -599,22 +704,6 @@ fn claim_batch(
         }
     }
     batch
-}
-
-fn try_claim_batch(
-    receiver: &Receiver<Command>,
-    pending: &mut VecDeque<Command>,
-    max_batch: usize,
-) -> Option<Vec<StagedIntent>> {
-    match receiver.try_recv() {
-        Ok(Command::Intent(first)) => Some(claim_batch(first, receiver, pending, max_batch)),
-        Ok(Command::Epoch(batch)) => Some(batch),
-        Ok(command @ Command::Barrier(_)) => {
-            pending.push_back(command);
-            None
-        }
-        Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -778,6 +867,12 @@ fn fail_outcomes(batch: EpochBatch, error: String) {
         let _ = staged
             .outcome
             .send(AdmissionEpochTicketOutcome::Failed(error.clone()));
+    }
+}
+
+fn fail_durable_backlog(backlog: &mut VecDeque<EpochBatch>, error: String) {
+    while let Some(batch) = backlog.pop_front() {
+        fail_outcomes(batch, error.clone());
     }
 }
 
@@ -963,6 +1058,8 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
 
     static TEST_PATH: AtomicU64 = AtomicU64::new(1);
 
@@ -1048,6 +1145,14 @@ mod tests {
             plan.outcomes()[0].accepted().unwrap().world().id(),
             plan.outcomes()[1].accepted().unwrap().world().id()
         );
+    }
+
+    #[test]
+    fn zero_unapplied_window_is_rejected() {
+        let error = AdmissionEpochController::open_with_window(path("zero-window"), 1, 1, 2, 0)
+            .err()
+            .expect("zero window must fail before opening io_uring");
+        assert!(matches!(error, AdmissionEpochOpenError::Config(_)));
     }
 
     #[test]
@@ -1155,6 +1260,88 @@ mod tests {
         assert_eq!(reopened.snapshot().id(), expected);
         reopened.shutdown();
         drop(reopened);
+        fs::remove_file(&path).unwrap();
+        let _ = fs::remove_file(writer_lock_path(&path));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_window_admits_a_durable_backlog_before_publication() {
+        let path = path("bounded-window");
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let validator_gate = gate.clone();
+        let validator: Validator = Arc::new(move |_| {
+            let (lock, ready) = &*validator_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = ready.wait(released).unwrap();
+            }
+            Ok(())
+        });
+        let controller = match AdmissionEpochController::open_with_validators_and_window(
+            &path,
+            16,
+            1,
+            64,
+            4,
+            vec![validator],
+        ) {
+            Ok(controller) => controller,
+            Err(AdmissionEpochOpenError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(writer_lock_path(&path));
+                return;
+            }
+            Err(error) => panic!("admission controller should open: {error}"),
+        };
+
+        let tickets = (0..4)
+            .map(|index| {
+                let mut intent = QueuedIntent::new();
+                intent.define(
+                    SlotId::new(format!("window/{index}")),
+                    IntentFact::new(
+                        Literal::new(index.to_string()),
+                        Predicate::new("state"),
+                        Literal::new("durable"),
+                    ),
+                );
+                controller
+                    .submit_epoch(vec![intent])
+                    .expect("epoch enters the admission queue")
+                    .pop()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while controller.metrics().durable_epochs < 4 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(controller.metrics().durable_epochs, 4);
+        assert_eq!(controller.metrics().maximum_semantic_lag, 4);
+        assert_eq!(controller.snapshot().version(), 0);
+
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+        for ticket in tickets {
+            ticket.wait_admitted().expect("epoch is durable");
+            assert!(matches!(
+                ticket.wait().expect("semantic outcome resolves"),
+                AdmissionEpochTicketOutcome::Accepted { .. }
+            ));
+        }
+        controller.flush().unwrap();
+        assert_eq!(controller.snapshot().version(), 4);
+        assert_eq!(controller.metrics().applied_epochs, 4);
+        controller.shutdown();
+        drop(controller);
         fs::remove_file(&path).unwrap();
         let _ = fs::remove_file(writer_lock_path(&path));
     }

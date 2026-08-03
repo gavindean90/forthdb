@@ -28,6 +28,20 @@ Milestone 6C tested three synchronous Linux io_uring epoch transports. None outp
 
 The current draft direction separates durable admission from semantic publication. Ordered intents are encoded into one checksummed admission epoch and become durable through one io_uring `WRITE -> DATASYNC`. The admitted epoch is then evaluated deterministically and publishes at most one immutable world. Recovery replays admission epochs rather than requiring a second synchronized outcome log. Multiple accepted intents in one epoch share the same published world and preserve individual accepted or rejected outcomes.
 
+`AdmissionEpochController::open_with_window` makes the durable-to-applied bound
+explicit. The existing `open` API keeps the one-epoch default. Larger windows
+allow the journal to acknowledge several durable epochs before semantic
+publication catches up, while applying backpressure at the configured bound and
+never exposing provisional worlds.
+
+The admission-window benchmark measures the raw gated journal ceiling, steady
+admission and publication rates, maximum lag, and catch-up time:
+
+```console
+cargo run --release --manifest-path rust/Cargo.toml \
+  -p forthdb-bench --bin admission_window
+```
+
 The library package also includes a ramped circulation comparison. It seeds
 10,000 works, 20,000 copies, 5,000 patrons, and eight branches, then applies the
 same deterministic 512-intent trace as interactive one-intent epochs and as
