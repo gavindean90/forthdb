@@ -27,7 +27,7 @@ jobs:
       - name: Run complete Rust tests
         run: cargo test --manifest-path rust/Cargo.toml
 
-      - name: Run million-definition structural benchmark
+      - name: Run isolated million-definition structural benchmark
         env:
           FORTHDB_M5_MILLION: "1"
         run: |
@@ -35,7 +35,7 @@ jobs:
           cargo run --quiet --release \
             --manifest-path rust/Cargo.toml \
             -p forthdb-bench \
-            --bin structural \
+            --bin structural_isolated \
             > "$RUNNER_TEMP/forthdb-m5-artifacts/rust-structural-benchmarks.json"
 
       - name: Publish structural summary
@@ -87,6 +87,11 @@ jobs:
                   f"Foreground P50/P95/P99/max: "
                   f"{retirement['p50_ns']} / {retirement['p95_ns']} / "
                   f"{retirement['p99_ns']} / {retirement['max_ns']} ns.\n\n"
+              )
+              handle.write(
+                  f"Reaper drain: {retirement['reaper_drain_ns']} ns; "
+                  f"drained={retirement['reaper_drained']}; "
+                  f"overflow enqueues={retirement['metrics_after']['overflow_enqueues']}.\n\n"
               )
               handle.write(
                   f"Final database drop: {retirement['final_database_drop_ns']} ns.\n"
