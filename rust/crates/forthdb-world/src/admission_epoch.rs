@@ -428,7 +428,7 @@ impl AdmissionEpochController {
                 &validator_store
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                materializer: materializer_kind,
+                materializer_kind,
             )?;
             let current = Arc::new(RwLock::new(replayed));
             let io = IoUringEpochFileIo::open(&path, ring_entries)?;
@@ -483,7 +483,7 @@ impl AdmissionEpochController {
                 metrics,
                 closed,
                 journal_path: path,
-                materializer,
+                materializer: materializer_kind,
                 _writer_lease: lease,
             })
         }
