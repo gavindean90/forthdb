@@ -1,7 +1,8 @@
 use forthdb_core::{
-    Atom, EntityId, Fact, ForthDb, Literal, Pattern, Predicate, QueryOptions, QueryResult, SlotId,
-    Symbol,
+    Atom, Binding, BoundValue, EntityId, Fact, ForthDb, Literal, Pattern, Predicate,
+    PredicateTerm, QueryMetrics, QueryOptions, QueryResult, QueryRow, SlotId, Symbol, Term,
 };
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -166,6 +167,345 @@ struct ProjectionBase {
     next_entity: u64,
 }
 
+#[derive(Clone)]
+struct ProjectedFact {
+    record_id: usize,
+    slot: SlotId,
+    fact: Fact,
+}
+
+#[derive(Default)]
+struct VmQueryProjection {
+    definitions: HashMap<SlotId, Vec<ProjectedFact>>,
+    active: Vec<ProjectedFact>,
+    by_subject: HashMap<Atom, Vec<usize>>,
+    by_predicate: HashMap<Predicate, Vec<usize>>,
+    by_object: HashMap<Atom, Vec<usize>>,
+    by_subject_predicate: HashMap<(Atom, Predicate), Vec<usize>>,
+    by_subject_object: HashMap<(Atom, Atom), Vec<usize>>,
+    by_predicate_object: HashMap<(Predicate, Atom), Vec<usize>>,
+    by_exact: HashMap<Fact, Vec<usize>>,
+}
+
+#[derive(Clone)]
+struct QueryFrame {
+    binding: Binding,
+    provenance: Vec<SlotId>,
+}
+
+impl VmQueryProjection {
+    fn from_history(history: &HistoryNode) -> Self {
+        let mut frames = Vec::new();
+        let mut cursor = Some(history);
+        while let Some(node) = cursor {
+            frames.push(node.frame.clone());
+            cursor = node.parent.as_deref();
+        }
+
+        let mut definitions = HashMap::<SlotId, Vec<ProjectedFact>>::new();
+        let mut record_id = 0usize;
+        for frame in frames.into_iter().rev() {
+            for operation in frame.operations.iter() {
+                match operation {
+                    Operation::AllocateEntity { .. } => {}
+                    Operation::Define { slot, fact } => {
+                        definitions
+                            .entry(slot.clone())
+                            .or_default()
+                            .push(ProjectedFact {
+                                record_id,
+                                slot: slot.clone(),
+                                fact: fact.clone(),
+                            });
+                        record_id += 1;
+                    }
+                    Operation::Forget { slot } => {
+                        let remove = if let Some(stack) = definitions.get_mut(slot) {
+                            stack.pop();
+                            stack.is_empty()
+                        } else {
+                            false
+                        };
+                        if remove {
+                            definitions.remove(slot);
+                        }
+                        record_id += 1;
+                    }
+                }
+            }
+        }
+
+        let mut active: Vec<_> = definitions
+            .values()
+            .filter_map(|stack| stack.last().cloned())
+            .collect();
+        active.sort_unstable_by_key(|entry| entry.record_id);
+        let mut projection = Self {
+            definitions,
+            active,
+            ..Self::default()
+        };
+        for index in 0..projection.active.len() {
+            let fact = &projection.active[index].fact;
+            projection
+                .by_subject
+                .entry(fact.subject.clone())
+                .or_default()
+                .push(index);
+            projection
+                .by_predicate
+                .entry(fact.predicate.clone())
+                .or_default()
+                .push(index);
+            projection
+                .by_object
+                .entry(fact.object.clone())
+                .or_default()
+                .push(index);
+            projection
+                .by_subject_predicate
+                .entry((fact.subject.clone(), fact.predicate.clone()))
+                .or_default()
+                .push(index);
+            projection
+                .by_subject_object
+                .entry((fact.subject.clone(), fact.object.clone()))
+                .or_default()
+                .push(index);
+            projection
+                .by_predicate_object
+                .entry((fact.predicate.clone(), fact.object.clone()))
+                .or_default()
+                .push(index);
+            projection
+                .by_exact
+                .entry(fact.clone())
+                .or_default()
+                .push(index);
+        }
+        projection
+    }
+
+    fn resolve(&self, slot: &SlotId) -> Option<&Fact> {
+        self.definitions
+            .get(slot)
+            .and_then(|stack| stack.last())
+            .map(|entry| &entry.fact)
+    }
+
+    fn definitions(&self, slot: &SlotId) -> Vec<&Fact> {
+        self.definitions
+            .get(slot)
+            .into_iter()
+            .flatten()
+            .rev()
+            .map(|entry| &entry.fact)
+            .collect()
+    }
+
+    fn candidates(&self, pattern: &Pattern, binding: &Binding) -> Vec<usize> {
+        let subject = resolved_atom(&pattern.subject, binding);
+        let predicate = resolved_predicate(&pattern.predicate, binding);
+        let object = resolved_atom(&pattern.object, binding);
+        let bucket = match (subject, predicate, object) {
+            (Some(subject), Some(predicate), Some(object)) => self
+                .by_exact
+                .get(&Fact::new(subject, predicate, object)),
+            (Some(subject), Some(predicate), None) => {
+                self.by_subject_predicate.get(&(subject, predicate))
+            }
+            (Some(subject), None, Some(object)) => {
+                self.by_subject_object.get(&(subject, object))
+            }
+            (None, Some(predicate), Some(object)) => {
+                self.by_predicate_object.get(&(predicate, object))
+            }
+            (Some(subject), None, None) => self.by_subject.get(&subject),
+            (None, Some(predicate), None) => self.by_predicate.get(&predicate),
+            (None, None, Some(object)) => self.by_object.get(&object),
+            (None, None, None) => return (0..self.active.len()).collect(),
+        };
+        bucket.cloned().unwrap_or_default()
+    }
+
+    fn query(&self, patterns: &[Pattern], options: QueryOptions) -> QueryResult {
+        let mut output = Vec::<QueryFrame>::new();
+        let mut first_path = Vec::<Pattern>::new();
+        let mut metrics = QueryMetrics::default();
+        self.walk_query(
+            QueryFrame {
+                binding: Binding::new(),
+                provenance: Vec::new(),
+            },
+            patterns.to_vec(),
+            0,
+            options,
+            &mut output,
+            &mut first_path,
+            &mut metrics,
+        );
+
+        if options.distinct {
+            let mut seen = BTreeSet::new();
+            output.retain(|frame| seen.insert(frame.binding.clone()));
+        }
+        output.sort_by(|left, right| {
+            left.binding.cmp(&right.binding).then_with(|| {
+                left.provenance
+                    .iter()
+                    .map(SlotId::as_str)
+                    .cmp(right.provenance.iter().map(SlotId::as_str))
+            })
+        });
+
+        QueryResult {
+            rows: output
+                .into_iter()
+                .map(|frame| QueryRow {
+                    binding: frame.binding,
+                    provenance: if options.include_provenance {
+                        frame.provenance
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect(),
+            chosen_first_path: first_path,
+            metrics,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_query(
+        &self,
+        frame: QueryFrame,
+        remaining: Vec<Pattern>,
+        depth: usize,
+        options: QueryOptions,
+        output: &mut Vec<QueryFrame>,
+        first_path: &mut Vec<Pattern>,
+        metrics: &mut QueryMetrics,
+    ) -> bool {
+        if remaining.is_empty() {
+            output.push(frame);
+            return options.limit.is_some_and(|limit| output.len() >= limit);
+        }
+
+        let chosen_index = if options.optimize {
+            remaining
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, pattern)| self.candidates(pattern, &frame.binding).len())
+                .map(|(index, _)| index)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let chosen = remaining[chosen_index].clone();
+        if depth == first_path.len() {
+            first_path.push(chosen.clone());
+        }
+        let mut rest = remaining;
+        rest.remove(chosen_index);
+
+        let candidates = self.candidates(&chosen, &frame.binding);
+        metrics.candidate_facts += candidates.len() as u64;
+        for index in candidates {
+            let entry = &self.active[index];
+            if let Some(binding) = unify_pattern(&chosen, &entry.fact, &frame.binding) {
+                metrics.bindings_emitted += 1;
+                let mut provenance = frame.provenance.clone();
+                provenance.push(entry.slot.clone());
+                if self.walk_query(
+                    QueryFrame {
+                        binding,
+                        provenance,
+                    },
+                    rest.clone(),
+                    depth + 1,
+                    options,
+                    output,
+                    first_path,
+                    metrics,
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn resolved_atom(term: &Term, binding: &Binding) -> Option<Atom> {
+    match term {
+        Term::Atom(atom) => Some(atom.clone()),
+        Term::Variable(variable) => binding
+            .get(variable.as_str())
+            .and_then(BoundValue::as_atom),
+    }
+}
+
+fn resolved_predicate(term: &PredicateTerm, binding: &Binding) -> Option<Predicate> {
+    match term {
+        PredicateTerm::Predicate(predicate) => Some(predicate.clone()),
+        PredicateTerm::Variable(variable) => binding
+            .get(variable.as_str())
+            .and_then(BoundValue::as_predicate),
+    }
+}
+
+fn unify_pattern(pattern: &Pattern, fact: &Fact, binding: &Binding) -> Option<Binding> {
+    let binding = unify_term(&pattern.subject, BoundValue::from(fact.subject.clone()), binding)?;
+    let binding = unify_predicate(
+        &pattern.predicate,
+        BoundValue::Predicate(fact.predicate.clone()),
+        &binding,
+    )?;
+    unify_term(
+        &pattern.object,
+        BoundValue::from(fact.object.clone()),
+        &binding,
+    )
+}
+
+fn unify_term(term: &Term, value: BoundValue, binding: &Binding) -> Option<Binding> {
+    match term {
+        Term::Atom(atom) if value.as_atom().as_ref() == Some(atom) => Some(binding.clone()),
+        Term::Atom(_) => None,
+        Term::Variable(variable) => unify_variable(variable.as_str(), value, binding),
+    }
+}
+
+fn unify_predicate(
+    term: &PredicateTerm,
+    value: BoundValue,
+    binding: &Binding,
+) -> Option<Binding> {
+    match term {
+        PredicateTerm::Predicate(predicate)
+            if value.as_predicate().as_ref() == Some(predicate) =>
+        {
+            Some(binding.clone())
+        }
+        PredicateTerm::Predicate(_) => None,
+        PredicateTerm::Variable(variable) => {
+            unify_variable(variable.as_str(), value, binding)
+        }
+    }
+}
+
+fn unify_variable(name: &str, value: BoundValue, binding: &Binding) -> Option<Binding> {
+    match binding.get(name) {
+        Some(existing) if existing == &value => Some(binding.clone()),
+        Some(_) => None,
+        None => {
+            let mut extended = binding.clone();
+            extended.insert(name.to_owned(), value);
+            Some(extended)
+        }
+    }
+}
+
 pub struct World {
     id: WorldId,
     version: u64,
@@ -175,6 +515,7 @@ pub struct World {
     record_count: usize,
     eager_kernel: Option<ForthDb>,
     lazy_kernel: OnceLock<Arc<ForthDb>>,
+    vm_query: OnceLock<Arc<VmQueryProjection>>,
     projection_base: Option<ProjectionBase>,
     history: Option<Arc<HistoryNode>>,
 }
@@ -208,6 +549,7 @@ impl World {
             record_count: 0,
             eager_kernel: Some(ForthDb::new()),
             lazy_kernel: OnceLock::new(),
+            vm_query: OnceLock::new(),
             projection_base: None,
             history: None,
         }
@@ -238,32 +580,73 @@ impl World {
     }
 
     pub fn resolve(&self, slot: &SlotId) -> Option<&Fact> {
-        self.kernel().resolve(slot)
+        if self.eager_kernel.is_none() {
+            self.vm_query().resolve(slot)
+        } else {
+            self.kernel().resolve(slot)
+        }
     }
 
     pub fn definitions(&self, slot: &SlotId) -> Vec<&Fact> {
-        self.kernel().definitions(slot)
+        if self.eager_kernel.is_none() {
+            self.vm_query().definitions(slot)
+        } else {
+            self.kernel().definitions(slot)
+        }
     }
 
     pub fn query(&self, patterns: &[Pattern], options: QueryOptions) -> QueryResult {
-        self.kernel().query(patterns, options)
+        if self.eager_kernel.is_none() {
+            self.vm_query().query(patterns, options)
+        } else {
+            self.kernel().query(patterns, options)
+        }
     }
 
     pub fn display_name(&self, entity: EntityId) -> String {
-        self.kernel().display_name(entity)
+        if self.eager_kernel.is_none() {
+            self.resolve(&ForthDb::display_slot(entity))
+                .and_then(|fact| match &fact.object {
+                    Atom::Literal(value) => Some(value.as_str().to_owned()),
+                    Atom::Entity(_) => None,
+                })
+                .unwrap_or_else(|| entity.to_string())
+        } else {
+            self.kernel().display_name(entity)
+        }
     }
 
-    /// Whether the compatibility `ForthDb` query projection has already been
-    /// built. VM-backed publication and recovery do not require it.
+    /// Whether the native query projection has already been built. VM-backed
+    /// publication and recovery do not require it.
     pub fn is_query_projection_materialized(&self) -> bool {
-        self.eager_kernel.is_some()
-            || self.lazy_kernel.get().is_some()
+        self.eager_kernel.is_some() || self.vm_query.get().is_some()
     }
 
-    /// Materialize the legacy query view on demand. This is a compatibility
-    /// boundary, not part of VM publication or durable recovery.
+    /// Materialize the native immutable-root query view on demand. VM-backed
+    /// worlds do not construct the legacy `ForthDb` projection here.
     pub fn materialize_query_projection(&self) {
-        let _ = self.kernel();
+        if self.eager_kernel.is_none() {
+            let _ = self.vm_query();
+        } else {
+            let _ = self.kernel();
+        }
+    }
+
+    /// Whether this world owns an eager or lazily reconstructed legacy kernel.
+    pub fn is_legacy_query_projection_materialized(&self) -> bool {
+        self.eager_kernel.is_some() || self.lazy_kernel.get().is_some()
+    }
+
+    fn vm_query(&self) -> &VmQueryProjection {
+        self.vm_query
+            .get_or_init(|| {
+                let history = self
+                    .history
+                    .as_deref()
+                    .expect("VM-backed worlds always have immutable history");
+                Arc::new(VmQueryProjection::from_history(history))
+            })
+            .as_ref()
     }
 
     pub(crate) fn kernel(&self) -> &ForthDb {
@@ -342,6 +725,7 @@ impl World {
             world.record_count = kernel.record_count();
             world.eager_kernel = None;
             world.lazy_kernel = OnceLock::new();
+            world.vm_query = OnceLock::new();
             let history = Arc::new(HistoryNode {
                 parent: world.history.clone(),
                 frame: frame.clone(),
@@ -390,6 +774,7 @@ impl World {
             record_count,
             eager_kernel: None,
             lazy_kernel: OnceLock::new(),
+            vm_query: OnceLock::new(),
             projection_base,
             history: Some(Arc::new(HistoryNode {
                 parent: base.history.clone(),
@@ -548,6 +933,7 @@ impl CandidateWorld {
             record_count,
             eager_kernel: Some(self.kernel),
             lazy_kernel: OnceLock::new(),
+            vm_query: OnceLock::new(),
             projection_base: None,
             history: Some(Arc::new(HistoryNode {
                 parent: parent_history,
@@ -914,6 +1300,7 @@ impl StableHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forthdb_core::Variable;
 
     fn state_fact(entity: EntityId, value: &str) -> Fact {
         Fact::new(
@@ -921,6 +1308,134 @@ mod tests {
             Predicate::new("state"),
             Atom::Literal(Literal::new(value)),
         )
+    }
+
+    fn variable(name: &str) -> Variable {
+        Variable::new(name).expect("valid test variable")
+    }
+
+    #[test]
+    fn vm_root_queries_match_the_legacy_kernel_without_materializing_it() {
+        let base = Arc::new(World::genesis());
+        let first = EntityId::new(1);
+        let second = EntityId::new(2);
+        let first_kind = Fact::new(
+            Atom::Entity(first),
+            Predicate::new("kind"),
+            Atom::Literal(Literal::new("book")),
+        );
+        let operations = vec![
+            Operation::AllocateEntity { entity: first },
+            Operation::AllocateEntity { entity: second },
+            Operation::Define {
+                slot: SlotId::new("book/1/kind"),
+                fact: first_kind.clone(),
+            },
+            Operation::Define {
+                slot: SlotId::new("book/1/kind/alias"),
+                fact: first_kind.clone(),
+            },
+            Operation::Define {
+                slot: SlotId::new("book/2/kind"),
+                fact: Fact::new(
+                    Atom::Entity(second),
+                    Predicate::new("kind"),
+                    Atom::Literal(Literal::new("book")),
+                ),
+            },
+            Operation::Define {
+                slot: SlotId::new("book/1/location"),
+                fact: Fact::new(
+                    Atom::Entity(first),
+                    Predicate::new("location"),
+                    Atom::Literal(Literal::new("shelf")),
+                ),
+            },
+            Operation::Define {
+                slot: SlotId::new("book/2/location"),
+                fact: Fact::new(
+                    Atom::Entity(second),
+                    Predicate::new("location"),
+                    Atom::Literal(Literal::new("desk")),
+                ),
+            },
+            Operation::Define {
+                slot: SlotId::new("book/2/location"),
+                fact: Fact::new(
+                    Atom::Entity(second),
+                    Predicate::new("location"),
+                    Atom::Literal(Literal::new("archive")),
+                ),
+            },
+            Operation::Forget {
+                slot: SlotId::new("book/2/location"),
+            },
+        ];
+
+        let candidate = CandidateWorld::construct(&base, operations.clone()).expect("eager world");
+        let active_slot_count = candidate.active_slot_count();
+        let record_count = candidate.record_count();
+        let frame = candidate.commit_frame();
+        let eager = Arc::new(candidate.into_world(frame, base.history.clone()));
+        let (vm, _) = World::from_vm_epoch(
+            base,
+            operations,
+            3,
+            active_slot_count,
+            record_count,
+        );
+
+        let s = Term::Variable(variable("s"));
+        let p = PredicateTerm::Variable(variable("p"));
+        let o = Term::Variable(variable("o"));
+        let entity = Term::Atom(Atom::Entity(first));
+        let kind = PredicateTerm::Predicate(Predicate::new("kind"));
+        let book = Term::Atom(Atom::Literal(Literal::new("book")));
+        let patterns = vec![
+            Pattern::new(entity.clone(), p.clone(), o.clone()),
+            Pattern::new(s.clone(), kind.clone(), o.clone()),
+            Pattern::new(s.clone(), p.clone(), book.clone()),
+            Pattern::new(entity.clone(), kind.clone(), o.clone()),
+            Pattern::new(entity.clone(), p.clone(), book.clone()),
+            Pattern::new(s.clone(), kind.clone(), book.clone()),
+            Pattern::new(entity.clone(), kind.clone(), book.clone()),
+        ];
+        let options = QueryOptions {
+            optimize: true,
+            distinct: false,
+            include_provenance: true,
+            limit: None,
+        };
+        for pattern in patterns {
+            assert_eq!(vm.query(&[pattern.clone()], options), eager.query(&[pattern], options));
+        }
+
+        let join = vec![
+            Pattern::new(s.clone(), kind, book),
+            Pattern::new(
+                s.clone(),
+                PredicateTerm::Predicate(Predicate::new("location")),
+                Term::Variable(variable("place")),
+            ),
+            Pattern::new(s.clone(), p, o),
+        ];
+        for optimize in [false, true] {
+            for distinct in [false, true] {
+                let options = QueryOptions {
+                    optimize,
+                    distinct,
+                    include_provenance: true,
+                    limit: Some(3),
+                };
+                assert_eq!(vm.query(&join, options), eager.query(&join, options));
+            }
+        }
+        assert_eq!(
+            vm.definitions(&SlotId::new("book/2/location")),
+            eager.definitions(&SlotId::new("book/2/location"))
+        );
+        assert!(vm.is_query_projection_materialized());
+        assert!(!vm.is_legacy_query_projection_materialized());
     }
 
     #[test]

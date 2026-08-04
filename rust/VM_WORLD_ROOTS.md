@@ -10,29 +10,28 @@ The frame remains the durable and historical compatibility boundary. Tickets,
 snapshot acquisition, recovery checks and count observations use the root
 without constructing the older query kernel.
 
-## Compatibility queries
+## Direct queries
 
 The existing `World` API is retained. Calling `resolve`, `definitions`,
-`display_name` or `query` materializes a `ForthDb` compatibility projection on
-demand. The projection starts from the closest already-materialized ancestor,
-applies the remaining immutable frames once and caches the result in the
-current `World` with `OnceLock`. A successor carries at most one shared pointer
-to the nearest projected base, while history nodes remain plain immutable frame
-links. The authoritative history therefore does not accumulate query kernels
-for every old world.
+`display_name` or `query` on a VM-backed root materializes a native indexed
+projection directly from immutable frames. It preserves visible definition
+stacks and record-ordered buckets for all seven SPO access paths, then caches
+that projection in the current `World` with `OnceLock`. It does not construct a
+`ForthDb` compatibility kernel. See
+[`VM_DIRECT_QUERIES.md`](VM_DIRECT_QUERIES.md).
 
 This deliberately moves work rather than hiding it:
 
 - VM publication and recovery do not pay for a reader representation that may
   never be used.
-- A legacy query pays a one-time projection cost for that immutable root.
+- The first query pays a one-time native projection cost for that immutable root.
 - Later queries reuse the cached projection.
-- A successor can reuse the closest projected ancestor instead of replaying
-  from genesis.
+- A future checkpoint can provide a compact base without changing query
+  semantics.
 
-`World::is_query_projection_materialized()` and
-`World::materialize_query_projection()` make the boundary observable to tests
-and benchmarks.
+`World::is_query_projection_materialized()`,
+`World::is_legacy_query_projection_materialized()` and
+`World::materialize_query_projection()` make both boundaries observable.
 
 ## Semantic invariants
 
@@ -40,13 +39,11 @@ and benchmarks.
 - The VM still evaluates every intent in order and rolls rejected trials back
   to POD frontiers.
 - Accepted intents in one admission epoch observe the same published world.
-- The VM and compatibility projection calculate the same frame and world ID.
+- The VM and direct query projection expose the same facts as the compatibility
+  kernel.
 - Recovery recompiles the durable journal through the VM before publishing its
   final root.
 - Registered host validators retain the eager world-materializer fallback.
 
-This milestone does not yet make the compact SPO/POS/OSP snapshot the complete
-public query engine. It removes eager double execution and measures the actual
-cost of retaining the established query API. Replacing that lazy compatibility
-projection with direct VM-index result materialization remains a separate,
-falsifiable step.
+The projection is still rebuilt from journal-derived history after process
+recovery. Persisted compact checkpoints remain a separate, falsifiable step.

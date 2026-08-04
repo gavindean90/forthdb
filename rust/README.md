@@ -68,6 +68,7 @@ Design and evidence:
 - [`IO_URING_EPOCHS.md`](IO_URING_EPOCHS.md)
 - [`ADMISSION_EPOCH_WORLDS.md`](ADMISSION_EPOCH_WORLDS.md)
 - [`DURABLE_TOKEN_VM.md`](DURABLE_TOKEN_VM.md)
+- [`VM_DIRECT_QUERIES.md`](VM_DIRECT_QUERIES.md)
 - [`FILE_FORMAT.md`](../FILE_FORMAT.md)
 - [`WORLD_CONTRACT.md`](../WORLD_CONTRACT.md)
 
@@ -208,6 +209,7 @@ The opt-in [one-epoch-ahead io_uring experiment](SPECULATIVE_IO_URING.md) overla
 
 The durable token VM publishes immutable semantic roots without eagerly
 replaying accepted operations into the legacy `ForthDb` query kernel. The
-existing `World` query API is preserved through a lazy cached compatibility
-projection, making the remaining translation cost explicit and measurable.
-See [`VM_WORLD_ROOTS.md`](VM_WORLD_ROOTS.md).
+existing `World` query API is preserved through a lazy cached projection built
+directly from immutable VM roots rather than a reconstructed `ForthDb`.
+See [`VM_WORLD_ROOTS.md`](VM_WORLD_ROOTS.md) and
+[`VM_DIRECT_QUERIES.md`](VM_DIRECT_QUERIES.md).
