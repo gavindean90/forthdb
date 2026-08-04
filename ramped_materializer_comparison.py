@@ -58,6 +58,18 @@ def summarize(reports: list[dict], profile: str) -> dict:
                 for sample in selected
             ]
         ),
+        "full_replay_query_ready_us": median(
+            [sample["recovery"]["full_replay_query_ready_us"] for sample in selected]
+        ) if selected[0]["recovery"]["full_replay_query_ready_us"] is not None else None,
+        "mmap_query_ready_us": median(
+            [sample["recovery"]["mmap_query_ready_us"] for sample in selected]
+        ) if selected[0]["recovery"]["mmap_query_ready_us"] is not None else None,
+        "mmap_snapshot_creation_us": median(
+            [sample["recovery"]["mmap_snapshot_creation_us"] for sample in selected]
+        ) if selected[0]["recovery"]["mmap_snapshot_creation_us"] is not None else None,
+        "mmap_snapshot_bytes": median(
+            [sample["recovery"]["mmap_snapshot_bytes"] for sample in selected]
+        ) if selected[0]["recovery"]["mmap_snapshot_bytes"] is not None else None,
         "throughput_samples": [
             sample["intents_per_second"] for sample in selected
         ],
@@ -109,6 +121,9 @@ def main() -> None:
             summarized["vm"][profile]["intents_per_second"]
             / summarized["world"][profile]["intents_per_second"]
         )
+        full = summarized["vm"][profile]["full_replay_query_ready_us"]
+        mapped = summarized["vm"][profile]["mmap_query_ready_us"]
+        result[f"{profile}_mmap_recovery_speedup"] = full / mapped
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))
