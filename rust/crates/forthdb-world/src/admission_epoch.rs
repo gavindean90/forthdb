@@ -1506,16 +1506,55 @@ mod tests {
         );
         let ticket = reopened.submit(next).expect("mapped VM accepts a successor");
         ticket.wait_admitted().expect("successor is durable");
-        match ticket.wait().expect("successor materializes") {
+        let successor_world = match ticket.wait().expect("successor materializes") {
             AdmissionEpochTicketOutcome::Accepted { world, .. } => {
                 assert!(world.resolve(&SlotId::new("live/after-reopen")).is_some());
+                world
             }
             outcome => panic!("unexpected mapped successor outcome: {outcome:?}"),
-        }
+        };
+        let successor_id = successor_world.id();
         reopened.shutdown();
         drop(reopened);
+
+        let stale = AdmissionEpochController::open_vm(&path, 16, 16, 64)
+            .expect("a stale image falls back to the authoritative journal");
+        assert!(!stale.metrics().mmap_snapshot_loaded);
+        assert_eq!(stale.snapshot().id(), successor_id);
+        stale
+            .write_mmap_snapshot()
+            .expect("a replayed world can replace the stale image");
+        stale.shutdown();
+        drop(stale);
+
+        let snapshot_path = MmapVmSnapshot::path_for(&path);
+        let mut snapshot_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&snapshot_path)
+            .unwrap();
+        let middle = snapshot_file.metadata().unwrap().len() / 2;
+        snapshot_file.seek(SeekFrom::Start(middle)).unwrap();
+        let mut byte = [0u8; 1];
+        snapshot_file.read_exact(&mut byte).unwrap();
+        snapshot_file.seek(SeekFrom::Start(middle)).unwrap();
+        byte[0] ^= 0x5a;
+        snapshot_file.write_all(&byte).unwrap();
+        snapshot_file.sync_data().unwrap();
+        drop(snapshot_file);
+
+        let corrupt = AdmissionEpochController::open_vm(&path, 16, 16, 64)
+            .expect("a corrupt image falls back to the authoritative journal");
+        assert!(!corrupt.metrics().mmap_snapshot_loaded);
+        assert_eq!(corrupt.snapshot().id(), successor_id);
+        assert!(corrupt
+            .snapshot()
+            .resolve(&SlotId::new("live/after-reopen"))
+            .is_some());
+        corrupt.shutdown();
+        drop(corrupt);
         fs::remove_file(&path).unwrap();
-        fs::remove_file(MmapVmSnapshot::path_for(&path)).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
         let _ = fs::remove_file(writer_lock_path(&path));
     }
 
