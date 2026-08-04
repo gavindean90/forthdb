@@ -5,7 +5,7 @@ use forthdb_core::{
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -125,6 +125,55 @@ impl CommitStore for MemoryCommitStore {
 struct HistoryNode {
     parent: Option<Arc<HistoryNode>>,
     frame: Arc<CommitFrame>,
+    compatibility_kernel: RwLock<Weak<ForthDb>>,
+}
+
+impl HistoryNode {
+    fn materialize_kernel(&self) -> Arc<ForthDb> {
+        let mut pending = Vec::new();
+        let mut cursor = Some(self);
+        let mut base = None;
+        while let Some(node) = cursor {
+            if let Some(kernel) = node
+                .compatibility_kernel
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .upgrade()
+            {
+                base = Some(kernel);
+                break;
+            }
+            pending.push(node.frame.clone());
+            cursor = node.parent.as_deref();
+        }
+
+        let mut kernel = base
+            .as_deref()
+            .map(Clone::clone)
+            .unwrap_or_else(ForthDb::new);
+        let mut next_entity = 1;
+        if let Some(ancestor) = cursor {
+            next_entity = ancestor.frame.resulting_allocator;
+        }
+        for frame in pending.into_iter().rev() {
+            for operation in frame.operations.iter() {
+                apply_operation(&mut kernel, &mut next_entity, operation)
+                    .expect("published VM operations must materialize deterministically");
+            }
+            debug_assert_eq!(next_entity, frame.resulting_allocator);
+        }
+        Arc::new(kernel)
+    }
+}
+
+fn remember_compatibility_kernel(history: &HistoryNode, kernel: &Arc<ForthDb>) {
+    let mut existing = history
+        .compatibility_kernel
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if existing.upgrade().is_none() {
+        *existing = Arc::downgrade(kernel);
+    }
 }
 
 pub struct World {
@@ -132,7 +181,10 @@ pub struct World {
     version: u64,
     next_entity: u64,
     operation_count: usize,
-    kernel: ForthDb,
+    active_slot_count: usize,
+    record_count: usize,
+    eager_kernel: Option<Arc<ForthDb>>,
+    lazy_kernel: OnceLock<Arc<ForthDb>>,
     history: Option<Arc<HistoryNode>>,
 }
 
@@ -144,8 +196,12 @@ impl fmt::Debug for World {
             .field("version", &self.version)
             .field("next_entity", &self.next_entity)
             .field("operation_count", &self.operation_count)
-            .field("active_slots", &self.kernel.active_slot_count())
-            .field("records", &self.kernel.record_count())
+            .field("active_slots", &self.active_slot_count)
+            .field("records", &self.record_count)
+            .field(
+                "compatibility_materialized",
+                &self.is_query_projection_materialized(),
+            )
             .finish()
     }
 }
@@ -157,7 +213,10 @@ impl World {
             version: 0,
             next_entity: 1,
             operation_count: 0,
-            kernel: ForthDb::new(),
+            active_slot_count: 0,
+            record_count: 0,
+            eager_kernel: Some(Arc::new(ForthDb::new())),
+            lazy_kernel: OnceLock::new(),
             history: None,
         }
     }
@@ -179,27 +238,57 @@ impl World {
     }
 
     pub fn active_slot_count(&self) -> usize {
-        self.kernel.active_slot_count()
+        self.active_slot_count
     }
 
     pub fn record_count(&self) -> usize {
-        self.kernel.record_count()
+        self.record_count
     }
 
     pub fn resolve(&self, slot: &SlotId) -> Option<&Fact> {
-        self.kernel.resolve(slot)
+        self.kernel().resolve(slot)
     }
 
     pub fn definitions(&self, slot: &SlotId) -> Vec<&Fact> {
-        self.kernel.definitions(slot)
+        self.kernel().definitions(slot)
     }
 
     pub fn query(&self, patterns: &[Pattern], options: QueryOptions) -> QueryResult {
-        self.kernel.query(patterns, options)
+        self.kernel().query(patterns, options)
     }
 
     pub fn display_name(&self, entity: EntityId) -> String {
-        self.kernel.display_name(entity)
+        self.kernel().display_name(entity)
+    }
+
+    /// Whether the compatibility `ForthDb` query projection has already been
+    /// built. VM-backed publication and recovery do not require it.
+    pub fn is_query_projection_materialized(&self) -> bool {
+        self.eager_kernel.is_some()
+            || self.lazy_kernel.get().is_some()
+    }
+
+    /// Materialize the legacy query view on demand. This is a compatibility
+    /// boundary, not part of VM publication or durable recovery.
+    pub fn materialize_query_projection(&self) {
+        let _ = self.kernel();
+    }
+
+    pub(crate) fn kernel(&self) -> &ForthDb {
+        if let Some(kernel) = self.eager_kernel.as_deref() {
+            return kernel;
+        }
+        self.lazy_kernel
+            .get_or_init(|| {
+                let history = self
+                    .history
+                    .as_deref()
+                    .expect("only an eager genesis world may omit history");
+                let kernel = history.materialize_kernel();
+                remember_compatibility_kernel(history, &kernel);
+                kernel
+            })
+            .as_ref()
     }
 
     pub fn frames(&self) -> Vec<Arc<CommitFrame>> {
@@ -215,6 +304,7 @@ impl World {
 
     fn reconstruct(frames: &[Arc<CommitFrame>]) -> Result<Self, CandidateError> {
         let mut world = Self::genesis();
+        let mut kernel = ForthDb::new();
         for frame in frames {
             if frame.parent_world != world.id {
                 return Err(CandidateError::HistoryParentMismatch {
@@ -231,7 +321,7 @@ impl World {
 
             let mut next_entity = world.next_entity;
             for operation in frame.operations.iter() {
-                apply_operation(&mut world.kernel, &mut next_entity, operation)?;
+                apply_operation(&mut kernel, &mut next_entity, operation)?;
             }
             if next_entity != frame.resulting_allocator {
                 return Err(CandidateError::AllocatorStateMismatch {
@@ -239,10 +329,7 @@ impl World {
                     actual: next_entity,
                 });
             }
-            world
-                .kernel
-                .validate()
-                .map_err(CandidateError::KernelInvariant)?;
+            kernel.validate().map_err(CandidateError::KernelInvariant)?;
 
             let expected_world = calculate_world_id(
                 frame.parent_world,
@@ -261,12 +348,66 @@ impl World {
             world.version = frame.resulting_version;
             world.next_entity = frame.resulting_allocator;
             world.operation_count += frame.operations.len();
-            world.history = Some(Arc::new(HistoryNode {
+            world.active_slot_count = kernel.active_slot_count();
+            world.record_count = kernel.record_count();
+            world.eager_kernel = None;
+            world.lazy_kernel = OnceLock::new();
+            let history = Arc::new(HistoryNode {
                 parent: world.history.clone(),
                 frame: frame.clone(),
-            }));
+                compatibility_kernel: RwLock::new(Weak::new()),
+            });
+            world.history = Some(history);
         }
+        world.eager_kernel = Some(Arc::new(kernel));
         Ok(world)
+    }
+
+    pub(crate) fn from_vm_epoch(
+        base: Arc<World>,
+        operations: Vec<Operation>,
+        next_entity: u64,
+        active_slot_count: usize,
+        record_count: usize,
+    ) -> (Arc<Self>, Arc<CommitFrame>) {
+        // Record a weak compatibility base when a live predecessor snapshot
+        // already owns one. History never retains every prior ForthDb state.
+        if let Some(history) = &base.history {
+            if let Some(kernel) = base
+                .eager_kernel
+                .as_ref()
+                .or_else(|| base.lazy_kernel.get())
+            {
+                remember_compatibility_kernel(history, kernel);
+            }
+        }
+        let version = base.version + 1;
+        let id = calculate_world_id(base.id, version, next_entity, &operations);
+        let operations: Arc<[Operation]> = Arc::from(operations);
+        let frame = Arc::new(CommitFrame {
+            parent_world: base.id,
+            resulting_world: id,
+            parent_version: base.version,
+            resulting_version: version,
+            resulting_allocator: next_entity,
+            operations: operations.clone(),
+        });
+        let world = Arc::new(Self {
+            id,
+            version,
+            next_entity,
+            operation_count: base.operation_count + operations.len(),
+            active_slot_count,
+            record_count,
+            eager_kernel: None,
+            lazy_kernel: OnceLock::new(),
+            history: Some(Arc::new(HistoryNode {
+                parent: base.history.clone(),
+                frame: frame.clone(),
+                compatibility_kernel: RwLock::new(Weak::new()),
+            })),
+        });
+        (world, frame)
     }
 }
 
@@ -304,7 +445,7 @@ impl CandidateWorld {
             base.version,
             base.next_entity,
             base.operation_count,
-            &base.kernel,
+            base.kernel(),
             operations,
         )
     }
@@ -407,15 +548,21 @@ impl CandidateWorld {
         frame: Arc<CommitFrame>,
         parent_history: Option<Arc<HistoryNode>>,
     ) -> World {
+        let active_slot_count = self.kernel.active_slot_count();
+        let record_count = self.kernel.record_count();
         World {
             id: self.id,
             version: self.version,
             next_entity: self.next_entity,
             operation_count: self.base_operation_count + self.operations.len(),
-            kernel: self.kernel,
+            active_slot_count,
+            record_count,
+            eager_kernel: Some(Arc::new(self.kernel)),
+            lazy_kernel: OnceLock::new(),
             history: Some(Arc::new(HistoryNode {
                 parent: parent_history,
                 frame,
+                compatibility_kernel: RwLock::new(Weak::new()),
             })),
         }
     }

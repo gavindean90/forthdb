@@ -15,23 +15,25 @@ QueuedIntent epoch
     -> io_uring WRITE + DATASYNC
     -> deterministic token compilation
     -> framed VM trial execution and rollback
-    -> one immutable production World query view
+    -> one immutable VM-backed World root
     -> ticket outcomes and reader publication
 ```
 
 The VM owns ordered trial state, temporary allocation, slot visibility,
 `FORGET` unmasking, and predecessor-relative precondition evaluation. Rejected
 intents change neither its arena frontiers nor its allocator. Accepted
-operations are accumulated and applied once to construct the rich production
-`World` for the epoch. Existing query, history, identity, and application APIs
-therefore remain available without maintaining a second public database model.
+operations are accumulated into the canonical epoch frame without immediately
+executing them a second time in the older `ForthDb` kernel. Existing query,
+history, identity, and application APIs remain available through a lazy,
+cached compatibility projection.
 
 ## Recovery
 
 Recovery starts from genesis, rebuilds the token dictionaries in first-seen
 journal order, executes every sound admission epoch through the VM, and
-reconstructs the same world identity, version, frame history, allocator, and
-query projection as live execution. An incomplete journal tail is still
+reconstructs the same world identity, version, frame history, allocator, and VM
+root as live execution. The compatibility query projection is constructed only
+if a recovered reader asks for it. An incomplete journal tail is still
 truncated before replay.
 
 No second outcome log or VM-specific durable format is required. Changing the
@@ -48,11 +50,16 @@ separately; the library workloads assert that they remain entirely on the VM.
 
 ## Reader model
 
-The VM is the semantic trial engine. Published application readers still
-receive `Arc<World>` snapshots, constructed once per accepted epoch, so the
-existing pattern-query and history APIs remain stable. The compact VM snapshot
-reader from Phase 3 remains available as an experimental indexed projection;
-it is not exposed as a second public query API in this integration.
+Published application readers still receive `Arc<World>` snapshots. For VM
+epochs the snapshot is an immutable semantic root over the canonical frame and
+VM frontiers. Identity, counts, tickets and history do not require the legacy
+kernel. The first call to `resolve`, `definitions`, `display_name` or `query`
+builds the compatibility projection from the closest cached ancestor and
+caches it on the immutable history node. See [`VM_WORLD_ROOTS.md`](VM_WORLD_ROOTS.md).
+
+The compact VM snapshot reader from Phase 3 remains an experimental indexed
+projection. Directly returning complete public query rows from those indexes is
+the next reader-specific experiment, not part of this compatibility milestone.
 
 ## Evidence
 

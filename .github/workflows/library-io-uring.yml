@@ -121,6 +121,14 @@ jobs:
                   f"VM materialized epochs: `{control['vm_materialized_epochs']}`; "
                   f"world-materializer fallbacks: `{control['world_materialized_epochs']}`.\n"
               )
+              handle.write(
+                  f"Final query projection deferred: "
+                  f"`{data['final_query_projection_was_deferred']}`; projection cost: "
+                  f"`{data['final_query_projection_elapsed_us'] / 1000:.2f} ms`. "
+                  f"Recovery open: `{recovery['open_elapsed_us'] / 1000:.2f} ms`; "
+                  f"recovery query projection: "
+                  f"`{recovery['query_projection_elapsed_us'] / 1000:.2f} ms`.\n"
+              )
               world_report = report.parent / "library-world-report.json"
               if world_report.exists():
                   baseline = json.loads(world_report.read_text())
@@ -164,6 +172,20 @@ jobs:
                       f"`{scaled['branch_rush_throughput_ratio']:.2f}x`; sync reduction: "
                       f"`{scaled['branch_rush_sync_reduction_percent']:.1f}%`; exact semantic "
                       f"projection: `{scaled['semantic_projection_equal']}`.\n"
+                  )
+                  handle.write(
+                      f"\nDeferred compatibility projection: interactive "
+                      f"`{interactive['query_projection_was_deferred']}` / "
+                      f"`{interactive['query_projection_elapsed_us'] / 1000:.2f} ms`; "
+                      f"branch rush `{rush['query_projection_was_deferred']}` / "
+                      f"`{rush['query_projection_elapsed_us'] / 1000:.2f} ms`.\n"
+                  )
+                  handle.write(
+                      f"Recovery open/projection: interactive "
+                      f"`{interactive['recovery']['open_elapsed_us'] / 1000:.2f}` / "
+                      f"`{interactive['recovery']['query_projection_elapsed_us'] / 1000:.2f} ms`; "
+                      f"branch rush `{rush['recovery']['open_elapsed_us'] / 1000:.2f}` / "
+                      f"`{rush['recovery']['query_projection_elapsed_us'] / 1000:.2f} ms`.\n"
                   )
                   ramped_world = report.parent / "ramped-library-world.json"
                   if ramped_world.exists():

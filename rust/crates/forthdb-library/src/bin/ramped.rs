@@ -42,7 +42,7 @@ mod linux {
 
         fn label(self) -> &'static str {
             match self {
-                Self::TokenVm => "io_uring_admission_journal_token_vm",
+                Self::TokenVm => "io_uring_admission_journal_vm_root",
                 Self::World => "io_uring_admission_journal_epoch_worlds",
             }
         }
@@ -150,6 +150,8 @@ mod linux {
     #[derive(Serialize)]
     struct RecoveryObservation {
         elapsed_us: u128,
+        open_elapsed_us: u128,
+        query_projection_elapsed_us: u128,
         same_world: bool,
         same_version: bool,
         same_active_slots: bool,
@@ -163,6 +165,8 @@ mod linux {
         epoch_width: usize,
         setup_elapsed_us: u128,
         workload_elapsed_us: u128,
+        query_projection_was_deferred: bool,
+        query_projection_elapsed_us: u128,
         intents_per_second: f64,
         admission_latency: LatencySummary,
         semantic_latency: LatencySummary,
@@ -296,6 +300,10 @@ mod linux {
         }
 
         let world = controller.snapshot();
+        let query_projection_was_deferred = !world.is_query_projection_materialized();
+        let projection_started = Instant::now();
+        world.materialize_query_projection();
+        let query_projection_elapsed = projection_started.elapsed();
         let live_projection = projection(&world)?;
         if live_projection.checked_out_copies != 0
             || live_projection.active_holds != scale.circulation_cycles
@@ -316,10 +324,16 @@ mod linux {
 
         let recovery_started = Instant::now();
         let recovered = materializer.open(path, capacity)?;
+        let recovery_open_elapsed = recovery_started.elapsed();
         let recovered_world = recovered.snapshot();
+        let recovered_projection_started = Instant::now();
+        recovered_world.materialize_query_projection();
+        let recovered_projection_elapsed = recovered_projection_started.elapsed();
         let recovered_projection = projection(&recovered_world)?;
         let recovery = RecoveryObservation {
             elapsed_us: recovery_started.elapsed().as_micros(),
+            open_elapsed_us: recovery_open_elapsed.as_micros(),
+            query_projection_elapsed_us: recovered_projection_elapsed.as_micros(),
             same_world: recovered_world.id() == expected_world,
             same_version: recovered_world.version() == expected_version,
             same_active_slots: recovered_world.active_slot_count() == expected_slots,
@@ -343,6 +357,8 @@ mod linux {
             epoch_width,
             setup_elapsed_us: setup_elapsed.as_micros(),
             workload_elapsed_us: workload_elapsed.as_micros(),
+            query_projection_was_deferred,
+            query_projection_elapsed_us: query_projection_elapsed.as_micros(),
             intents_per_second: intent_count / workload_elapsed.as_secs_f64(),
             admission_latency: summarize_latencies(admission_latencies),
             semantic_latency: summarize_latencies(semantic_latencies),
