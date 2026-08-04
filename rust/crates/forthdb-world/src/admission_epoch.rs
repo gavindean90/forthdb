@@ -1382,6 +1382,7 @@ mod tests {
         };
         assert_eq!(first_world.id(), second_world.id());
         assert_eq!(first_world.version(), 1);
+        assert!(!first_world.is_query_projection_materialized());
         assert_eq!(controller.metrics().vm_materialized_epochs, 1);
         assert_eq!(controller.metrics().world_materialized_epochs, 0);
         let expected = first_world.id();
@@ -1391,6 +1392,7 @@ mod tests {
         let reopened = AdmissionEpochController::open_vm(&path, 16, 16, 64)
             .expect("durable admission journal reopens");
         assert_eq!(reopened.snapshot().id(), expected);
+        assert!(!reopened.snapshot().is_query_projection_materialized());
         reopened.shutdown();
         drop(reopened);
         fs::remove_file(&path).unwrap();

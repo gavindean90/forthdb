@@ -203,3 +203,11 @@ The existing world, file, mmap, conformance, recovery, canonical-byte, and specu
 The engine does not yet implement dwell-time batching, adaptive batch policy, multiple durability epochs in flight, a dedicated completion reactor, registered io_uring resources, checkpoints, compaction, true power-loss fault injection, worker restart, or cross-process writer coordination.
 
 The opt-in [one-epoch-ahead io_uring experiment](SPECULATIVE_IO_URING.md) overlaps private preparation with durability while leaving ordinary per-epoch durability as the default and control.
+
+## VM-backed world roots
+
+The durable token VM publishes immutable semantic roots without eagerly
+replaying accepted operations into the legacy `ForthDb` query kernel. The
+existing `World` query API is preserved through a lazy cached compatibility
+projection, making the remaining translation cost explicit and measurable.
+See [`VM_WORLD_ROOTS.md`](VM_WORLD_ROOTS.md).

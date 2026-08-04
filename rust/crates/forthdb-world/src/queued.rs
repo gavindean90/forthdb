@@ -711,10 +711,17 @@ impl VmEpochMaterializer {
             });
         }
 
-        let candidate = CandidateWorld::construct(base.as_ref(), accepted_operations)
-            .map_err(|error| format!("VM projection could not build published world: {error}"))?;
-        let frame = candidate.commit_frame();
-        let world = Arc::new(candidate.into_world(frame.clone(), base.history.clone()));
+        // The token workspace is the authoritative semantic state. Publish a
+        // lightweight immutable world root over its accepted frontiers; the
+        // legacy ForthDb query kernel is materialized lazily only if a reader
+        // actually invokes the compatibility query surface.
+        let (world, frame) = World::from_vm_epoch(
+            base.clone(),
+            accepted_operations,
+            self.workspace.next_entity(),
+            self.workspace.active_slot_count(),
+            self.workspace.delta_count(),
+        );
         let outcomes = outcomes
             .into_iter()
             .map(|outcome| match outcome {
@@ -940,7 +947,7 @@ pub fn derive_epoch_world(
     let mut predecessor_version = base.version;
     let mut next_entity = base.next_entity;
     let mut operation_count = base.operation_count;
-    let mut kernel = base.kernel.clone();
+    let mut kernel = base.kernel().clone();
     let mut operations = Vec::new();
     let mut accepted_count = 0usize;
     let mut workspace_outcomes = Vec::with_capacity(intents.len());
@@ -1952,6 +1959,20 @@ mod tests {
                 expected.tail().next_entity(),
                 "epoch {epoch}"
             );
+            assert_eq!(
+                actual.tail().active_slot_count(),
+                expected.tail().active_slot_count(),
+                "epoch {epoch}"
+            );
+            assert_eq!(
+                actual.tail().record_count(),
+                expected.tail().record_count(),
+                "epoch {epoch}"
+            );
+            assert!(
+                !actual.tail().is_query_projection_materialized(),
+                "VM epoch {epoch} projected the compatibility kernel eagerly"
+            );
             for (actual, expected) in actual.outcomes().iter().zip(expected.outcomes()) {
                 assert_eq!(actual.accepted().is_some(), expected.accepted().is_some());
                 if let (Some(actual), Some(expected)) = (actual.accepted(), expected.accepted()) {
@@ -1961,6 +1982,10 @@ mod tests {
             reference_world = expected.tail();
             vm_world = actual.tail();
         }
+
+        let final_slot = SlotId::new("vm/dependent/63");
+        assert_eq!(vm_world.resolve(&final_slot), reference_world.resolve(&final_slot));
+        assert!(vm_world.is_query_projection_materialized());
     }
 
     #[test]

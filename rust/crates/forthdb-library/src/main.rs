@@ -45,7 +45,7 @@ mod linux {
 
         fn label(self) -> &'static str {
             match self {
-                Self::TokenVm => "io_uring_admission_journal_token_vm",
+                Self::TokenVm => "io_uring_admission_journal_vm_root",
                 Self::World => "io_uring_admission_journal_epoch_worlds",
             }
         }
@@ -72,6 +72,8 @@ mod linux {
         engine: &'static str,
         database_path: String,
         elapsed_us: u128,
+        final_query_projection_was_deferred: bool,
+        final_query_projection_elapsed_us: u128,
         world_version: u64,
         world_id: String,
         frame_count: usize,
@@ -91,6 +93,9 @@ mod linux {
 
     #[derive(Serialize)]
     struct Recovery {
+        open_elapsed_us: u128,
+        query_projection_was_deferred: bool,
+        query_projection_elapsed_us: u128,
         same_world: bool,
         same_version: bool,
         same_frame_count: bool,
@@ -342,6 +347,11 @@ mod linux {
             Term::Atom(Atom::Entity(resolve_symbol(&renamed_world, "Alice")?)),
         );
         let new_compiled_after_symbol_rebind = query(&renamed_world, &[newly_compiled_alice]);
+        let final_query_projection_was_deferred =
+            !final_world.is_query_projection_materialized();
+        let final_projection_started = Instant::now();
+        final_world.materialize_query_projection();
+        let final_query_projection_elapsed = final_projection_started.elapsed();
         let after_return = query(
             &final_world,
             &[pattern_entity_variable(copy_42, "borrowed_by", "patron")?],
@@ -355,10 +365,20 @@ mod linux {
         controller.shutdown();
         drop(controller);
 
+        let recovery_started = Instant::now();
         let recovered = materializer.open(path)?;
+        let recovery_open_elapsed = recovery_started.elapsed();
         let recovered_world = recovered.snapshot();
+        let recovery_query_projection_was_deferred =
+            !recovered_world.is_query_projection_materialized();
+        let recovery_projection_started = Instant::now();
+        recovered_world.materialize_query_projection();
+        let recovery_query_projection_elapsed = recovery_projection_started.elapsed();
         let recovered_locations = query(&recovered_world, &copies_and_shelves);
         let recovery = Recovery {
+            open_elapsed_us: recovery_open_elapsed.as_micros(),
+            query_projection_was_deferred: recovery_query_projection_was_deferred,
+            query_projection_elapsed_us: recovery_query_projection_elapsed.as_micros(),
             same_world: recovered_world.id() == expected_world,
             same_version: recovered_world.version() == expected_version,
             same_frame_count: recovered_world.frames().len() == expected_frames,
@@ -386,6 +406,8 @@ mod linux {
             engine: materializer.label(),
             database_path: path.display().to_string(),
             elapsed_us: started.elapsed().as_micros(),
+            final_query_projection_was_deferred,
+            final_query_projection_elapsed_us: final_query_projection_elapsed.as_micros(),
             world_version: recovered_world.version(),
             world_id: recovered_world.id().to_string(),
             frame_count: recovered_world.frames().len(),

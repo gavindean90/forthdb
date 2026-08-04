@@ -5,7 +5,7 @@ use forthdb_core::{
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -127,12 +127,55 @@ struct HistoryNode {
     frame: Arc<CommitFrame>,
 }
 
+impl HistoryNode {
+    fn materialize_kernel(&self, projected: Option<&ProjectionBase>) -> Arc<ForthDb> {
+        let projected = projected.map(|base| {
+            (base.kernel.clone(), base.version, base.next_entity)
+        });
+        let projected_version = projected
+            .as_ref()
+            .map_or(0, |(_, version, _)| *version);
+        let mut pending = Vec::new();
+        let mut cursor = Some(self);
+        while let Some(node) = cursor {
+            if node.frame.resulting_version <= projected_version {
+                break;
+            }
+            pending.push(node.frame.clone());
+            cursor = node.parent.as_deref();
+        }
+
+        let (mut kernel, mut next_entity) = projected
+            .map(|(kernel, _, next_entity)| (kernel.as_ref().clone(), next_entity))
+            .unwrap_or_else(|| (ForthDb::new(), 1));
+        for frame in pending.into_iter().rev() {
+            for operation in frame.operations.iter() {
+                apply_operation(&mut kernel, &mut next_entity, operation)
+                    .expect("published VM operations must materialize deterministically");
+            }
+            debug_assert_eq!(next_entity, frame.resulting_allocator);
+        }
+        Arc::new(kernel)
+    }
+}
+
+#[derive(Clone)]
+struct ProjectionBase {
+    kernel: Arc<ForthDb>,
+    version: u64,
+    next_entity: u64,
+}
+
 pub struct World {
     id: WorldId,
     version: u64,
     next_entity: u64,
     operation_count: usize,
-    kernel: ForthDb,
+    active_slot_count: usize,
+    record_count: usize,
+    eager_kernel: Option<ForthDb>,
+    lazy_kernel: OnceLock<Arc<ForthDb>>,
+    projection_base: Option<ProjectionBase>,
     history: Option<Arc<HistoryNode>>,
 }
 
@@ -144,8 +187,12 @@ impl fmt::Debug for World {
             .field("version", &self.version)
             .field("next_entity", &self.next_entity)
             .field("operation_count", &self.operation_count)
-            .field("active_slots", &self.kernel.active_slot_count())
-            .field("records", &self.kernel.record_count())
+            .field("active_slots", &self.active_slot_count)
+            .field("records", &self.record_count)
+            .field(
+                "compatibility_materialized",
+                &self.is_query_projection_materialized(),
+            )
             .finish()
     }
 }
@@ -157,7 +204,11 @@ impl World {
             version: 0,
             next_entity: 1,
             operation_count: 0,
-            kernel: ForthDb::new(),
+            active_slot_count: 0,
+            record_count: 0,
+            eager_kernel: Some(ForthDb::new()),
+            lazy_kernel: OnceLock::new(),
+            projection_base: None,
             history: None,
         }
     }
@@ -179,27 +230,55 @@ impl World {
     }
 
     pub fn active_slot_count(&self) -> usize {
-        self.kernel.active_slot_count()
+        self.active_slot_count
     }
 
     pub fn record_count(&self) -> usize {
-        self.kernel.record_count()
+        self.record_count
     }
 
     pub fn resolve(&self, slot: &SlotId) -> Option<&Fact> {
-        self.kernel.resolve(slot)
+        self.kernel().resolve(slot)
     }
 
     pub fn definitions(&self, slot: &SlotId) -> Vec<&Fact> {
-        self.kernel.definitions(slot)
+        self.kernel().definitions(slot)
     }
 
     pub fn query(&self, patterns: &[Pattern], options: QueryOptions) -> QueryResult {
-        self.kernel.query(patterns, options)
+        self.kernel().query(patterns, options)
     }
 
     pub fn display_name(&self, entity: EntityId) -> String {
-        self.kernel.display_name(entity)
+        self.kernel().display_name(entity)
+    }
+
+    /// Whether the compatibility `ForthDb` query projection has already been
+    /// built. VM-backed publication and recovery do not require it.
+    pub fn is_query_projection_materialized(&self) -> bool {
+        self.eager_kernel.is_some()
+            || self.lazy_kernel.get().is_some()
+    }
+
+    /// Materialize the legacy query view on demand. This is a compatibility
+    /// boundary, not part of VM publication or durable recovery.
+    pub fn materialize_query_projection(&self) {
+        let _ = self.kernel();
+    }
+
+    pub(crate) fn kernel(&self) -> &ForthDb {
+        if let Some(kernel) = self.eager_kernel.as_ref() {
+            return kernel;
+        }
+        self.lazy_kernel
+            .get_or_init(|| {
+                let history = self
+                    .history
+                    .as_deref()
+                    .expect("only an eager genesis world may omit history");
+                history.materialize_kernel(self.projection_base.as_ref())
+            })
+            .as_ref()
     }
 
     pub fn frames(&self) -> Vec<Arc<CommitFrame>> {
@@ -215,6 +294,7 @@ impl World {
 
     fn reconstruct(frames: &[Arc<CommitFrame>]) -> Result<Self, CandidateError> {
         let mut world = Self::genesis();
+        let mut kernel = ForthDb::new();
         for frame in frames {
             if frame.parent_world != world.id {
                 return Err(CandidateError::HistoryParentMismatch {
@@ -231,7 +311,7 @@ impl World {
 
             let mut next_entity = world.next_entity;
             for operation in frame.operations.iter() {
-                apply_operation(&mut world.kernel, &mut next_entity, operation)?;
+                apply_operation(&mut kernel, &mut next_entity, operation)?;
             }
             if next_entity != frame.resulting_allocator {
                 return Err(CandidateError::AllocatorStateMismatch {
@@ -239,10 +319,7 @@ impl World {
                     actual: next_entity,
                 });
             }
-            world
-                .kernel
-                .validate()
-                .map_err(CandidateError::KernelInvariant)?;
+            kernel.validate().map_err(CandidateError::KernelInvariant)?;
 
             let expected_world = calculate_world_id(
                 frame.parent_world,
@@ -261,12 +338,65 @@ impl World {
             world.version = frame.resulting_version;
             world.next_entity = frame.resulting_allocator;
             world.operation_count += frame.operations.len();
-            world.history = Some(Arc::new(HistoryNode {
+            world.active_slot_count = kernel.active_slot_count();
+            world.record_count = kernel.record_count();
+            world.eager_kernel = None;
+            world.lazy_kernel = OnceLock::new();
+            let history = Arc::new(HistoryNode {
                 parent: world.history.clone(),
                 frame: frame.clone(),
-            }));
+            });
+            world.history = Some(history);
         }
+        world.eager_kernel = Some(kernel);
         Ok(world)
+    }
+
+    pub(crate) fn from_vm_epoch(
+        base: Arc<World>,
+        operations: Vec<Operation>,
+        next_entity: u64,
+        active_slot_count: usize,
+        record_count: usize,
+    ) -> (Arc<Self>, Arc<CommitFrame>) {
+        let projection_base = base
+            .lazy_kernel
+            .get()
+            .cloned()
+            .or_else(|| base.eager_kernel.as_ref().map(|kernel| Arc::new(kernel.clone())))
+            .map(|kernel| ProjectionBase {
+                kernel,
+                version: base.version,
+                next_entity: base.next_entity,
+            })
+            .or_else(|| base.projection_base.clone());
+        let version = base.version + 1;
+        let id = calculate_world_id(base.id, version, next_entity, &operations);
+        let operations: Arc<[Operation]> = Arc::from(operations);
+        let frame = Arc::new(CommitFrame {
+            parent_world: base.id,
+            resulting_world: id,
+            parent_version: base.version,
+            resulting_version: version,
+            resulting_allocator: next_entity,
+            operations: operations.clone(),
+        });
+        let world = Arc::new(Self {
+            id,
+            version,
+            next_entity,
+            operation_count: base.operation_count + operations.len(),
+            active_slot_count,
+            record_count,
+            eager_kernel: None,
+            lazy_kernel: OnceLock::new(),
+            projection_base,
+            history: Some(Arc::new(HistoryNode {
+                parent: base.history.clone(),
+                frame: frame.clone(),
+            })),
+        });
+        (world, frame)
     }
 }
 
@@ -304,7 +434,7 @@ impl CandidateWorld {
             base.version,
             base.next_entity,
             base.operation_count,
-            &base.kernel,
+            base.kernel(),
             operations,
         )
     }
@@ -407,12 +537,18 @@ impl CandidateWorld {
         frame: Arc<CommitFrame>,
         parent_history: Option<Arc<HistoryNode>>,
     ) -> World {
+        let active_slot_count = self.kernel.active_slot_count();
+        let record_count = self.kernel.record_count();
         World {
             id: self.id,
             version: self.version,
             next_entity: self.next_entity,
             operation_count: self.base_operation_count + self.operations.len(),
-            kernel: self.kernel,
+            active_slot_count,
+            record_count,
+            eager_kernel: Some(self.kernel),
+            lazy_kernel: OnceLock::new(),
+            projection_base: None,
             history: Some(Arc::new(HistoryNode {
                 parent: parent_history,
                 frame,
