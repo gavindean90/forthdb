@@ -152,6 +152,7 @@ mod linux {
         elapsed_us: u128,
         open_elapsed_us: u128,
         query_projection_elapsed_us: u128,
+        legacy_query_projection_materialized: bool,
         same_world: bool,
         same_version: bool,
         same_active_slots: bool,
@@ -167,6 +168,7 @@ mod linux {
         workload_elapsed_us: u128,
         query_projection_was_deferred: bool,
         query_projection_elapsed_us: u128,
+        legacy_query_projection_materialized: bool,
         intents_per_second: f64,
         admission_latency: LatencySummary,
         semantic_latency: LatencySummary,
@@ -334,6 +336,8 @@ mod linux {
             elapsed_us: recovery_started.elapsed().as_micros(),
             open_elapsed_us: recovery_open_elapsed.as_micros(),
             query_projection_elapsed_us: recovered_projection_elapsed.as_micros(),
+            legacy_query_projection_materialized: recovered_world
+                .is_legacy_query_projection_materialized(),
             same_world: recovered_world.id() == expected_world,
             same_version: recovered_world.version() == expected_version,
             same_active_slots: recovered_world.active_slot_count() == expected_slots,
@@ -359,6 +363,8 @@ mod linux {
             workload_elapsed_us: workload_elapsed.as_micros(),
             query_projection_was_deferred,
             query_projection_elapsed_us: query_projection_elapsed.as_micros(),
+            legacy_query_projection_materialized: world
+                .is_legacy_query_projection_materialized(),
             intents_per_second: intent_count / workload_elapsed.as_secs_f64(),
             admission_latency: summarize_latencies(admission_latencies),
             semantic_latency: summarize_latencies(semantic_latencies),

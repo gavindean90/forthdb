@@ -74,6 +74,7 @@ mod linux {
         elapsed_us: u128,
         final_query_projection_was_deferred: bool,
         final_query_projection_elapsed_us: u128,
+        final_legacy_query_projection_materialized: bool,
         world_version: u64,
         world_id: String,
         frame_count: usize,
@@ -96,6 +97,7 @@ mod linux {
         open_elapsed_us: u128,
         query_projection_was_deferred: bool,
         query_projection_elapsed_us: u128,
+        legacy_query_projection_materialized: bool,
         same_world: bool,
         same_version: bool,
         same_frame_count: bool,
@@ -379,6 +381,8 @@ mod linux {
             open_elapsed_us: recovery_open_elapsed.as_micros(),
             query_projection_was_deferred: recovery_query_projection_was_deferred,
             query_projection_elapsed_us: recovery_query_projection_elapsed.as_micros(),
+            legacy_query_projection_materialized: recovered_world
+                .is_legacy_query_projection_materialized(),
             same_world: recovered_world.id() == expected_world,
             same_version: recovered_world.version() == expected_version,
             same_frame_count: recovered_world.frames().len() == expected_frames,
@@ -408,6 +412,8 @@ mod linux {
             elapsed_us: started.elapsed().as_micros(),
             final_query_projection_was_deferred,
             final_query_projection_elapsed_us: final_query_projection_elapsed.as_micros(),
+            final_legacy_query_projection_materialized: final_world
+                .is_legacy_query_projection_materialized(),
             world_version: recovered_world.version(),
             world_id: recovered_world.id().to_string(),
             frame_count: recovered_world.frames().len(),

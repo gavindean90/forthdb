@@ -25,14 +25,14 @@ intents change neither its arena frontiers nor its allocator. Accepted
 operations are accumulated into the canonical epoch frame without immediately
 executing them a second time in the older `ForthDb` kernel. Existing query,
 history, identity, and application APIs remain available through a lazy,
-cached compatibility projection.
+cached native query projection.
 
 ## Recovery
 
 Recovery starts from genesis, rebuilds the token dictionaries in first-seen
 journal order, executes every sound admission epoch through the VM, and
 reconstructs the same world identity, version, frame history, allocator, and VM
-root as live execution. The compatibility query projection is constructed only
+root as live execution. The native query projection is constructed only
 if a recovered reader asks for it. An incomplete journal tail is still
 truncated before replay.
 
@@ -54,12 +54,13 @@ Published application readers still receive `Arc<World>` snapshots. For VM
 epochs the snapshot is an immutable semantic root over the canonical frame and
 VM frontiers. Identity, counts, tickets and history do not require the legacy
 kernel. The first call to `resolve`, `definitions`, `display_name` or `query`
-builds the compatibility projection from the closest cached ancestor and
-caches it on the immutable history node. See [`VM_WORLD_ROOTS.md`](VM_WORLD_ROOTS.md).
+builds record-ordered indexes directly from immutable history and caches them
+on the queried root. See [`VM_WORLD_ROOTS.md`](VM_WORLD_ROOTS.md) and
+[`VM_DIRECT_QUERIES.md`](VM_DIRECT_QUERIES.md).
 
-The compact VM snapshot reader from Phase 3 remains an experimental indexed
-projection. Directly returning complete public query rows from those indexes is
-the next reader-specific experiment, not part of this compatibility milestone.
+The query projection is still rebuilt after process recovery. Persisting a
+compact projection checkpoint is the next recovery-specific experiment, not
+part of this query milestone.
 
 ## Evidence
 

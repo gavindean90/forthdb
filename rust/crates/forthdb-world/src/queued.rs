@@ -1986,6 +1986,7 @@ mod tests {
         let final_slot = SlotId::new("vm/dependent/63");
         assert_eq!(vm_world.resolve(&final_slot), reference_world.resolve(&final_slot));
         assert!(vm_world.is_query_projection_materialized());
+        assert!(!vm_world.is_legacy_query_projection_materialized());
     }
 
     #[test]
