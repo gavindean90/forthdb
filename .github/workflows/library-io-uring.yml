@@ -71,6 +71,13 @@ jobs:
             --bin ramped \
             -- "$RUNNER_TEMP/forthdb-library-artifacts/ramped-world"
 
+      - name: Compare materializers in alternating order
+        run: |
+          python ramped_materializer_comparison.py \
+            --binary "$CARGO_TARGET_DIR/release/ramped" \
+            --rounds 4 \
+            --output "$RUNNER_TEMP/forthdb-library-artifacts/ramped-materializer-comparison.json"
+
       - name: Measure bounded admission versus publication
         run: |
           FORTHDB_ADMISSION_WINDOW_REPORT="$RUNNER_TEMP/forthdb-library-artifacts/admission-window.json" \
@@ -195,6 +202,16 @@ jobs:
                           f"`{interactive['intents_per_second'] / baseline['interactive']['intents_per_second']:.2f}x`; "
                           f"branch rush "
                           f"`{rush['intents_per_second'] / baseline['branch_rush']['intents_per_second']:.2f}x`.\n"
+                      )
+                  repeated = report.parent / "ramped-materializer-comparison.json"
+                  if repeated.exists():
+                      comparison = json.loads(repeated.read_text())
+                      handle.write(
+                          f"\nAlternating-order `{comparison['rounds']}`-round medians: "
+                          f"interactive VM/world "
+                          f"`{comparison['interactive_vm_to_world_ratio']:.2f}x`; "
+                          f"branch rush "
+                          f"`{comparison['branch_rush_vm_to_world_ratio']:.2f}x`.\n"
                       )
               windowed = report.parent / "admission-window.json"
               if windowed.exists():
