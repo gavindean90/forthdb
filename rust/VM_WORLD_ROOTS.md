@@ -16,10 +16,10 @@ The existing `World` API is retained. Calling `resolve`, `definitions`,
 `display_name` or `query` materializes a `ForthDb` compatibility projection on
 demand. The projection starts from the closest already-materialized ancestor,
 applies the remaining immutable frames once and caches the result in the
-current `World` with `OnceLock`. A successor may carry a weak pointer to the
-nearest live projected base, while history nodes remain plain immutable frame
-links. The authoritative history therefore does not pin old query kernels in
-memory.
+current `World` with `OnceLock`. A successor carries at most one shared pointer
+to the nearest projected base, while history nodes remain plain immutable frame
+links. The authoritative history therefore does not accumulate query kernels
+for every old world.
 
 This deliberately moves work rather than hiding it:
 

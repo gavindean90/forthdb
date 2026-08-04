@@ -5,7 +5,7 @@ use forthdb_core::{
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -129,10 +129,8 @@ struct HistoryNode {
 
 impl HistoryNode {
     fn materialize_kernel(&self, projected: Option<&ProjectionBase>) -> Arc<ForthDb> {
-        let projected = projected.and_then(|base| {
-            base.kernel
-                .upgrade()
-                .map(|kernel| (kernel, base.version, base.next_entity))
+        let projected = projected.map(|base| {
+            (base.kernel.clone(), base.version, base.next_entity)
         });
         let projected_version = projected
             .as_ref()
@@ -163,7 +161,7 @@ impl HistoryNode {
 
 #[derive(Clone)]
 struct ProjectionBase {
-    kernel: Weak<ForthDb>,
+    kernel: Arc<ForthDb>,
     version: u64,
     next_entity: u64,
 }
@@ -175,7 +173,7 @@ pub struct World {
     operation_count: usize,
     active_slot_count: usize,
     record_count: usize,
-    eager_kernel: Option<Arc<ForthDb>>,
+    eager_kernel: Option<ForthDb>,
     lazy_kernel: OnceLock<Arc<ForthDb>>,
     projection_base: Option<ProjectionBase>,
     history: Option<Arc<HistoryNode>>,
@@ -208,7 +206,7 @@ impl World {
             operation_count: 0,
             active_slot_count: 0,
             record_count: 0,
-            eager_kernel: Some(Arc::new(ForthDb::new())),
+            eager_kernel: Some(ForthDb::new()),
             lazy_kernel: OnceLock::new(),
             projection_base: None,
             history: None,
@@ -269,7 +267,7 @@ impl World {
     }
 
     pub(crate) fn kernel(&self) -> &ForthDb {
-        if let Some(kernel) = self.eager_kernel.as_deref() {
+        if let Some(kernel) = self.eager_kernel.as_ref() {
             return kernel;
         }
         self.lazy_kernel
@@ -350,7 +348,7 @@ impl World {
             });
             world.history = Some(history);
         }
-        world.eager_kernel = Some(Arc::new(kernel));
+        world.eager_kernel = Some(kernel);
         Ok(world)
     }
 
@@ -362,11 +360,12 @@ impl World {
         record_count: usize,
     ) -> (Arc<Self>, Arc<CommitFrame>) {
         let projection_base = base
-            .eager_kernel
-            .as_ref()
-            .or_else(|| base.lazy_kernel.get())
+            .lazy_kernel
+            .get()
+            .cloned()
+            .or_else(|| base.eager_kernel.as_ref().map(|kernel| Arc::new(kernel.clone())))
             .map(|kernel| ProjectionBase {
-                kernel: Arc::downgrade(kernel),
+                kernel,
                 version: base.version,
                 next_entity: base.next_entity,
             })
@@ -547,7 +546,7 @@ impl CandidateWorld {
             operation_count: self.base_operation_count + self.operations.len(),
             active_slot_count,
             record_count,
-            eager_kernel: Some(Arc::new(self.kernel)),
+            eager_kernel: Some(self.kernel),
             lazy_kernel: OnceLock::new(),
             projection_base: None,
             history: Some(Arc::new(HistoryNode {
