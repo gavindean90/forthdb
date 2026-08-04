@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-const NONE: u32 = u32::MAX;
+pub(crate) const NONE: u32 = u32::MAX;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -142,13 +142,13 @@ pub enum RecordKind {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FactRecord {
-    kind: RecordKind,
-    slot: SlotToken,
-    subject: Cell,
-    predicate: Cell,
-    object: Cell,
-    previous_visible: u32,
-    resulting_visible: u32,
+    pub(crate) kind: RecordKind,
+    pub(crate) slot: SlotToken,
+    pub(crate) subject: Cell,
+    pub(crate) predicate: Cell,
+    pub(crate) object: Cell,
+    pub(crate) previous_visible: u32,
+    pub(crate) resulting_visible: u32,
 }
 
 #[repr(C)]
@@ -411,6 +411,7 @@ pub struct Workspace {
     version: u64,
     semantic_hash: u64,
     track_indexes: bool,
+    historical_delta_offset: usize,
 }
 
 impl Workspace {
@@ -487,7 +488,57 @@ impl Workspace {
             version: 0,
             semantic_hash: 0xcbf2_9ce4_8422_2325,
             track_indexes,
+            historical_delta_offset: 0,
         }
+    }
+
+    pub(crate) fn from_physical_snapshot(
+        next_entity: u64,
+        records: Vec<FactRecord>,
+        accepted_heads: Vec<u32>,
+        total_record_count: usize,
+    ) -> Result<Self, String> {
+        if total_record_count < records.len() {
+            return Err("snapshot retained records exceed total record count".to_owned());
+        }
+        for (index, record) in records.iter().enumerate() {
+            if record.kind != RecordKind::Define
+                || record.resulting_visible != index as u32
+                || (record.previous_visible != NONE
+                    && record.previous_visible as usize >= index)
+                || record.slot.0 as usize >= accepted_heads.len()
+            {
+                return Err(format!("invalid physical fact record {index}"));
+            }
+        }
+        for head in &accepted_heads {
+            if *head != NONE && *head as usize >= records.len() {
+                return Err("physical snapshot head exceeds record arena".to_owned());
+            }
+        }
+        let mut semantic_hash = 0xcbf2_9ce4_8422_2325;
+        for record in &records {
+            semantic_hash = hash_record(semantic_hash, *record);
+        }
+        Ok(Self {
+            stack: vec![Cell::default(); 32],
+            stack_pointer: 0,
+            frame_base: 0,
+            records: PodArena {
+                frontier: records.len(),
+                data: records,
+            },
+            deltas: PodArena::with_capacity(1_024),
+            index_deltas: PodArena::with_capacity(6_144),
+            roots: PodArena::with_capacity(1_024),
+            accepted_heads,
+            next_entity,
+            last_root: NONE,
+            version: 0,
+            semantic_hash,
+            track_indexes: true,
+            historical_delta_offset: total_record_count,
+        })
     }
 
     pub fn execute(&mut self, program: &IntentProgram) -> ExecutionOutcome {
@@ -537,7 +588,7 @@ impl Workspace {
     }
 
     pub fn delta_count(&self) -> usize {
-        self.deltas.frontier()
+        self.historical_delta_offset + self.deltas.frontier()
     }
 
     pub fn index_delta_count(&self) -> usize {

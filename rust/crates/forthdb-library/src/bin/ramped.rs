@@ -152,6 +152,12 @@ mod linux {
         elapsed_us: u128,
         open_elapsed_us: u128,
         query_projection_elapsed_us: u128,
+        full_replay_query_ready_us: Option<u128>,
+        mmap_query_ready_us: Option<u128>,
+        mmap_snapshot_creation_us: Option<u128>,
+        mmap_snapshot_bytes: Option<u64>,
+        mmap_snapshot_loaded: bool,
+        mmap_snapshot_epochs_skipped: u64,
         legacy_query_projection_materialized: bool,
         same_world: bool,
         same_version: bool,
@@ -321,8 +327,33 @@ mod linux {
         let expected_version = world.version();
         let expected_slots = world.active_slot_count();
         let expected_records = world.record_count();
+        let (snapshot_creation_us, snapshot_bytes) = if materializer.uses_vm() {
+            let started = Instant::now();
+            let snapshot = controller.write_mmap_snapshot()?;
+            (Some(started.elapsed().as_micros()), Some(snapshot.snapshot_bytes))
+        } else {
+            (None, None)
+        };
         controller.shutdown();
         drop(controller);
+
+        let mut full_replay_query_ready_us = None;
+        let snapshot_path = appended_path(path, ".vm-snapshot");
+        let held_snapshot_path = appended_path(path, ".vm-snapshot.benchmark-held");
+        if materializer.uses_vm() {
+            fs::rename(&snapshot_path, &held_snapshot_path)?;
+            let full_started = Instant::now();
+            let full = materializer.open(path, capacity)?;
+            let full_world = full.snapshot();
+            let full_projection = projection(&full_world)?;
+            full_replay_query_ready_us = Some(full_started.elapsed().as_micros());
+            if full_projection != live_projection {
+                return Err(format!("{profile} full replay projection diverged").into());
+            }
+            full.shutdown();
+            drop(full);
+            fs::rename(&held_snapshot_path, &snapshot_path)?;
+        }
 
         let recovery_started = Instant::now();
         let recovered = materializer.open(path, capacity)?;
@@ -332,10 +363,20 @@ mod linux {
         recovered_world.materialize_query_projection();
         let recovered_projection_elapsed = recovered_projection_started.elapsed();
         let recovered_projection = projection(&recovered_world)?;
+        let recovered_metrics = recovered.metrics();
+        let mmap_query_ready_us = materializer
+            .uses_vm()
+            .then_some(recovery_started.elapsed().as_micros());
         let recovery = RecoveryObservation {
             elapsed_us: recovery_started.elapsed().as_micros(),
             open_elapsed_us: recovery_open_elapsed.as_micros(),
             query_projection_elapsed_us: recovered_projection_elapsed.as_micros(),
+            full_replay_query_ready_us,
+            mmap_query_ready_us,
+            mmap_snapshot_creation_us: snapshot_creation_us,
+            mmap_snapshot_bytes: snapshot_bytes,
+            mmap_snapshot_loaded: recovered_metrics.mmap_snapshot_loaded,
+            mmap_snapshot_epochs_skipped: recovered_metrics.mmap_snapshot_epochs_skipped,
             legacy_query_projection_materialized: recovered_world
                 .is_legacy_query_projection_materialized(),
             same_world: recovered_world.id() == expected_world,
@@ -386,6 +427,12 @@ mod linux {
             projection: live_projection,
             recovery,
         })
+    }
+
+    fn appended_path(path: &Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
     }
 
     fn allocate_entities(

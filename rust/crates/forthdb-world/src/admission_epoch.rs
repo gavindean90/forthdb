@@ -2,13 +2,14 @@ use super::*;
 #[cfg(target_os = "linux")]
 use crate::io_uring_epoch_io::PendingIoUringEpoch;
 use crate::queued::{VmEpochMaterializer, decode_queued_intent, encode_queued_intent};
+use crate::mmap_vm_snapshot::{MmapSnapshotMetadata, MmapVmSnapshot};
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
@@ -135,6 +136,9 @@ pub struct AdmissionEpochMetrics {
     pub maximum_semantic_lag: u64,
     pub vm_materialized_epochs: u64,
     pub world_materialized_epochs: u64,
+    pub mmap_snapshot_loaded: bool,
+    pub mmap_snapshot_epochs_skipped: u64,
+    pub mmap_snapshot_bytes: u64,
 }
 
 #[derive(Default)]
@@ -153,6 +157,9 @@ struct Metrics {
     maximum_semantic_lag: AtomicU64,
     vm_materialized_epochs: AtomicU64,
     world_materialized_epochs: AtomicU64,
+    mmap_snapshot_loaded: AtomicBool,
+    mmap_snapshot_epochs_skipped: AtomicU64,
+    mmap_snapshot_bytes: AtomicU64,
 }
 
 impl Metrics {
@@ -172,6 +179,11 @@ impl Metrics {
             maximum_semantic_lag: self.maximum_semantic_lag.load(Ordering::Relaxed),
             vm_materialized_epochs: self.vm_materialized_epochs.load(Ordering::Relaxed),
             world_materialized_epochs: self.world_materialized_epochs.load(Ordering::Relaxed),
+            mmap_snapshot_loaded: self.mmap_snapshot_loaded.load(Ordering::Relaxed),
+            mmap_snapshot_epochs_skipped: self
+                .mmap_snapshot_epochs_skipped
+                .load(Ordering::Relaxed),
+            mmap_snapshot_bytes: self.mmap_snapshot_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -227,6 +239,8 @@ pub struct AdmissionEpochController {
     worker: Mutex<Option<JoinHandle<()>>>,
     metrics: Arc<Metrics>,
     closed: Arc<AtomicBool>,
+    journal_path: PathBuf,
+    materializer_kind: AdmissionMaterializer,
     _writer_lease: WriterLease,
 }
 
@@ -378,25 +392,39 @@ impl AdmissionEpochController {
         #[cfg(target_os = "linux")]
         {
             let path = path.as_ref().to_path_buf();
+            let materializer_kind = materializer;
             let lease = WriterLease::acquire(&path)?;
-            let recovered = recover_journal(&path)?;
+            let recovered = recover_journal(
+                &path,
+                materializer_kind == AdmissionMaterializer::TokenVm && validators.is_empty(),
+            )?;
             let validator_store = Arc::new(RwLock::new(validators));
             let (replayed, materializer) = replay_epochs(
+                recovered.snapshot.clone(),
                 &recovered.epochs,
                 &validator_store
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                materializer,
+                materializer_kind,
             )?;
             let current = Arc::new(RwLock::new(replayed));
             let io = IoUringEpochFileIo::open(&path, ring_entries)?;
             let metrics = Arc::new(Metrics::default());
             metrics
                 .durable_epochs
-                .store(recovered.epochs.len() as u64, Ordering::Release);
+                .store(recovered.total_epochs, Ordering::Release);
             metrics
                 .applied_epochs
-                .store(recovered.epochs.len() as u64, Ordering::Release);
+                .store(recovered.total_epochs, Ordering::Release);
+            if let Some(snapshot) = &recovered.snapshot {
+                metrics.mmap_snapshot_loaded.store(true, Ordering::Release);
+                metrics
+                    .mmap_snapshot_epochs_skipped
+                    .store(snapshot.epoch_count(), Ordering::Release);
+                metrics
+                    .mmap_snapshot_bytes
+                    .store(snapshot.snapshot_bytes(), Ordering::Release);
+            }
             metrics
                 .published_worlds
                 .store(current.read().unwrap().version(), Ordering::Release);
@@ -412,7 +440,7 @@ impl AdmissionEpochController {
                     run_worker(
                         io,
                         recovered.file_len,
-                        recovered.epochs.len() as u64 + 1,
+                        recovered.total_epochs + 1,
                         receiver,
                         max_batch,
                         max_unapplied_epochs,
@@ -431,6 +459,8 @@ impl AdmissionEpochController {
                 worker: Mutex::new(Some(worker)),
                 metrics,
                 closed,
+                journal_path: path,
+                materializer_kind,
                 _writer_lease: lease,
             })
         }
@@ -577,6 +607,34 @@ impl AdmissionEpochController {
 
     pub fn metrics(&self) -> AdmissionEpochMetrics {
         self.metrics.snapshot()
+    }
+
+    /// Persist a stable, offset-based image of the current token-VM query root.
+    /// The admission journal remains authoritative; invalid or stale images are
+    /// ignored during the next open.
+    pub fn write_mmap_snapshot(&self) -> Result<MmapSnapshotMetadata, String> {
+        if self.materializer_kind != AdmissionMaterializer::TokenVm {
+            return Err("mmap VM snapshots require the token VM materializer".to_owned());
+        }
+        if !self
+            .validators
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            return Err("mmap VM snapshots do not yet capture host validators".to_owned());
+        }
+        self.flush()?;
+        let world = self.snapshot();
+        world.materialize_query_projection();
+        let journal = std::fs::read(&self.journal_path).map_err(|error| error.to_string())?;
+        MmapVmSnapshot::create(
+            &self.journal_path,
+            &journal,
+            self.metrics().durable_epochs,
+            &world,
+            world.vm_query(),
+        )
     }
 
     pub fn shutdown(&self) {
@@ -1003,9 +1061,14 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 struct RecoveredJournal {
     epochs: Vec<Vec<QueuedIntent>>,
     file_len: u64,
+    total_epochs: u64,
+    snapshot: Option<Arc<MmapVmSnapshot>>,
 }
 
-fn recover_journal(path: &Path) -> Result<RecoveredJournal, AdmissionEpochOpenError> {
+fn recover_journal(
+    path: &Path,
+    allow_mmap_snapshot: bool,
+) -> Result<RecoveredJournal, AdmissionEpochOpenError> {
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -1029,6 +1092,18 @@ fn recover_journal(path: &Path) -> Result<RecoveredJournal, AdmissionEpochOpenEr
         return Err(AdmissionEpochOpenError::Format(
             "unsupported journal version".to_owned(),
         ));
+    }
+    if allow_mmap_snapshot {
+        if let Ok(snapshot) = MmapVmSnapshot::open(path, &bytes) {
+            if snapshot.journal_offset() == bytes.len() as u64 {
+                return Ok(RecoveredJournal {
+                    epochs: Vec::new(),
+                    file_len: bytes.len() as u64,
+                    total_epochs: snapshot.epoch_count(),
+                    snapshot: Some(snapshot),
+                });
+            }
+        }
     }
     let mut offset = JOURNAL_HEADER_LEN;
     let mut epochs = Vec::new();
@@ -1082,21 +1157,32 @@ fn recover_journal(path: &Path) -> Result<RecoveredJournal, AdmissionEpochOpenEr
         file.sync_data()?;
     }
     Ok(RecoveredJournal {
+        total_epochs: epochs.len() as u64,
         epochs,
         file_len: offset as u64,
+        snapshot: None,
     })
 }
 
 fn replay_epochs(
+    snapshot: Option<Arc<MmapVmSnapshot>>,
     epochs: &[Vec<QueuedIntent>],
     validators: &[Validator],
     materializer: AdmissionMaterializer,
 ) -> Result<(Arc<World>, EpochMaterializer), AdmissionEpochOpenError> {
-    let mut world = Arc::new(World::genesis());
+    let mut world = snapshot
+        .as_ref()
+        .map_or_else(|| Arc::new(World::genesis()), |snapshot| World::from_mmap(snapshot.clone()));
     let mut materializer = match materializer {
         AdmissionMaterializer::World => EpochMaterializer::World,
         AdmissionMaterializer::TokenVm => {
-            EpochMaterializer::TokenVm(VmEpochMaterializer::new(world.next_entity()))
+            let vm = if let Some(snapshot) = snapshot {
+                VmEpochMaterializer::from_mmap(snapshot)
+                    .map_err(AdmissionEpochOpenError::Format)?
+            } else {
+                VmEpochMaterializer::new(world.next_entity())
+            };
+            EpochMaterializer::TokenVm(vm)
         }
     };
     for intents in epochs {
@@ -1288,7 +1374,7 @@ mod tests {
     #[test]
     fn durable_intent_epochs_replay_worlds_and_trim_an_incomplete_tail() {
         let path = path("replay");
-        let initialized = recover_journal(&path).expect("journal initializes");
+        let initialized = recover_journal(&path, false).expect("journal initializes");
         assert_eq!(initialized.file_len, JOURNAL_HEADER_LEN as u64);
 
         let mut first = QueuedIntent::new();
@@ -1319,12 +1405,17 @@ mod tests {
         file.sync_data().unwrap();
         drop(file);
 
-        let recovered = recover_journal(&path).expect("sound prefix recovers");
+        let recovered = recover_journal(&path, false).expect("sound prefix recovers");
         assert_eq!(recovered.epochs.len(), 2);
         assert_eq!(recovered.file_len, expected_len as u64);
         assert_eq!(fs::metadata(&path).unwrap().len(), expected_len as u64);
-        let (world, _) = replay_epochs(&recovered.epochs, &[], AdmissionMaterializer::TokenVm)
-            .expect("epochs materialize");
+        let (world, _) = replay_epochs(
+            None,
+            &recovered.epochs,
+            &[],
+            AdmissionMaterializer::TokenVm,
+        )
+        .expect("epochs materialize");
         assert_eq!(world.version(), 2);
         assert!(world.resolve(&SlotId::new("replay/name")).is_some());
         assert!(world.resolve(&SlotId::new("replay/state")).is_some());
@@ -1386,16 +1477,45 @@ mod tests {
         assert_eq!(controller.metrics().vm_materialized_epochs, 1);
         assert_eq!(controller.metrics().world_materialized_epochs, 0);
         let expected = first_world.id();
+        let snapshot = controller
+            .write_mmap_snapshot()
+            .expect("physical VM snapshot persists");
+        assert_eq!(snapshot.epoch_count, 1);
+        assert_eq!(snapshot.world_id, expected);
         controller.shutdown();
         drop(controller);
 
         let reopened = AdmissionEpochController::open_vm(&path, 16, 16, 64)
             .expect("durable admission journal reopens");
         assert_eq!(reopened.snapshot().id(), expected);
-        assert!(!reopened.snapshot().is_query_projection_materialized());
+        assert!(reopened.snapshot().is_query_projection_materialized());
+        assert!(reopened.metrics().mmap_snapshot_loaded);
+        assert_eq!(reopened.metrics().mmap_snapshot_epochs_skipped, 1);
+        assert!(reopened
+            .snapshot()
+            .resolve(&SlotId::new("live/name"))
+            .is_some());
+        let mut next = QueuedIntent::new();
+        next.define(
+            SlotId::new("live/after-reopen"),
+            IntentFact::new(
+                EntityId::new(1),
+                Predicate::new("state"),
+                Literal::new("mapped"),
+            ),
+        );
+        let ticket = reopened.submit(next).expect("mapped VM accepts a successor");
+        ticket.wait_admitted().expect("successor is durable");
+        match ticket.wait().expect("successor materializes") {
+            AdmissionEpochTicketOutcome::Accepted { world, .. } => {
+                assert!(world.resolve(&SlotId::new("live/after-reopen")).is_some());
+            }
+            outcome => panic!("unexpected mapped successor outcome: {outcome:?}"),
+        }
         reopened.shutdown();
         drop(reopened);
         fs::remove_file(&path).unwrap();
+        fs::remove_file(MmapVmSnapshot::path_for(&path)).unwrap();
         let _ = fs::remove_file(writer_lock_path(&path));
     }
 

@@ -7,6 +7,7 @@ mod file_store;
 mod history_lifecycle;
 mod io_uring_epoch_io;
 mod mmap_store;
+mod mmap_vm_snapshot;
 mod queued;
 mod queued_controller;
 pub mod stack_vm;
@@ -31,6 +32,7 @@ pub use file_epoch_store::{
 pub use file_store::{FileCommitStore, FileCommitStoreError};
 pub use io_uring_epoch_io::{IoUringEpochFileIo, IoUringEpochStore};
 pub use mmap_store::{MmapCommitStore, MmapCommitStoreError};
+pub use mmap_vm_snapshot::MmapSnapshotMetadata;
 pub use queued::{
     AcceptedIntent, EpochOutcome, EpochPlan, IntentAtom, IntentFact, IntentPrecondition,
     IntentRejection, QueuedIntent, RejectedIntent, TempEntity, derive_epoch, derive_epoch_world,

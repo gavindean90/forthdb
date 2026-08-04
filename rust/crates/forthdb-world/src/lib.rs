@@ -128,6 +128,10 @@ struct HistoryNode {
     frame: Arc<CommitFrame>,
 }
 
+pub(crate) trait FrameSource: Send + Sync {
+    fn frames(&self) -> Vec<Arc<CommitFrame>>;
+}
+
 impl HistoryNode {
     fn materialize_kernel(&self, projected: Option<&ProjectionBase>) -> Arc<ForthDb> {
         let projected = projected.map(|base| {
@@ -176,6 +180,7 @@ struct ProjectedFact {
 
 #[derive(Default)]
 struct VmQueryProjection {
+    mapped: Option<Arc<MmapVmSnapshot>>,
     definitions: HashMap<SlotId, Vec<ProjectedFact>>,
     active: Vec<ProjectedFact>,
     by_subject: HashMap<Atom, Vec<usize>>,
@@ -194,6 +199,13 @@ struct QueryFrame {
 }
 
 impl VmQueryProjection {
+    fn from_mmap(snapshot: Arc<MmapVmSnapshot>) -> Self {
+        Self {
+            mapped: Some(snapshot),
+            ..Self::default()
+        }
+    }
+
     fn from_history(history: &HistoryNode) -> Self {
         let mut frames = Vec::new();
         let mut cursor = Some(history);
@@ -201,10 +213,14 @@ impl VmQueryProjection {
             frames.push(node.frame.clone());
             cursor = node.parent.as_deref();
         }
+        frames.reverse();
+        Self::from_frames(&frames)
+    }
 
+    fn from_frames(frames: &[Arc<CommitFrame>]) -> Self {
         let mut definitions = HashMap::<SlotId, Vec<ProjectedFact>>::new();
         let mut record_id = 0usize;
-        for frame in frames.into_iter().rev() {
+        for frame in frames {
             for operation in frame.operations.iter() {
                 match operation {
                     Operation::AllocateEntity { .. } => {}
@@ -287,6 +303,9 @@ impl VmQueryProjection {
     }
 
     fn resolve(&self, slot: &SlotId) -> Option<&Fact> {
+        if let Some(mapped) = &self.mapped {
+            return mapped.resolve(slot);
+        }
         self.definitions
             .get(slot)
             .and_then(|stack| stack.last())
@@ -294,6 +313,9 @@ impl VmQueryProjection {
     }
 
     fn definitions(&self, slot: &SlotId) -> Vec<&Fact> {
+        if let Some(mapped) = &self.mapped {
+            return mapped.definitions(slot);
+        }
         self.definitions
             .get(slot)
             .into_iter()
@@ -329,6 +351,9 @@ impl VmQueryProjection {
     }
 
     fn query(&self, patterns: &[Pattern], options: QueryOptions) -> QueryResult {
+        if let Some(mapped) = &self.mapped {
+            return mapped.query(patterns, options);
+        }
         let mut output = Vec::<QueryFrame>::new();
         let mut first_path = Vec::<Pattern>::new();
         let mut metrics = QueryMetrics::default();
@@ -518,6 +543,7 @@ pub struct World {
     vm_query: OnceLock<Arc<VmQueryProjection>>,
     projection_base: Option<ProjectionBase>,
     history: Option<Arc<HistoryNode>>,
+    history_prefix: Option<Arc<dyn FrameSource>>,
 }
 
 impl fmt::Debug for World {
@@ -552,6 +578,7 @@ impl World {
             vm_query: OnceLock::new(),
             projection_base: None,
             history: None,
+            history_prefix: None,
         }
     }
 
@@ -640,11 +667,8 @@ impl World {
     fn vm_query(&self) -> &VmQueryProjection {
         self.vm_query
             .get_or_init(|| {
-                let history = self
-                    .history
-                    .as_deref()
-                    .expect("VM-backed worlds always have immutable history");
-                Arc::new(VmQueryProjection::from_history(history))
+                assert!(self.history.is_some(), "mapped VM roots preinstall their query view");
+                Arc::new(VmQueryProjection::from_frames(&self.frames()))
             })
             .as_ref()
     }
@@ -655,24 +679,59 @@ impl World {
         }
         self.lazy_kernel
             .get_or_init(|| {
-                let history = self
-                    .history
-                    .as_deref()
-                    .expect("only an eager genesis world may omit history");
-                history.materialize_kernel(self.projection_base.as_ref())
+                if self.history_prefix.is_some() {
+                    let mut kernel = ForthDb::new();
+                    let mut next_entity = 1;
+                    for frame in self.frames() {
+                        for operation in frame.operations.iter() {
+                            apply_operation(&mut kernel, &mut next_entity, operation)
+                                .expect("mapped history must materialize deterministically");
+                        }
+                    }
+                    Arc::new(kernel)
+                } else {
+                    let history = self
+                        .history
+                        .as_deref()
+                        .expect("only an eager genesis world may omit history");
+                    history.materialize_kernel(self.projection_base.as_ref())
+                }
             })
             .as_ref()
     }
 
     pub fn frames(&self) -> Vec<Arc<CommitFrame>> {
-        let mut frames = Vec::with_capacity(self.version as usize);
+        let mut frames = self
+            .history_prefix
+            .as_ref()
+            .map_or_else(Vec::new, |source| source.frames());
+        let prefix_len = frames.len();
         let mut node = self.history.clone();
         while let Some(current) = node {
             frames.push(current.frame.clone());
             node = current.parent.clone();
         }
-        frames.reverse();
+        frames[prefix_len..].reverse();
         frames
+    }
+
+    pub(crate) fn from_mmap(snapshot: Arc<MmapVmSnapshot>) -> Arc<Self> {
+        let mut vm_query = OnceLock::new();
+        let _ = vm_query.set(Arc::new(VmQueryProjection::from_mmap(snapshot.clone())));
+        Arc::new(Self {
+            id: snapshot.world_id(),
+            version: snapshot.world_version(),
+            next_entity: snapshot.next_entity(),
+            operation_count: snapshot.operation_count(),
+            active_slot_count: snapshot.active_slot_count(),
+            record_count: snapshot.record_count(),
+            eager_kernel: None,
+            lazy_kernel: OnceLock::new(),
+            vm_query,
+            projection_base: None,
+            history: None,
+            history_prefix: Some(snapshot),
+        })
     }
 
     fn reconstruct(frames: &[Arc<CommitFrame>]) -> Result<Self, CandidateError> {
@@ -731,6 +790,7 @@ impl World {
                 frame: frame.clone(),
             });
             world.history = Some(history);
+            world.history_prefix = None;
         }
         world.eager_kernel = Some(kernel);
         Ok(world)
@@ -780,6 +840,7 @@ impl World {
                 parent: base.history.clone(),
                 frame: frame.clone(),
             })),
+            history_prefix: base.history_prefix.clone(),
         });
         (world, frame)
     }
@@ -939,6 +1000,7 @@ impl CandidateWorld {
                 parent: parent_history,
                 frame,
             })),
+            history_prefix: None,
         }
     }
 }

@@ -2,6 +2,7 @@ use super::*;
 use crate::stack_vm::{
     Cell, ExecutionOutcome, Instruction, IntentProgram, SlotToken, Workspace as VmWorkspace,
 };
+use crate::mmap_vm_snapshot::MmapVmSnapshot;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -595,6 +596,7 @@ const VM_LITERAL_BASE: u64 = 1 << 63;
 /// both live execution and recovery compile them through this same state.
 pub(crate) struct VmEpochMaterializer {
     workspace: VmWorkspace,
+    mapped_base: Option<Arc<MmapVmSnapshot>>,
     slots: BTreeMap<SlotId, SlotToken>,
     predicates: BTreeMap<Predicate, Cell>,
     predicate_values: Vec<Predicate>,
@@ -606,12 +608,32 @@ impl VmEpochMaterializer {
     pub(crate) fn new(next_entity: u64) -> Self {
         Self {
             workspace: VmWorkspace::with_indexes_from(next_entity, 0, 32, 1_024, 1_024),
+            mapped_base: None,
             slots: BTreeMap::new(),
             predicates: BTreeMap::new(),
             predicate_values: Vec::new(),
             literals: BTreeMap::new(),
             literal_values: Vec::new(),
         }
+    }
+
+    pub(crate) fn from_mmap(snapshot: Arc<MmapVmSnapshot>) -> Result<Self, String> {
+        let (records, heads) = snapshot.workspace_image()?;
+        let workspace = VmWorkspace::from_physical_snapshot(
+            snapshot.next_entity(),
+            records,
+            heads,
+            snapshot.record_count(),
+        )?;
+        Ok(Self {
+            workspace,
+            mapped_base: Some(snapshot),
+            slots: BTreeMap::new(),
+            predicates: BTreeMap::new(),
+            predicate_values: Vec::new(),
+            literals: BTreeMap::new(),
+            literal_values: Vec::new(),
+        })
     }
 
     pub(crate) fn materialize(
@@ -818,9 +840,21 @@ impl VmEpochMaterializer {
         if let Some(token) = self.slots.get(slot) {
             return *token;
         }
-        let token = SlotToken(self.slots.len() as u32);
+        if let Some(token) = self
+            .mapped_base
+            .as_ref()
+            .and_then(|base| base.slot_token(slot.as_str()))
+        {
+            return SlotToken(token);
+        }
+        let base_count = self
+            .mapped_base
+            .as_ref()
+            .map_or(0, |base| base.slot_count());
+        let token = SlotToken((base_count + self.slots.len()) as u32);
         self.slots.insert(slot.clone(), token);
-        self.workspace.ensure_slot_count(self.slots.len());
+        self.workspace
+            .ensure_slot_count(base_count + self.slots.len());
         token
     }
 
@@ -828,7 +862,18 @@ impl VmEpochMaterializer {
         if let Some(cell) = self.predicates.get(predicate) {
             return *cell;
         }
-        let cell = Cell(self.predicates.len() as u64);
+        if let Some(token) = self
+            .mapped_base
+            .as_ref()
+            .and_then(|base| base.predicate_token(predicate.as_str()))
+        {
+            return Cell(u64::from(token));
+        }
+        let base_count = self
+            .mapped_base
+            .as_ref()
+            .map_or(0, |base| base.predicate_count());
+        let cell = Cell((base_count + self.predicates.len()) as u64);
         self.predicates.insert(predicate.clone(), cell);
         self.predicate_values.push(predicate.clone());
         cell
@@ -844,7 +889,18 @@ impl VmEpochMaterializer {
                 if let Some(cell) = self.literals.get(literal) {
                     return Ok(*cell);
                 }
-                let offset = self.literal_values.len() as u64;
+                if let Some(token) = self
+                    .mapped_base
+                    .as_ref()
+                    .and_then(|base| base.literal_token(literal.as_str()))
+                {
+                    return Ok(Cell(VM_LITERAL_BASE + u64::from(token)));
+                }
+                let base_count = self
+                    .mapped_base
+                    .as_ref()
+                    .map_or(0, |base| base.literal_count());
+                let offset = (base_count + self.literal_values.len()) as u64;
                 let value = VM_LITERAL_BASE
                     .checked_add(offset)
                     .ok_or_else(|| "VM literal token overflow".to_owned())?;
@@ -857,11 +913,16 @@ impl VmEpochMaterializer {
     }
 
     fn resolve_fact(&self, slot: &SlotId) -> Option<Fact> {
-        let token = self.slots.get(slot)?;
-        let (subject, predicate, object) = self.workspace.resolve_fact_cells(*token)?;
+        let token = self.slots.get(slot).copied().or_else(|| {
+            self.mapped_base
+                .as_ref()
+                .and_then(|base| base.slot_token(slot.as_str()))
+                .map(SlotToken)
+        })?;
+        let (subject, predicate, object) = self.workspace.resolve_fact_cells(token)?;
         Some(Fact::new(
             self.atom_from_cell(subject)?,
-            self.predicate_values.get(predicate.0 as usize)?.clone(),
+            self.predicate_from_cell(predicate)?,
             self.atom_from_cell(object)?,
         ))
     }
@@ -870,11 +931,33 @@ impl VmEpochMaterializer {
         if cell.0 < VM_LITERAL_BASE {
             Some(Atom::Entity(EntityId::new(cell.0)))
         } else {
-            self.literal_values
-                .get((cell.0 - VM_LITERAL_BASE) as usize)
-                .cloned()
-                .map(Atom::Literal)
+            let token = (cell.0 - VM_LITERAL_BASE) as usize;
+            if let Some(base) = self.mapped_base.as_ref() {
+                if token < base.literal_count() {
+                    return base.literal_value(token).map(Atom::Literal);
+                }
+                return self
+                    .literal_values
+                    .get(token - base.literal_count())
+                    .cloned()
+                    .map(Atom::Literal);
+            }
+            self.literal_values.get(token).cloned().map(Atom::Literal)
         }
+    }
+
+    fn predicate_from_cell(&self, cell: Cell) -> Option<Predicate> {
+        let token = cell.0 as usize;
+        if let Some(base) = self.mapped_base.as_ref() {
+            if token < base.predicate_count() {
+                return base.predicate_value(token);
+            }
+            return self
+                .predicate_values
+                .get(token - base.predicate_count())
+                .cloned();
+        }
+        self.predicate_values.get(token).cloned()
     }
 }
 
