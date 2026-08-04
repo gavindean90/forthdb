@@ -2,6 +2,7 @@ use forthdb_core::{
     Atom, Binding, BoundValue, EntityId, Fact, ForthDb, Literal, Pattern, Predicate,
     PredicateTerm, QueryMetrics, QueryOptions, QueryResult, QueryRow, SlotId, Symbol, Term,
 };
+use crate::mmap_vm_snapshot::MmapVmSnapshot;
 use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::error::Error;
