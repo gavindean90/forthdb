@@ -391,6 +391,9 @@ mod linux {
             vm_materialized_epochs: after.vm_materialized_epochs - before.vm_materialized_epochs,
             world_materialized_epochs: after.world_materialized_epochs
                 - before.world_materialized_epochs,
+            mmap_snapshot_loaded: after.mmap_snapshot_loaded,
+            mmap_snapshot_epochs_skipped: after.mmap_snapshot_epochs_skipped,
+            mmap_snapshot_bytes: after.mmap_snapshot_bytes,
         }
     }
 
