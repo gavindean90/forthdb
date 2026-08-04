@@ -391,6 +391,9 @@ mod linux {
             vm_materialized_epochs: after.vm_materialized_epochs - before.vm_materialized_epochs,
             world_materialized_epochs: after.world_materialized_epochs
                 - before.world_materialized_epochs,
+            checkpoint_loaded: after.checkpoint_loaded,
+            checkpoint_epochs_skipped: after.checkpoint_epochs_skipped,
+            checkpoint_bytes: after.checkpoint_bytes,
         }
     }
 

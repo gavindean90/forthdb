@@ -153,11 +153,23 @@ mod linux {
         open_elapsed_us: u128,
         query_projection_elapsed_us: u128,
         legacy_query_projection_materialized: bool,
+        checkpoint_loaded: bool,
+        checkpoint_epochs_skipped: u64,
         same_world: bool,
         same_version: bool,
         same_active_slots: bool,
         same_records: bool,
         same_projection: bool,
+    }
+
+    #[derive(Serialize)]
+    struct CheckpointObservation {
+        create_elapsed_us: u128,
+        epoch_count: u64,
+        checkpoint_bytes: u64,
+        full_replay_open_elapsed_us: u128,
+        full_replay_query_projection_elapsed_us: u128,
+        full_replay_same_projection: bool,
     }
 
     #[derive(Serialize)]
@@ -189,6 +201,7 @@ mod linux {
         queries: Vec<QueryObservation>,
         projection: Projection,
         recovery: RecoveryObservation,
+        checkpoint: Option<CheckpointObservation>,
     }
 
     #[derive(Serialize)]
@@ -261,6 +274,8 @@ mod linux {
         materializer: Materializer,
     ) -> Result<ProfileReport, Box<dyn Error>> {
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(checkpoint_path(path));
+        let _ = fs::remove_file(checkpoint_saved_path(path));
         let capacity = scale
             .circulation_intents()
             .div_ceil(epoch_width)
@@ -321,8 +336,45 @@ mod linux {
         let expected_version = world.version();
         let expected_slots = world.active_slot_count();
         let expected_records = world.record_count();
+        let checkpoint = if materializer.uses_vm() {
+            let started = Instant::now();
+            let checkpoint = controller.checkpoint()?;
+            Some((started.elapsed(), checkpoint))
+        } else {
+            None
+        };
         controller.shutdown();
         drop(controller);
+
+        let checkpoint = if let Some((create_elapsed, checkpoint)) = checkpoint {
+            let target = checkpoint_path(path);
+            let saved = checkpoint_saved_path(path);
+            fs::rename(&target, &saved)?;
+            let full_replay_started = Instant::now();
+            let full_replay = materializer.open(path, capacity)?;
+            let full_replay_open_elapsed = full_replay_started.elapsed();
+            let full_replay_world = full_replay.snapshot();
+            let full_projection_started = Instant::now();
+            full_replay_world.materialize_query_projection();
+            let full_projection_elapsed = full_projection_started.elapsed();
+            let full_projection = projection(&full_replay_world)?;
+            let full_replay_same_projection = full_projection == live_projection
+                && full_replay_world.id() == expected_world
+                && full_replay_world.version() == expected_version;
+            full_replay.shutdown();
+            drop(full_replay);
+            fs::rename(&saved, &target)?;
+            Some(CheckpointObservation {
+                create_elapsed_us: create_elapsed.as_micros(),
+                epoch_count: checkpoint.epoch_count,
+                checkpoint_bytes: checkpoint.checkpoint_bytes,
+                full_replay_open_elapsed_us: full_replay_open_elapsed.as_micros(),
+                full_replay_query_projection_elapsed_us: full_projection_elapsed.as_micros(),
+                full_replay_same_projection,
+            })
+        } else {
+            None
+        };
 
         let recovery_started = Instant::now();
         let recovered = materializer.open(path, capacity)?;
@@ -332,12 +384,15 @@ mod linux {
         recovered_world.materialize_query_projection();
         let recovered_projection_elapsed = recovered_projection_started.elapsed();
         let recovered_projection = projection(&recovered_world)?;
+        let recovered_metrics = recovered.metrics();
         let recovery = RecoveryObservation {
             elapsed_us: recovery_started.elapsed().as_micros(),
             open_elapsed_us: recovery_open_elapsed.as_micros(),
             query_projection_elapsed_us: recovered_projection_elapsed.as_micros(),
             legacy_query_projection_materialized: recovered_world
                 .is_legacy_query_projection_materialized(),
+            checkpoint_loaded: recovered_metrics.checkpoint_loaded,
+            checkpoint_epochs_skipped: recovered_metrics.checkpoint_epochs_skipped,
             same_world: recovered_world.id() == expected_world,
             same_version: recovered_world.version() == expected_version,
             same_active_slots: recovered_world.active_slot_count() == expected_slots,
@@ -353,6 +408,19 @@ mod linux {
             || !recovery.same_projection
         {
             return Err(format!("{profile} recovery did not reproduce the live world").into());
+        }
+        if checkpoint
+            .as_ref()
+            .is_some_and(|observation| !observation.full_replay_same_projection)
+        {
+            return Err(format!("{profile} full replay diverged from the checkpointed world").into());
+        }
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            if !recovery.checkpoint_loaded
+                || recovery.checkpoint_epochs_skipped != checkpoint.epoch_count
+            {
+                return Err(format!("{profile} did not load its semantic checkpoint").into());
+            }
         }
 
         let intent_count = scale.circulation_intents() as f64;
@@ -385,7 +453,20 @@ mod linux {
             queries,
             projection: live_projection,
             recovery,
+            checkpoint,
         })
+    }
+
+    fn checkpoint_path(path: &Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(".checkpoint");
+        PathBuf::from(value)
+    }
+
+    fn checkpoint_saved_path(path: &Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(".checkpoint.benchmark-saved");
+        PathBuf::from(value)
     }
 
     fn allocate_entities(
@@ -808,6 +889,9 @@ mod linux {
             vm_materialized_epochs: after.vm_materialized_epochs - before.vm_materialized_epochs,
             world_materialized_epochs: after.world_materialized_epochs
                 - before.world_materialized_epochs,
+            checkpoint_loaded: after.checkpoint_loaded,
+            checkpoint_epochs_skipped: after.checkpoint_epochs_skipped,
+            checkpoint_bytes: after.checkpoint_bytes,
         }
     }
 

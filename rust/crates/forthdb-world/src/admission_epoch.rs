@@ -5,10 +5,10 @@ use crate::queued::{VmEpochMaterializer, decode_queued_intent, encode_queued_int
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, RwLock};
@@ -23,6 +23,11 @@ const EPOCH_PREFIX_LEN: usize = 20;
 const MAX_EPOCH_BYTES: usize = 64 * 1024 * 1024;
 const CHECKSUM_OFFSET: u64 = 0xcbf29ce484222325;
 const CHECKSUM_PRIME: u64 = 0x100000001b3;
+const CHECKPOINT_MAGIC: &[u8; 8] = b"FTHCP001";
+const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_HEADER_LEN: usize = 32;
+const CHECKPOINT_TRAILER: &[u8; 4] = b"CPND";
+const MAX_CHECKPOINT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdmissionEpochReceipt {
@@ -83,6 +88,15 @@ pub enum AdmissionEpochOpenError {
     Writer(WriterLeaseError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionEpochCheckpoint {
+    pub epoch_count: u64,
+    pub journal_offset: u64,
+    pub checkpoint_bytes: u64,
+    pub world_id: WorldId,
+    pub world_version: u64,
+}
+
 impl fmt::Display for AdmissionEpochOpenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -135,6 +149,9 @@ pub struct AdmissionEpochMetrics {
     pub maximum_semantic_lag: u64,
     pub vm_materialized_epochs: u64,
     pub world_materialized_epochs: u64,
+    pub checkpoint_loaded: bool,
+    pub checkpoint_epochs_skipped: u64,
+    pub checkpoint_bytes: u64,
 }
 
 #[derive(Default)]
@@ -153,6 +170,9 @@ struct Metrics {
     maximum_semantic_lag: AtomicU64,
     vm_materialized_epochs: AtomicU64,
     world_materialized_epochs: AtomicU64,
+    checkpoint_loaded: AtomicBool,
+    checkpoint_epochs_skipped: AtomicU64,
+    checkpoint_bytes: AtomicU64,
 }
 
 impl Metrics {
@@ -172,6 +192,11 @@ impl Metrics {
             maximum_semantic_lag: self.maximum_semantic_lag.load(Ordering::Relaxed),
             vm_materialized_epochs: self.vm_materialized_epochs.load(Ordering::Relaxed),
             world_materialized_epochs: self.world_materialized_epochs.load(Ordering::Relaxed),
+            checkpoint_loaded: self.checkpoint_loaded.load(Ordering::Relaxed),
+            checkpoint_epochs_skipped: self
+                .checkpoint_epochs_skipped
+                .load(Ordering::Relaxed),
+            checkpoint_bytes: self.checkpoint_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -227,6 +252,8 @@ pub struct AdmissionEpochController {
     worker: Mutex<Option<JoinHandle<()>>>,
     metrics: Arc<Metrics>,
     closed: Arc<AtomicBool>,
+    journal_path: PathBuf,
+    materializer: AdmissionMaterializer,
     _writer_lease: WriterLease,
 }
 
@@ -378,28 +405,52 @@ impl AdmissionEpochController {
         #[cfg(target_os = "linux")]
         {
             let path = path.as_ref().to_path_buf();
+            let materializer_kind = materializer;
             let lease = WriterLease::acquire(&path)?;
-            let recovered = recover_journal(&path)?;
+            let recovered = recover_journal(
+                &path,
+                materializer == AdmissionMaterializer::TokenVm
+                    && validators.is_empty(),
+            )?;
             let validator_store = Arc::new(RwLock::new(validators));
+            let checkpoint_loaded = recovered.checkpoint.is_some();
+            let checkpoint_epoch = recovered
+                .checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.epoch_count);
+            let checkpoint_bytes = recovered
+                .checkpoint
+                .as_ref()
+                .map_or(0, |checkpoint| checkpoint.bytes);
             let (replayed, materializer) = replay_epochs(
+                recovered.checkpoint,
                 &recovered.epochs,
                 &validator_store
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                materializer,
+                materializer: materializer_kind,
             )?;
             let current = Arc::new(RwLock::new(replayed));
             let io = IoUringEpochFileIo::open(&path, ring_entries)?;
             let metrics = Arc::new(Metrics::default());
             metrics
                 .durable_epochs
-                .store(recovered.epochs.len() as u64, Ordering::Release);
+                .store(recovered.total_epochs, Ordering::Release);
             metrics
                 .applied_epochs
-                .store(recovered.epochs.len() as u64, Ordering::Release);
+                .store(recovered.total_epochs, Ordering::Release);
             metrics
                 .published_worlds
                 .store(current.read().unwrap().version(), Ordering::Release);
+            metrics
+                .checkpoint_loaded
+                .store(checkpoint_loaded, Ordering::Release);
+            metrics
+                .checkpoint_epochs_skipped
+                .store(checkpoint_epoch, Ordering::Release);
+            metrics
+                .checkpoint_bytes
+                .store(checkpoint_bytes, Ordering::Release);
             let closed = Arc::new(AtomicBool::new(false));
             let (sender, receiver) = mpsc::sync_channel(capacity);
             let worker_current = current.clone();
@@ -412,7 +463,7 @@ impl AdmissionEpochController {
                     run_worker(
                         io,
                         recovered.file_len,
-                        recovered.epochs.len() as u64 + 1,
+                        recovered.total_epochs + 1,
                         receiver,
                         max_batch,
                         max_unapplied_epochs,
@@ -431,6 +482,8 @@ impl AdmissionEpochController {
                 worker: Mutex::new(Some(worker)),
                 metrics,
                 closed,
+                journal_path: path,
+                materializer,
                 _writer_lease: lease,
             })
         }
@@ -573,6 +626,78 @@ impl AdmissionEpochController {
         receiver
             .recv()
             .map_err(|_| "admission worker stopped at barrier".to_owned())?
+    }
+
+    pub fn checkpoint(&self) -> Result<AdmissionEpochCheckpoint, String> {
+        if self.materializer != AdmissionMaterializer::TokenVm {
+            return Err("semantic checkpoints require the token VM materializer".to_owned());
+        }
+        if !self
+            .validators
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+        {
+            return Err("semantic checkpoints do not yet capture host validators".to_owned());
+        }
+        self.flush()?;
+        let world = self.snapshot();
+        let epoch_count = self.metrics.durable_epochs.load(Ordering::Acquire);
+        let journal = fs::read(&self.journal_path).map_err(|error| error.to_string())?;
+        let journal_offset = journal.len() as u64;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&epoch_count.to_le_bytes());
+        payload.extend_from_slice(&journal_offset.to_le_bytes());
+        payload.extend_from_slice(&digest(&journal).to_le_bytes());
+        payload.extend_from_slice(&world.id().value().to_le_bytes());
+        payload.extend_from_slice(&world.version().to_le_bytes());
+        payload.extend_from_slice(&world.next_entity().to_le_bytes());
+        let frames = world.frames();
+        payload.extend_from_slice(&(frames.len() as u64).to_le_bytes());
+        for frame in &frames {
+            encode_checkpoint_frame(frame, &mut payload)?;
+        }
+        if payload.len() > MAX_CHECKPOINT_BYTES - CHECKPOINT_HEADER_LEN - CHECKPOINT_TRAILER.len() {
+            return Err("semantic checkpoint exceeds size limit".to_owned());
+        }
+        let mut bytes = Vec::with_capacity(
+            CHECKPOINT_HEADER_LEN + payload.len() + CHECKPOINT_TRAILER.len(),
+        );
+        bytes.extend_from_slice(CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(&CHECKPOINT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&digest(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(CHECKPOINT_TRAILER);
+
+        let temporary = checkpoint_temp_path(&self.journal_path);
+        let target = checkpoint_path(&self.journal_path);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_data().map_err(|error| error.to_string())?;
+        drop(file);
+        fs::rename(&temporary, &target).map_err(|error| error.to_string())?;
+        if let Some(parent) = target.parent() {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| error.to_string())?;
+        }
+        self.metrics
+            .checkpoint_bytes
+            .store(bytes.len() as u64, Ordering::Release);
+        Ok(AdmissionEpochCheckpoint {
+            epoch_count,
+            journal_offset,
+            checkpoint_bytes: bytes.len() as u64,
+            world_id: world.id(),
+            world_version: world.version(),
+        })
     }
 
     pub fn metrics(&self) -> AdmissionEpochMetrics {
@@ -1003,9 +1128,22 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 struct RecoveredJournal {
     epochs: Vec<Vec<QueuedIntent>>,
     file_len: u64,
+    total_epochs: u64,
+    checkpoint: Option<RecoveredCheckpoint>,
 }
 
-fn recover_journal(path: &Path) -> Result<RecoveredJournal, AdmissionEpochOpenError> {
+struct RecoveredCheckpoint {
+    epoch_count: u64,
+    journal_offset: u64,
+    bytes: u64,
+    world: Arc<World>,
+    materializer: VmEpochMaterializer,
+}
+
+fn recover_journal(
+    path: &Path,
+    allow_checkpoint: bool,
+) -> Result<RecoveredJournal, AdmissionEpochOpenError> {
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -1030,8 +1168,20 @@ fn recover_journal(path: &Path) -> Result<RecoveredJournal, AdmissionEpochOpenEr
             "unsupported journal version".to_owned(),
         ));
     }
-    let mut offset = JOURNAL_HEADER_LEN;
+    let checkpoint = allow_checkpoint
+        .then(|| read_checkpoint(path, &bytes))
+        .flatten();
+    let (mut offset, expected_first_epoch) = checkpoint.as_ref().map_or(
+        (JOURNAL_HEADER_LEN, 1),
+        |checkpoint| {
+            (
+                checkpoint.journal_offset as usize,
+                checkpoint.epoch_count + 1,
+            )
+        },
+    );
     let mut epochs = Vec::new();
+    let mut expected_epoch = expected_first_epoch;
     while offset < bytes.len() {
         if bytes.len() - offset < EPOCH_PREFIX_LEN {
             break;
@@ -1068,13 +1218,13 @@ fn recover_journal(path: &Path) -> Result<RecoveredJournal, AdmissionEpochOpenEr
         }
         let (epoch_id, intents) =
             decode_epoch_payload(payload).map_err(AdmissionEpochOpenError::Format)?;
-        let expected_epoch = epochs.len() as u64 + 1;
         if epoch_id != expected_epoch {
             return Err(AdmissionEpochOpenError::Format(format!(
                 "expected admission epoch {expected_epoch}, found {epoch_id}"
             )));
         }
         epochs.push(intents);
+        expected_epoch += 1;
         offset = end;
     }
     if offset != bytes.len() {
@@ -1084,19 +1234,29 @@ fn recover_journal(path: &Path) -> Result<RecoveredJournal, AdmissionEpochOpenEr
     Ok(RecoveredJournal {
         epochs,
         file_len: offset as u64,
+        total_epochs: expected_epoch - 1,
+        checkpoint,
     })
 }
 
 fn replay_epochs(
+    checkpoint: Option<RecoveredCheckpoint>,
     epochs: &[Vec<QueuedIntent>],
     validators: &[Validator],
     materializer: AdmissionMaterializer,
 ) -> Result<(Arc<World>, EpochMaterializer), AdmissionEpochOpenError> {
-    let mut world = Arc::new(World::genesis());
-    let mut materializer = match materializer {
-        AdmissionMaterializer::World => EpochMaterializer::World,
-        AdmissionMaterializer::TokenVm => {
-            EpochMaterializer::TokenVm(VmEpochMaterializer::new(world.next_entity()))
+    let (mut world, mut materializer) = match (materializer, checkpoint) {
+        (AdmissionMaterializer::TokenVm, Some(checkpoint)) => (
+            checkpoint.world,
+            EpochMaterializer::TokenVm(checkpoint.materializer),
+        ),
+        (AdmissionMaterializer::World, _) => {
+            (Arc::new(World::genesis()), EpochMaterializer::World)
+        }
+        (AdmissionMaterializer::TokenVm, None) => {
+            let world = Arc::new(World::genesis());
+            let vm = VmEpochMaterializer::new(world.next_entity());
+            (world, EpochMaterializer::TokenVm(vm))
         }
     };
     for intents in epochs {
@@ -1112,6 +1272,195 @@ fn replay_epochs(
         };
     }
     Ok((world, materializer))
+}
+
+fn checkpoint_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".checkpoint");
+    PathBuf::from(value)
+}
+
+fn checkpoint_temp_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".checkpoint.tmp");
+    PathBuf::from(value)
+}
+
+fn read_checkpoint(path: &Path, journal: &[u8]) -> Option<RecoveredCheckpoint> {
+    let bytes = fs::read(checkpoint_path(path)).ok()?;
+    if bytes.len() < CHECKPOINT_HEADER_LEN + CHECKPOINT_TRAILER.len()
+        || bytes.len() > MAX_CHECKPOINT_BYTES
+        || &bytes[..8] != CHECKPOINT_MAGIC
+        || u32::from_le_bytes(bytes[8..12].try_into().ok()?) != CHECKPOINT_VERSION
+    {
+        return None;
+    }
+    let payload_len = u64::from_le_bytes(bytes[16..24].try_into().ok()?) as usize;
+    let checksum = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
+    let end = CHECKPOINT_HEADER_LEN.checked_add(payload_len)?;
+    if end.checked_add(CHECKPOINT_TRAILER.len())? != bytes.len()
+        || &bytes[end..] != CHECKPOINT_TRAILER
+    {
+        return None;
+    }
+    let payload = &bytes[CHECKPOINT_HEADER_LEN..end];
+    if digest(payload) != checksum {
+        return None;
+    }
+    let mut cursor = Cursor::new(payload);
+    let epoch_count = read_u64(&mut cursor).ok()?;
+    let journal_offset = read_u64(&mut cursor).ok()?;
+    let prefix_digest = read_u64(&mut cursor).ok()?;
+    let expected_world = WorldId::new(read_u64(&mut cursor).ok()?);
+    let expected_version = read_u64(&mut cursor).ok()?;
+    let expected_allocator = read_u64(&mut cursor).ok()?;
+    let offset = usize::try_from(journal_offset).ok()?;
+    if offset < JOURNAL_HEADER_LEN
+        || offset > journal.len()
+        || digest(&journal[..offset]) != prefix_digest
+    {
+        return None;
+    }
+    let frame_count = read_u64(&mut cursor).ok()?;
+    let frame_count = usize::try_from(frame_count).ok()?;
+    let mut frames = Vec::with_capacity(frame_count);
+    for _ in 0..frame_count {
+        frames.push(Arc::new(decode_checkpoint_frame(&mut cursor).ok()?));
+    }
+    if cursor.position() as usize != payload.len() {
+        return None;
+    }
+    let world = World::restore_vm_frames(&frames).ok()?;
+    if world.id() != expected_world
+        || world.version() != expected_version
+        || world.next_entity() != expected_allocator
+    {
+        return None;
+    }
+    let materializer = VmEpochMaterializer::restore(&frames).ok()?;
+    Some(RecoveredCheckpoint {
+        epoch_count,
+        journal_offset,
+        bytes: bytes.len() as u64,
+        world,
+        materializer,
+    })
+}
+
+fn encode_checkpoint_frame(frame: &CommitFrame, output: &mut Vec<u8>) -> Result<(), String> {
+    output.extend_from_slice(&frame.parent_world().value().to_le_bytes());
+    output.extend_from_slice(&frame.resulting_world().value().to_le_bytes());
+    output.extend_from_slice(&frame.parent_version().to_le_bytes());
+    output.extend_from_slice(&frame.resulting_version().to_le_bytes());
+    output.extend_from_slice(&frame.resulting_allocator().to_le_bytes());
+    let operation_count = u32::try_from(frame.operations().len())
+        .map_err(|_| "checkpoint frame has too many operations".to_owned())?;
+    output.extend_from_slice(&operation_count.to_le_bytes());
+    for operation in frame.operations() {
+        match operation {
+            Operation::AllocateEntity { entity } => {
+                output.push(0);
+                output.extend_from_slice(&entity.value().to_le_bytes());
+            }
+            Operation::Define { slot, fact } => {
+                output.push(1);
+                encode_checkpoint_string(slot.as_str(), output)?;
+                encode_checkpoint_atom(&fact.subject, output)?;
+                encode_checkpoint_string(fact.predicate.as_str(), output)?;
+                encode_checkpoint_atom(&fact.object, output)?;
+            }
+            Operation::Forget { slot } => {
+                output.push(2);
+                encode_checkpoint_string(slot.as_str(), output)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_checkpoint_atom(atom: &Atom, output: &mut Vec<u8>) -> Result<(), String> {
+    match atom {
+        Atom::Entity(entity) => {
+            output.push(0);
+            output.extend_from_slice(&entity.value().to_le_bytes());
+        }
+        Atom::Literal(literal) => {
+            output.push(1);
+            encode_checkpoint_string(literal.as_str(), output)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_checkpoint_string(value: &str, output: &mut Vec<u8>) -> Result<(), String> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| "checkpoint string exceeds u32 length".to_owned())?;
+    output.extend_from_slice(&length.to_le_bytes());
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn decode_checkpoint_frame(cursor: &mut Cursor<&[u8]>) -> Result<CommitFrame, String> {
+    let parent_world = WorldId::new(read_u64(cursor)?);
+    let resulting_world = WorldId::new(read_u64(cursor)?);
+    let parent_version = read_u64(cursor)?;
+    let resulting_version = read_u64(cursor)?;
+    let resulting_allocator = read_u64(cursor)?;
+    let operation_count = read_u32(cursor)? as usize;
+    let mut operations = Vec::with_capacity(operation_count.min(1_048_576));
+    for _ in 0..operation_count {
+        let operation = match read_u8(cursor)? {
+            0 => Operation::AllocateEntity {
+                entity: EntityId::new(read_u64(cursor)?),
+            },
+            1 => Operation::Define {
+                slot: SlotId::new(read_checkpoint_string(cursor)?),
+                fact: Fact::new(
+                    decode_checkpoint_atom(cursor)?,
+                    Predicate::new(read_checkpoint_string(cursor)?),
+                    decode_checkpoint_atom(cursor)?,
+                ),
+            },
+            2 => Operation::Forget {
+                slot: SlotId::new(read_checkpoint_string(cursor)?),
+            },
+            tag => return Err(format!("unknown checkpoint operation tag {tag}")),
+        };
+        operations.push(operation);
+    }
+    Ok(CommitFrame {
+        parent_world,
+        resulting_world,
+        parent_version,
+        resulting_version,
+        resulting_allocator,
+        operations: Arc::from(operations),
+    })
+}
+
+fn decode_checkpoint_atom(cursor: &mut Cursor<&[u8]>) -> Result<Atom, String> {
+    match read_u8(cursor)? {
+        0 => Ok(Atom::Entity(EntityId::new(read_u64(cursor)?))),
+        1 => Ok(Atom::Literal(Literal::new(read_checkpoint_string(cursor)?))),
+        tag => Err(format!("unknown checkpoint atom tag {tag}")),
+    }
+}
+
+fn read_checkpoint_string(cursor: &mut Cursor<&[u8]>) -> Result<String, String> {
+    let length = read_u32(cursor)? as usize;
+    let start = cursor.position() as usize;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| "checkpoint string length overflow".to_owned())?;
+    let bytes = cursor
+        .get_ref()
+        .get(start..end)
+        .ok_or_else(|| "truncated checkpoint string".to_owned())?;
+    let value = std::str::from_utf8(bytes)
+        .map_err(|error| error.to_string())?
+        .to_owned();
+    cursor.set_position(end as u64);
+    Ok(value)
 }
 
 fn encode_epoch(batch: &EpochBatch) -> Vec<u8> {
@@ -1166,6 +1515,14 @@ fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, String> {
         .read_exact(&mut bytes)
         .map_err(|error| error.to_string())?;
     Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8, String> {
+    let mut byte = [0; 1];
+    cursor
+        .read_exact(&mut byte)
+        .map_err(|error| error.to_string())?;
+    Ok(byte[0])
 }
 
 fn read_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64, String> {
@@ -1288,7 +1645,7 @@ mod tests {
     #[test]
     fn durable_intent_epochs_replay_worlds_and_trim_an_incomplete_tail() {
         let path = path("replay");
-        let initialized = recover_journal(&path).expect("journal initializes");
+        let initialized = recover_journal(&path, false).expect("journal initializes");
         assert_eq!(initialized.file_len, JOURNAL_HEADER_LEN as u64);
 
         let mut first = QueuedIntent::new();
@@ -1319,12 +1676,17 @@ mod tests {
         file.sync_data().unwrap();
         drop(file);
 
-        let recovered = recover_journal(&path).expect("sound prefix recovers");
+        let recovered = recover_journal(&path, false).expect("sound prefix recovers");
         assert_eq!(recovered.epochs.len(), 2);
         assert_eq!(recovered.file_len, expected_len as u64);
         assert_eq!(fs::metadata(&path).unwrap().len(), expected_len as u64);
-        let (world, _) = replay_epochs(&recovered.epochs, &[], AdmissionMaterializer::TokenVm)
-            .expect("epochs materialize");
+        let (world, _) = replay_epochs(
+            recovered.checkpoint,
+            &recovered.epochs,
+            &[],
+            AdmissionMaterializer::TokenVm,
+        )
+        .expect("epochs materialize");
         assert_eq!(world.version(), 2);
         assert!(world.resolve(&SlotId::new("replay/name")).is_some());
         assert!(world.resolve(&SlotId::new("replay/state")).is_some());
@@ -1396,6 +1758,140 @@ mod tests {
         reopened.shutdown();
         drop(reopened);
         fs::remove_file(&path).unwrap();
+        let _ = fs::remove_file(writer_lock_path(&path));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn semantic_checkpoint_restores_prefix_and_replays_journal_tail() {
+        let path = path("checkpoint-tail");
+        let controller = match AdmissionEpochController::open_vm(&path, 16, 16, 64) {
+            Ok(controller) => controller,
+            Err(AdmissionEpochOpenError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(writer_lock_path(&path));
+                return;
+            }
+            Err(error) => panic!("admission controller should open: {error}"),
+        };
+        let mut first = QueuedIntent::new();
+        let entity = first.entity();
+        first.define(
+            SlotId::new("checkpoint/name"),
+            IntentFact::new(entity, Predicate::new("name"), Literal::new("Ada")),
+        );
+        let first = controller
+            .submit_epoch(vec![first])
+            .expect("first epoch submits")
+            .remove(0)
+            .wait()
+            .expect("first epoch resolves");
+        assert!(matches!(first, AdmissionEpochTicketOutcome::Accepted { .. }));
+        let checkpoint = controller.checkpoint().expect("checkpoint persists");
+        assert_eq!(checkpoint.epoch_count, 1);
+
+        let mut second = QueuedIntent::new();
+        second.define(
+            SlotId::new("checkpoint/state"),
+            IntentFact::new(
+                EntityId::new(1),
+                Predicate::new("state"),
+                Literal::new("active"),
+            ),
+        );
+        let second = controller
+            .submit_epoch(vec![second])
+            .expect("tail epoch submits")
+            .remove(0)
+            .wait()
+            .expect("tail epoch resolves");
+        assert!(matches!(second, AdmissionEpochTicketOutcome::Accepted { .. }));
+        controller.flush().expect("tail epoch applies");
+        let expected = controller.snapshot();
+        controller.shutdown();
+        drop(controller);
+
+        let reopened = AdmissionEpochController::open_vm(&path, 16, 16, 64)
+            .expect("checkpoint and tail reopen");
+        let metrics = reopened.metrics();
+        assert!(metrics.checkpoint_loaded);
+        assert_eq!(metrics.checkpoint_epochs_skipped, 1);
+        assert_eq!(metrics.durable_epochs, 2);
+        assert_eq!(reopened.snapshot().id(), expected.id());
+        assert_eq!(reopened.snapshot().frames(), expected.frames());
+        assert!(reopened
+            .snapshot()
+            .resolve(&SlotId::new("checkpoint/state"))
+            .is_some());
+        assert!(!reopened
+            .snapshot()
+            .is_legacy_query_projection_materialized());
+        reopened.shutdown();
+        drop(reopened);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(checkpoint_path(&path)).unwrap();
+        let _ = fs::remove_file(writer_lock_path(&path));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn corrupt_checkpoint_falls_back_to_complete_journal_replay() {
+        let path = path("checkpoint-corrupt");
+        let controller = match AdmissionEpochController::open_vm(&path, 16, 16, 64) {
+            Ok(controller) => controller,
+            Err(AdmissionEpochOpenError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(writer_lock_path(&path));
+                return;
+            }
+            Err(error) => panic!("admission controller should open: {error}"),
+        };
+        let mut intent = QueuedIntent::new();
+        let entity = intent.entity();
+        intent.define(
+            SlotId::new("checkpoint/sound"),
+            IntentFact::new(entity, Predicate::new("state"), Literal::new("sound")),
+        );
+        let outcome = controller
+            .submit_epoch(vec![intent])
+            .expect("epoch submits")
+            .remove(0)
+            .wait()
+            .expect("epoch resolves");
+        assert!(matches!(outcome, AdmissionEpochTicketOutcome::Accepted { .. }));
+        controller.checkpoint().expect("checkpoint persists");
+        let expected = controller.snapshot().id();
+        controller.shutdown();
+        drop(controller);
+
+        let checkpoint = checkpoint_path(&path);
+        let mut bytes = fs::read(&checkpoint).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x5a;
+        fs::write(&checkpoint, bytes).unwrap();
+
+        let reopened = AdmissionEpochController::open_vm(&path, 16, 16, 64)
+            .expect("journal survives corrupt checkpoint");
+        assert!(!reopened.metrics().checkpoint_loaded);
+        assert_eq!(reopened.snapshot().id(), expected);
+        assert!(reopened
+            .snapshot()
+            .resolve(&SlotId::new("checkpoint/sound"))
+            .is_some());
+        reopened.shutdown();
+        drop(reopened);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(checkpoint).unwrap();
         let _ = fs::remove_file(writer_lock_path(&path));
     }
 

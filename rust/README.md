@@ -69,6 +69,7 @@ Design and evidence:
 - [`ADMISSION_EPOCH_WORLDS.md`](ADMISSION_EPOCH_WORLDS.md)
 - [`DURABLE_TOKEN_VM.md`](DURABLE_TOKEN_VM.md)
 - [`VM_DIRECT_QUERIES.md`](VM_DIRECT_QUERIES.md)
+- [`SEMANTIC_CHECKPOINTS.md`](SEMANTIC_CHECKPOINTS.md)
 - [`FILE_FORMAT.md`](../FILE_FORMAT.md)
 - [`WORLD_CONTRACT.md`](../WORLD_CONTRACT.md)
 
@@ -213,3 +214,8 @@ existing `World` query API is preserved through a lazy cached projection built
 directly from immutable VM roots rather than a reconstructed `ForthDb`.
 See [`VM_WORLD_ROOTS.md`](VM_WORLD_ROOTS.md) and
 [`VM_DIRECT_QUERIES.md`](VM_DIRECT_QUERIES.md).
+
+Token-VM controllers can also write validated semantic checkpoints. Recovery
+restores the accepted immutable frame prefix and replays only later admission
+epochs; invalid checkpoints fall back to complete journal replay. See
+[`SEMANTIC_CHECKPOINTS.md`](SEMANTIC_CHECKPOINTS.md).

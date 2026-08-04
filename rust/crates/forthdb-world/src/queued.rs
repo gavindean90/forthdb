@@ -614,6 +614,23 @@ impl VmEpochMaterializer {
         }
     }
 
+    pub(crate) fn restore(frames: &[Arc<CommitFrame>]) -> Result<Self, String> {
+        let mut materializer = Self::new(1);
+        for frame in frames {
+            materializer.apply_committed(frame.operations())?;
+        }
+        let expected = frames
+            .last()
+            .map_or(1, |frame| frame.resulting_allocator());
+        if materializer.workspace.next_entity() != expected {
+            return Err(format!(
+                "checkpoint VM allocator {}, expected {expected}",
+                materializer.workspace.next_entity()
+            ));
+        }
+        Ok(materializer)
+    }
+
     pub(crate) fn materialize(
         &mut self,
         base: Arc<World>,

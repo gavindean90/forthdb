@@ -13,7 +13,8 @@ pub mod stack_vm;
 mod writer_lock;
 
 pub use admission_epoch::{
-    AdmissionEpochBatchSubmitError, AdmissionEpochController, AdmissionEpochMetrics,
+    AdmissionEpochBatchSubmitError, AdmissionEpochCheckpoint, AdmissionEpochController,
+    AdmissionEpochMetrics,
     AdmissionEpochOpenError, AdmissionEpochReceipt, AdmissionEpochSubmitError,
     AdmissionEpochTicket, AdmissionEpochTicketOutcome,
 };

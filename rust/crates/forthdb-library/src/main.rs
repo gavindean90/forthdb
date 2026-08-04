@@ -75,6 +75,8 @@ mod linux {
         final_query_projection_was_deferred: bool,
         final_query_projection_elapsed_us: u128,
         final_legacy_query_projection_materialized: bool,
+        checkpoint_create_elapsed_us: Option<u128>,
+        checkpoint_bytes: Option<u64>,
         world_version: u64,
         world_id: String,
         frame_count: usize,
@@ -98,6 +100,8 @@ mod linux {
         query_projection_was_deferred: bool,
         query_projection_elapsed_us: u128,
         legacy_query_projection_materialized: bool,
+        checkpoint_loaded: bool,
+        checkpoint_epochs_skipped: u64,
         same_world: bool,
         same_version: bool,
         same_frame_count: bool,
@@ -137,6 +141,7 @@ mod linux {
                 ))
             });
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(checkpoint_path(&path));
         let report = run_library(&path, Materializer::from_environment()?)?;
         let json = serde_json::to_string_pretty(&report)?;
         if let Ok(report_path) = std::env::var("FORTHDB_LIBRARY_REPORT") {
@@ -364,6 +369,13 @@ mod linux {
         let expected_world = final_world.id();
         let expected_version = final_world.version();
         let expected_frames = final_world.frames().len();
+        let checkpoint = if materializer.uses_vm() {
+            let started = Instant::now();
+            let checkpoint = controller.checkpoint()?;
+            Some((started.elapsed(), checkpoint))
+        } else {
+            None
+        };
         controller.shutdown();
         drop(controller);
 
@@ -377,12 +389,15 @@ mod linux {
         recovered_world.materialize_query_projection();
         let recovery_query_projection_elapsed = recovery_projection_started.elapsed();
         let recovered_locations = query(&recovered_world, &copies_and_shelves);
+        let recovered_metrics = recovered.metrics();
         let recovery = Recovery {
             open_elapsed_us: recovery_open_elapsed.as_micros(),
             query_projection_was_deferred: recovery_query_projection_was_deferred,
             query_projection_elapsed_us: recovery_query_projection_elapsed.as_micros(),
             legacy_query_projection_materialized: recovered_world
                 .is_legacy_query_projection_materialized(),
+            checkpoint_loaded: recovered_metrics.checkpoint_loaded,
+            checkpoint_epochs_skipped: recovered_metrics.checkpoint_epochs_skipped,
             same_world: recovered_world.id() == expected_world,
             same_version: recovered_world.version() == expected_version,
             same_frame_count: recovered_world.frames().len() == expected_frames,
@@ -391,6 +406,13 @@ mod linux {
 
         if !recovery.same_world || !recovery.same_version || !recovery.same_frame_count {
             return Err("reopened library did not reconstruct the durable world".into());
+        }
+        if let Some((_, checkpoint)) = checkpoint.as_ref() {
+            if !recovery.checkpoint_loaded
+                || recovery.checkpoint_epochs_skipped != checkpoint.epoch_count
+            {
+                return Err("reopened library did not load its semantic checkpoint".into());
+            }
         }
         if after_return != Vec::<BTreeMap<String, String>>::new() {
             return Err("returned copy remained checked out".into());
@@ -414,6 +436,12 @@ mod linux {
             final_query_projection_elapsed_us: final_query_projection_elapsed.as_micros(),
             final_legacy_query_projection_materialized: final_world
                 .is_legacy_query_projection_materialized(),
+            checkpoint_create_elapsed_us: checkpoint
+                .as_ref()
+                .map(|(elapsed, _)| elapsed.as_micros()),
+            checkpoint_bytes: checkpoint
+                .as_ref()
+                .map(|(_, checkpoint)| checkpoint.checkpoint_bytes),
             world_version: recovered_world.version(),
             world_id: recovered_world.id().to_string(),
             frame_count: recovered_world.frames().len(),
@@ -430,6 +458,12 @@ mod linux {
             recovery,
             controller: observation,
         })
+    }
+
+    fn checkpoint_path(path: &Path) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(".checkpoint");
+        PathBuf::from(value)
     }
 
     fn relation_slot(owner: EntityId, relation: &str, suffix: &str) -> forthdb_core::SlotId {

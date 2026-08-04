@@ -675,6 +675,79 @@ impl World {
         frames
     }
 
+    pub(crate) fn restore_vm_frames(
+        frames: &[Arc<CommitFrame>],
+    ) -> Result<Arc<Self>, CandidateError> {
+        let mut world = Arc::new(Self::genesis());
+        let mut definition_depths = HashMap::<SlotId, usize>::new();
+        let mut record_count = 0usize;
+        let mut next_entity = 1u64;
+        for expected in frames {
+            if expected.parent_world != world.id {
+                return Err(CandidateError::HistoryParentMismatch {
+                    expected: world.id,
+                    actual: expected.parent_world,
+                });
+            }
+            if expected.parent_version != world.version {
+                return Err(CandidateError::HistoryVersionMismatch {
+                    expected: world.version,
+                    actual: expected.parent_version,
+                });
+            }
+            for operation in expected.operations.iter() {
+                match operation {
+                    Operation::AllocateEntity { entity } => {
+                        if entity.value() != next_entity {
+                            return Err(CandidateError::AllocatorOperationMismatch {
+                                expected: next_entity,
+                                actual: entity.value(),
+                            });
+                        }
+                        next_entity += 1;
+                    }
+                    Operation::Define { slot, .. } => {
+                        *definition_depths.entry(slot.clone()).or_default() += 1;
+                        record_count += 1;
+                    }
+                    Operation::Forget { slot } => {
+                        let remove = if let Some(depth) = definition_depths.get_mut(slot) {
+                            *depth = depth.saturating_sub(1);
+                            *depth == 0
+                        } else {
+                            false
+                        };
+                        if remove {
+                            definition_depths.remove(slot);
+                        }
+                        record_count += 1;
+                    }
+                }
+            }
+            if next_entity != expected.resulting_allocator {
+                return Err(CandidateError::AllocatorStateMismatch {
+                    expected: expected.resulting_allocator,
+                    actual: next_entity,
+                });
+            }
+            let (restored, actual) = Self::from_vm_epoch(
+                world,
+                expected.operations.to_vec(),
+                next_entity,
+                definition_depths.len(),
+                record_count,
+            );
+            if actual.as_ref() != expected.as_ref() {
+                return Err(CandidateError::WorldIdentityMismatch {
+                    expected: expected.resulting_world,
+                    actual: actual.resulting_world,
+                });
+            }
+            world = restored;
+        }
+        Ok(world)
+    }
+
     fn reconstruct(frames: &[Arc<CommitFrame>]) -> Result<Self, CandidateError> {
         let mut world = Self::genesis();
         let mut kernel = ForthDb::new();

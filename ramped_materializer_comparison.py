@@ -35,7 +35,7 @@ def median(samples: list[float | int]) -> float:
 
 def summarize(reports: list[dict], profile: str) -> dict:
     selected = [report[profile] for report in reports]
-    return {
+    summary = {
         "samples": len(selected),
         "intents_per_second": median(
             [sample["intents_per_second"] for sample in selected]
@@ -62,6 +62,41 @@ def summarize(reports: list[dict], profile: str) -> dict:
             sample["intents_per_second"] for sample in selected
         ],
     }
+    checkpointed = [sample for sample in selected if sample["checkpoint"] is not None]
+    if checkpointed:
+        checkpoint_open = summary["recovery_open_elapsed_us"]
+        checkpoint_projection = summary["recovery_query_projection_elapsed_us"]
+        full_open = median(
+            [
+                sample["checkpoint"]["full_replay_open_elapsed_us"]
+                for sample in checkpointed
+            ]
+        )
+        full_projection = median(
+            [
+                sample["checkpoint"]["full_replay_query_projection_elapsed_us"]
+                for sample in checkpointed
+            ]
+        )
+        summary["checkpoint"] = {
+            "create_elapsed_us": median(
+                [sample["checkpoint"]["create_elapsed_us"] for sample in checkpointed]
+            ),
+            "checkpoint_bytes": median(
+                [sample["checkpoint"]["checkpoint_bytes"] for sample in checkpointed]
+            ),
+            "epochs_skipped": median(
+                [
+                    sample["recovery"]["checkpoint_epochs_skipped"]
+                    for sample in checkpointed
+                ]
+            ),
+            "full_replay_query_ready_us": full_open + full_projection,
+            "checkpoint_query_ready_us": checkpoint_open + checkpoint_projection,
+            "query_ready_speedup": (full_open + full_projection)
+            / (checkpoint_open + checkpoint_projection),
+        }
+    return summary
 
 
 def main() -> None:

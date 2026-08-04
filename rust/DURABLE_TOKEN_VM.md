@@ -58,9 +58,10 @@ builds record-ordered indexes directly from immutable history and caches them
 on the queried root. See [`VM_WORLD_ROOTS.md`](VM_WORLD_ROOTS.md) and
 [`VM_DIRECT_QUERIES.md`](VM_DIRECT_QUERIES.md).
 
-The query projection is still rebuilt after process recovery. Persisting a
-compact projection checkpoint is the next recovery-specific experiment, not
-part of this query milestone.
+Semantic checkpoints can now restore the accepted frame prefix and token VM
+before replaying only the later admission epochs. Query indexes remain derived
+after process recovery. See
+[`SEMANTIC_CHECKPOINTS.md`](SEMANTIC_CHECKPOINTS.md).
 
 ## Evidence
 

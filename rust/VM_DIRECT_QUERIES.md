@@ -20,10 +20,11 @@ This keeps the public semantics unchanged:
 - limits, distinct rows, provenance and deterministic result ordering match
   the legacy kernel.
 
-The projection is deliberately not a checkpoint. Its first construction still
-walks history from the current root, after which `OnceLock` makes reads reuse
-the immutable indexed view. Persisting a compact projection checkpoint is the
-next independent recovery experiment.
+The projection is not raw process memory. Its first construction still walks
+history from the current root, after which `OnceLock` makes reads reuse the
+immutable indexed view. [`SEMANTIC_CHECKPOINTS.md`](SEMANTIC_CHECKPOINTS.md)
+persists the accepted semantic frame prefix so recovery can skip intent replay;
+the read indexes remain a derived in-memory view.
 
 `World::is_query_projection_materialized()` observes the native read view.
 `World::is_legacy_query_projection_materialized()` separately proves whether
