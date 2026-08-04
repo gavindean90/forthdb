@@ -339,7 +339,8 @@ impl MmapVmSnapshot {
         put_u32(&mut bytes, 12, HEADER_LEN as u32);
         let file_len = bytes.len() as u64;
         put_u64(&mut bytes, 16, file_len);
-        put_u64(&mut bytes, 24, digest(&bytes[HEADER_LEN..]));
+        let body_digest = digest(&bytes[HEADER_LEN..]);
+        put_u64(&mut bytes, 24, body_digest);
         put_u64(&mut bytes, 32, epoch_count);
         put_u64(&mut bytes, 40, journal.len() as u64);
         put_u64(&mut bytes, 48, digest(journal));

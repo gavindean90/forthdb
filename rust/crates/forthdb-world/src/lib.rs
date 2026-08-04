@@ -717,7 +717,7 @@ impl World {
     }
 
     pub(crate) fn from_mmap(snapshot: Arc<MmapVmSnapshot>) -> Arc<Self> {
-        let mut vm_query = OnceLock::new();
+        let vm_query = OnceLock::new();
         let _ = vm_query.set(Arc::new(VmQueryProjection::from_mmap(snapshot.clone())));
         Arc::new(Self {
             id: snapshot.world_id(),
