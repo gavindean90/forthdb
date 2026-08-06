@@ -1,9 +1,12 @@
 name: Speculative io_uring Durability
 
 on:
-  push:
   pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
