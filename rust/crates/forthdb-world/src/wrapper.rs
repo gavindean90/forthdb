@@ -12,6 +12,7 @@ mod queued;
 mod queued_controller;
 pub mod semantic_isa;
 pub mod stack_vm;
+pub mod transaction_ast;
 mod writer_lock;
 
 pub use admission_epoch::{

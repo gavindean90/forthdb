@@ -810,12 +810,19 @@ impl Workspace {
     ) -> Result<(), ExecError> {
         match instruction.opcode {
             Opcode::ExpectObject => {
-                let slot = SlotToken(instruction.argument);
                 let expected = Cell(instruction.immediate);
-                match self.resolve_trial_object(slot, checkpoint.delta_frontier)? {
-                    Some(actual) if actual == expected => Ok(()),
-                    Some(_) => Err(ExecError::ExpectedValueMismatch),
-                    None => Err(ExecError::MissingExpectedValue),
+                if instruction.argument == u32::MAX {
+                    if self.semantic_hash != expected.0 {
+                        return Err(ExecError::ExpectedValueMismatch);
+                    }
+                    Ok(())
+                } else {
+                    let slot = SlotToken(instruction.argument);
+                    match self.resolve_trial_object(slot, checkpoint.delta_frontier)? {
+                        Some(actual) if actual == expected => Ok(()),
+                        Some(_) => Err(ExecError::ExpectedValueMismatch),
+                        None => Err(ExecError::MissingExpectedValue),
+                    }
                 }
             }
             Opcode::Allocate => {
@@ -1542,5 +1549,36 @@ mod tests {
                 "rejected marker must remain invisible"
             );
         }
+    }
+    
+    #[test]
+    fn expect_world_accepts_matching_predecessor() {
+        let mut workspace = Workspace::with_capacity(4, 16, 16, 16);
+        let current_world = workspace.semantic_hash;
+        let expected = IntentProgram::new(
+            0,
+            vec![
+                Instruction::raw(Opcode::ExpectObject, u32::MAX, current_world),
+            ],
+        );
+        assert_eq!(
+            workspace.execute(&expected),
+            ExecutionOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn expect_world_rejects_stale_predecessor() {
+        let mut workspace = Workspace::with_capacity(4, 16, 16, 16);
+        let expected = IntentProgram::new(
+            0,
+            vec![
+                Instruction::raw(Opcode::ExpectObject, u32::MAX, 99999),
+            ],
+        );
+        assert_eq!(
+            workspace.execute(&expected),
+            ExecutionOutcome::Rejected(ExecError::ExpectedValueMismatch)
+        );
     }
 }
