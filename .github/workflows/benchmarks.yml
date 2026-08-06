@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   benchmarks:
-    name: Run VM Profiling, Ramped Workloads, and io_uring Benchmarks
+    name: Run Semantic Pipeline, VM Profiling, Ramped Workloads, and io_uring Benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -27,6 +27,9 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Semantic Intent AST to SISA Pipeline Benchmark
+        run: cargo run --manifest-path rust/Cargo.toml --release --bin semantic_intent_pipeline
 
       - name: Volatile Stack VM Benchmark (30M-55M ops/sec)
         run: cargo run --manifest-path rust/Cargo.toml --release --bin stack_vm_phases
@@ -40,5 +43,5 @@ jobs:
       - name: Queued Ingress Controller Benchmark
         run: cargo run --manifest-path rust/Cargo.toml --release --bin queued_ingress
 
-      - name: Ramped Library Workload & Durable io_uring Benchmarks
-        run: cargo test --manifest-path rust/Cargo.toml --test queued_durable_benchmarks -- --ignored --nocapture
+      - name: Ramped Library Workload & Durable io_uring Benchmarks (Release)
+        run: cargo test --manifest-path rust/Cargo.toml --release --test queued_durable_benchmarks -- --ignored --nocapture
