@@ -1,3 +1,4 @@
+use crate::queued::VmEpochMaterializer;
 use super::queued_controller::{AdaptiveState, BatchSealReason};
 use super::*;
 use std::collections::{BTreeMap, VecDeque};
@@ -1346,7 +1347,11 @@ fn derive_prepared_batch(
 ) -> Result<PreparedDurableBatch, (UnplannedDurableBatch, String)> {
     let derive_started = Instant::now();
     let result = catch_unwind(AssertUnwindSafe(|| {
-        derive_epoch(base, source.intents.clone(), validators)
+        let mut materializer = VmEpochMaterializer::new(base.next_entity());
+        materializer
+            .materialize(base, source.intents.clone(), validators)
+            .map(|(plan, _)| plan)
+            .expect("vm materialize")
     }));
     metrics
         .derive_nanos
@@ -1827,7 +1832,11 @@ fn commit_durable_epoch<I: EpochFileIo>(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let plan = derive_epoch(base, intents, &validators);
+    let mut materializer = VmEpochMaterializer::new(base.next_entity());
+    let plan = materializer
+        .materialize(base, intents, &validators)
+        .expect("vm materialize")
+        .0;
     metrics
         .derive_nanos
         .fetch_add(nanos(derive_started.elapsed()), Ordering::Relaxed);
