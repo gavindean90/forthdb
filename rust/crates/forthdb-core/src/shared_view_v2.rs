@@ -144,13 +144,94 @@ impl SharedCurrentView {
             + self.by_predicate_object.populated_shards()
             + self.by_exact.populated_shards()
     }
+
+    fn replace(
+        &mut self,
+        old_record_id: RecordId,
+        new_record_id: RecordId,
+        store: &SharedDefinitionStore,
+    ) {
+        let old_fact = store
+            .record(old_record_id)
+            .fact
+            .as_ref()
+            .expect("current definitions have facts");
+        let new_fact = store
+            .record(new_record_id)
+            .fact
+            .as_ref()
+            .expect("new definitions have facts");
+
+        if old_fact.subject == new_fact.subject {
+            replace_index(&mut self.by_subject, &old_fact.subject, old_record_id, new_record_id);
+        } else {
+            remove_index(&mut self.by_subject, &old_fact.subject, old_record_id);
+            insert_index(&mut self.by_subject, new_fact.subject.clone(), new_record_id);
+        }
+
+        if old_fact.predicate == new_fact.predicate {
+            replace_index(&mut self.by_predicate, &old_fact.predicate, old_record_id, new_record_id);
+        } else {
+            remove_index(&mut self.by_predicate, &old_fact.predicate, old_record_id);
+            insert_index(&mut self.by_predicate, new_fact.predicate.clone(), new_record_id);
+        }
+
+        if old_fact.object == new_fact.object {
+            replace_index(&mut self.by_object, &old_fact.object, old_record_id, new_record_id);
+        } else {
+            remove_index(&mut self.by_object, &old_fact.object, old_record_id);
+            insert_index(&mut self.by_object, new_fact.object.clone(), new_record_id);
+        }
+
+        let old_sp = (old_fact.subject.clone(), old_fact.predicate.clone());
+        let new_sp = (new_fact.subject.clone(), new_fact.predicate.clone());
+        if old_sp == new_sp {
+            replace_index(&mut self.by_subject_predicate, &old_sp, old_record_id, new_record_id);
+        } else {
+            remove_index(&mut self.by_subject_predicate, &old_sp, old_record_id);
+            insert_index(&mut self.by_subject_predicate, new_sp, new_record_id);
+        }
+
+        let old_so = (old_fact.subject.clone(), old_fact.object.clone());
+        let new_so = (new_fact.subject.clone(), new_fact.object.clone());
+        if old_so == new_so {
+            replace_index(&mut self.by_subject_object, &old_so, old_record_id, new_record_id);
+        } else {
+            remove_index(&mut self.by_subject_object, &old_so, old_record_id);
+            insert_index(&mut self.by_subject_object, new_so, new_record_id);
+        }
+
+        let old_po = (old_fact.predicate.clone(), old_fact.object.clone());
+        let new_po = (new_fact.predicate.clone(), new_fact.object.clone());
+        if old_po == new_po {
+            replace_index(&mut self.by_predicate_object, &old_po, old_record_id, new_record_id);
+        } else {
+            remove_index(&mut self.by_predicate_object, &old_po, old_record_id);
+            insert_index(&mut self.by_predicate_object, new_po, new_record_id);
+        }
+
+        if old_fact == new_fact {
+            replace_index(&mut self.by_exact, old_fact, old_record_id, new_record_id);
+        } else {
+            remove_index(&mut self.by_exact, old_fact, old_record_id);
+            insert_index(&mut self.by_exact, new_fact.clone(), new_record_id);
+        }
+
+        self.active_signature.remove(old_record_id);
+        self.active_signature.add(new_record_id);
+    }
 }
 
 fn insert_index<K>(index: &mut Index<K>, key: K, record_id: RecordId)
 where
     K: Clone + Eq + Hash,
 {
-    let mut bucket = index.get(&key).cloned().unwrap_or_default();
+    if let Some(bucket) = index.get_mut(&key) {
+        bucket.insert(record_id);
+        return;
+    }
+
+    let mut bucket = RecordSet::default();
     bucket.insert(record_id);
     index.insert(key, bucket);
 }
@@ -159,14 +240,24 @@ fn remove_index<K>(index: &mut Index<K>, key: &K, record_id: RecordId)
 where
     K: Clone + Eq + Hash,
 {
-    let Some(existing) = index.get(key).cloned() else {
-        return;
-    };
-    let mut bucket = existing;
-    bucket.remove(&record_id);
-    if bucket.is_empty() {
-        index.remove(key);
-    } else {
-        index.insert(key.clone(), bucket);
+    if let Some(bucket) = index.get_mut(key) {
+        bucket.remove(&record_id);
+        if bucket.is_empty() {
+            index.remove(key);
+        }
+    }
+}
+
+fn replace_index<K>(
+    index: &mut Index<K>,
+    key: &K,
+    old_record_id: RecordId,
+    new_record_id: RecordId,
+) where
+    K: Clone + Eq + Hash,
+{
+    if let Some(bucket) = index.get_mut(key) {
+        bucket.remove(&old_record_id);
+        bucket.insert(new_record_id);
     }
 }

@@ -42,20 +42,26 @@ impl ForthDb {
     }
 
     pub fn define(&mut self, slot: SlotId, fact: Fact) -> RecordId {
-        if let Some(old_head) = self.store.head.get(&slot).copied() {
-            self.view.remove(old_head, &self.store);
-        }
+        let old_head = self.store.head.get(&slot).copied();
         let record_id = self.store.append_define(slot, fact);
-        self.view.add(record_id, &self.store);
+        if let Some(old_head) = old_head {
+            self.view.replace(old_head, record_id, &self.store);
+        } else {
+            self.view.add(record_id, &self.store);
+        }
         record_id
     }
 
     pub fn forget(&mut self, slot: SlotId) -> RecordId {
-        if let Some(current) = self.store.head.get(&slot).copied() {
-            self.view.remove(current, &self.store);
-        }
+        let old_head = self.store.head.get(&slot).copied();
         let (record_id, revealed) = self.store.append_forget(slot);
-        if let Some(revealed) = revealed {
+        if let Some(old_head) = old_head {
+            if let Some(revealed) = revealed {
+                self.view.replace(old_head, revealed, &self.store);
+            } else {
+                self.view.remove(old_head, &self.store);
+            }
+        } else if let Some(revealed) = revealed {
             self.view.add(revealed, &self.store);
         }
         record_id

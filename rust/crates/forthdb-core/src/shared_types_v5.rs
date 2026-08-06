@@ -176,6 +176,15 @@ where
             .and_then(|shard| shard.get(key))
     }
 
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        let (group_index, local_index) = Self::directory_indices(key);
+        let root = Arc::make_mut(&mut self.groups);
+        let group_arc = root[group_index].as_mut()?;
+        let group = Arc::make_mut(group_arc);
+        let shard = group[local_index].as_mut()?;
+        Arc::make_mut(shard).get_mut(key)
+    }
+
     fn insert(&mut self, key: K, value: V) -> Option<V> {
         let (group_index, local_index) = Self::directory_indices(&key);
         let root = Arc::make_mut(&mut self.groups);

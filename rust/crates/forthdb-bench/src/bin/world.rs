@@ -292,6 +292,7 @@ where
     let mut elapsed = Vec::with_capacity(SAMPLES);
     let mut checksum = 0_u64;
     for _ in 0..SAMPLES {
+        forthdb_core::ForthDb::drain_reaper(Duration::from_secs(5));
         let mut state = setup();
         let started = Instant::now();
         checksum = checksum.wrapping_add(black_box(run(&mut state)));
