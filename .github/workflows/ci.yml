@@ -1,0 +1,58 @@
+name: ForthDB CI Suite
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Test Rust Workspace and Python Conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPYCACHEPREFIX: /tmp/forthdb-python-cache
+      CARGO_TARGET_DIR: /tmp/forthdb-cargo-target
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify Python sources compile
+        run: |
+          python -m py_compile \
+            forthdb_kernel.py \
+            library_demo.py \
+            deployment_demo.py \
+            forthdb_atomic.py \
+            atomic_demo.py \
+            forthdb_world.py \
+            world_library_demo.py \
+            world_deployment_demo.py \
+            conformance_runner.py \
+            forthdb_transaction_ast.py \
+            test_ast_parity.py
+
+      - name: Test Rust Workspace
+        run: cargo test --manifest-path rust/Cargo.toml
+
+      - name: Run Python AST Parity & Conformance Suite
+        run: |
+          python test_ast_parity.py
+          python conformance_runner.py

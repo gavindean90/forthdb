@@ -1,4 +1,4 @@
-name: Rust Profiling & Ramped Benchmarks
+name: ForthDB Benchmarks & io_uring
 
 on:
   push:
@@ -14,8 +14,8 @@ permissions:
   contents: read
 
 jobs:
-  rust-benchmarks:
-    name: Run Rust VM Profiling and Ramped Workload Benchmarks
+  benchmarks:
+    name: Run VM Profiling, Ramped Workloads, and io_uring Benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -28,17 +28,17 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run Volatile Stack VM Benchmark (30M-55M ops/sec)
+      - name: Volatile Stack VM Benchmark (30M-55M ops/sec)
         run: cargo run --manifest-path rust/Cargo.toml --release --bin stack_vm_phases
 
-      - name: Run Structural Candidate Scaling Benchmark
+      - name: Structural Candidate Scaling Benchmark
         run: cargo run --manifest-path rust/Cargo.toml --release --bin structural_isolated
 
-      - name: Run Memory Committed World Engine Benchmark
+      - name: Memory Committed World Engine Benchmark
         run: cargo run --manifest-path rust/Cargo.toml --release --bin world
 
-      - name: Run Queued Ingress Benchmark
+      - name: Queued Ingress Controller Benchmark
         run: cargo run --manifest-path rust/Cargo.toml --release --bin queued_ingress
 
-      - name: Run Ramped Library Workload & Durable io_uring Benchmarks
+      - name: Ramped Library Workload & Durable io_uring Benchmarks
         run: cargo test --manifest-path rust/Cargo.toml --test queued_durable_benchmarks -- --ignored --nocapture
