@@ -1,6 +1,7 @@
 name: Milestone 6A.2 Ingress and Tickets
 
 on:
+  push:
   pull_request:
   workflow_dispatch:
 

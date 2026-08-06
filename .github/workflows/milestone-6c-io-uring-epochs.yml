@@ -1,6 +1,7 @@
 name: Speculative io_uring Durability
 
 on:
+  push:
   pull_request:
   workflow_dispatch:
 

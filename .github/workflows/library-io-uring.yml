@@ -1,6 +1,7 @@
 name: Library App on Admission Epoch Worlds
 
 on:
+  push:
   pull_request:
   workflow_dispatch:
 

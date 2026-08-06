@@ -1,6 +1,7 @@
 name: Milestone 6B File Epochs
 
 on:
+  push:
   pull_request:
   workflow_dispatch:
 

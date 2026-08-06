@@ -1,8 +1,9 @@
 name: Milestone 6D Lifecycle Safety
 
 on:
-  pull_request:
   push:
+  pull_request:
+  workflow_dispatch:
     branches:
       - main
 

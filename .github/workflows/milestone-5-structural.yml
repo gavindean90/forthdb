@@ -1,6 +1,7 @@
 name: Milestone 5 Structural Sharing
 
 on:
+  push:
   pull_request:
   workflow_dispatch:
 
