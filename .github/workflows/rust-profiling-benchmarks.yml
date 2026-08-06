@@ -1,0 +1,39 @@
+name: Rust Profiling & Ramped Benchmarks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-benchmarks:
+    name: Run Rust VM Profiling and Ramped Workload Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: /tmp/forthdb-cargo-target
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Volatile Stack VM Benchmark (30M-55M ops/sec)
+        run: cargo run --manifest-path rust/Cargo.toml --release --bin stack_vm_phases
+
+      - name: Run Structural Candidate Scaling Benchmark
+        run: cargo run --manifest-path rust/Cargo.toml --release --bin structural_isolated
+
+      - name: Run Memory Committed World Engine Benchmark
+        run: cargo run --manifest-path rust/Cargo.toml --release --bin world
+
+      - name: Run Queued Ingress Benchmark
+        run: cargo run --manifest-path rust/Cargo.toml --release --bin queued_ingress
+
+      - name: Run Ramped Library Workload & Durable io_uring Benchmarks
+        run: cargo test --manifest-path rust/Cargo.toml --test queued_durable_benchmarks -- --ignored --nocapture
