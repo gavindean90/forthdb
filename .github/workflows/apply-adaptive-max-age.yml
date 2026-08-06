@@ -1,0 +1,190 @@
+name: Apply Adaptive Maximum Age
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Patch adaptive age control
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          queued = Path('rust/crates/forthdb-world/src/queued_controller.rs')
+          q = queued.read_text()
+
+          q = q.replace(
+              'const ARRIVAL_ALPHA: f64 = 0.20;\n',
+              'const ARRIVAL_ALPHA: f64 = 0.20;\n'
+              'const SERVICE_ALPHA: f64 = 0.20;\n'
+              'const SERVICE_TIME_MULTIPLIER: u32 = 4;\n'
+              'const MAX_AGE_BUDGET_MULTIPLIER: u32 = 5;\n'
+          )
+
+          q = q.replace(
+              '    pub(crate) target_width: usize,\n    pub(crate) epochs_sealed: u64,\n',
+              '    pub(crate) target_width: usize,\n'
+              '    pub(crate) epochs_sealed: u64,\n'
+              '    ewma_service_time_ns: f64,\n'
+          )
+
+          q = q.replace(
+              '            target_width: initial_target,\n            epochs_sealed: 0,\n',
+              '            target_width: initial_target,\n'
+              '            epochs_sealed: 0,\n'
+              '            ewma_service_time_ns: 250_000.0,\n'
+          )
+
+          marker = '''    pub(crate) fn update_target(&mut self, reason: BatchSealReason, achieved_width: usize, min_batch: usize, max_batch: usize) {'''
+          insert = '''    pub(crate) fn observe_service_time(&mut self, elapsed: Duration) {
+        let elapsed_ns = elapsed.as_nanos() as f64;
+        self.ewma_service_time_ns = (1.0 - SERVICE_ALPHA) * self.ewma_service_time_ns
+            + SERVICE_ALPHA * elapsed_ns;
+    }
+
+    pub(crate) fn predicted_service_time(&self) -> Duration {
+        Duration::from_nanos(self.ewma_service_time_ns.max(1.0) as u64)
+    }
+
+    pub(crate) fn dynamic_max_age(&self, latency_budget: Duration) -> Duration {
+        let service_scaled = self
+            .predicted_service_time()
+            .saturating_mul(SERVICE_TIME_MULTIPLIER);
+        let absolute_cap = latency_budget.saturating_mul(MAX_AGE_BUDGET_MULTIPLIER);
+        service_scaled.max(latency_budget).min(absolute_cap)
+    }
+
+'''
+          if insert not in q:
+              q = q.replace(marker, insert + marker)
+
+          old = '''                            let now = Instant::now();
+                            let age = now.saturating_duration_since(oldest_enqueued_at);
+                            if age >= latency_budget {
+                                BatchSealReason::Latency
+                            } else {
+                                let remaining_budget = latency_budget - age;
+                                let predicted_interarrival = Duration::from_nanos(state.ewma_interarrival_time_ns as u64);'''
+          new = '''                            let now = Instant::now();
+                            let age = now.saturating_duration_since(oldest_enqueued_at);
+                            let predicted_service = state.predicted_service_time();
+                            let dynamic_max_age = state.dynamic_max_age(latency_budget);
+                            if age >= latency_budget
+                                || age.saturating_add(predicted_service) >= dynamic_max_age
+                            {
+                                BatchSealReason::Latency
+                            } else {
+                                let remaining_budget = (latency_budget - age).min(
+                                    dynamic_max_age.saturating_sub(
+                                        age.saturating_add(predicted_service),
+                                    ),
+                                );
+                                let predicted_interarrival = Duration::from_nanos(state.ewma_interarrival_time_ns as u64);'''
+          if q.count(old) != 1:
+              raise SystemExit(f'queued adaptive block match count={q.count(old)}')
+          q = q.replace(old, new)
+
+          old = '''                metrics.record_seal_reason(seal_reason);
+                process_batch(&database, batch, &metrics);'''
+          new = '''                metrics.record_seal_reason(seal_reason);
+                let service_started = Instant::now();
+                process_batch(&database, batch, &metrics);
+                state.observe_service_time(service_started.elapsed());'''
+          if q.count(old) != 1:
+              raise SystemExit(f'queued service block match count={q.count(old)}')
+          q = q.replace(old, new)
+
+          test_marker = '''    #[test]
+    fn saturation_returns_the_original_intent_immediately() {'''
+          test = '''    #[test]
+    fn adaptive_max_age_scales_with_service_time_and_stays_capped() {
+        let budget = Duration::from_millis(2);
+        let mut state = AdaptiveState::new(16);
+
+        assert_eq!(state.dynamic_max_age(budget), budget);
+
+        state.observe_service_time(Duration::from_millis(2));
+        let scaled = state.dynamic_max_age(budget);
+        assert!(scaled >= budget);
+        assert!(scaled <= Duration::from_millis(10));
+
+        for _ in 0..32 {
+            state.observe_service_time(Duration::from_millis(100));
+        }
+        assert_eq!(state.dynamic_max_age(budget), Duration::from_millis(10));
+    }
+
+'''
+          if test not in q:
+              q = q.replace(test_marker, test + test_marker)
+
+          queued.write_text(q)
+
+          durable = Path('rust/crates/forthdb-world/src/file_epoch_controller.rs')
+          d = durable.read_text()
+
+          old = '''                            let now = Instant::now();
+                            let age = now.saturating_duration_since(oldest_enqueued_at);
+                            if age >= latency_budget {
+                                BatchSealReason::Latency
+                            } else {
+                                let remaining_budget = latency_budget - age;
+                                let predicted_interarrival = Duration::from_nanos(state.ewma_interarrival_time_ns as u64);'''
+          new = '''                            let now = Instant::now();
+                            let age = now.saturating_duration_since(oldest_enqueued_at);
+                            let predicted_service = state.predicted_service_time();
+                            let dynamic_max_age = state.dynamic_max_age(latency_budget);
+                            if age >= latency_budget
+                                || age.saturating_add(predicted_service) >= dynamic_max_age
+                            {
+                                BatchSealReason::Latency
+                            } else {
+                                let remaining_budget = (latency_budget - age).min(
+                                    dynamic_max_age.saturating_sub(
+                                        age.saturating_add(predicted_service),
+                                    ),
+                                );
+                                let predicted_interarrival = Duration::from_nanos(state.ewma_interarrival_time_ns as u64);'''
+          if d.count(old) != 1:
+              raise SystemExit(f'durable adaptive block match count={d.count(old)}')
+          d = d.replace(old, new)
+
+          old = '''                if let Err(reason) = process_durable_batch(database, batch, metrics) {
+                    let reason = metrics.poison(reason);'''
+          new = '''                let service_started = Instant::now();
+                let process_result = process_durable_batch(database, batch, metrics);
+                state.observe_service_time(service_started.elapsed());
+                if let Err(reason) = process_result {
+                    let reason = metrics.poison(reason);'''
+          if d.count(old) != 1:
+              raise SystemExit(f'durable service block match count={d.count(old)}')
+          d = d.replace(old, new)
+          durable.write_text(d)
+          PY
+
+      - name: Format and test
+        run: |
+          cargo fmt --manifest-path rust/Cargo.toml --all -- --check || cargo fmt --manifest-path rust/Cargo.toml --all
+          cargo test --manifest-path rust/Cargo.toml --release
+
+      - name: Commit patch and remove one-shot workflow
+        run: |
+          rm .github/workflows/apply-adaptive-max-age.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add rust/crates/forthdb-world/src/queued_controller.rs rust/crates/forthdb-world/src/file_epoch_controller.rs .github/workflows/apply-adaptive-max-age.yml
+          git commit -m "feat(adaptive): add service-aware maximum intent age"
+          git push
