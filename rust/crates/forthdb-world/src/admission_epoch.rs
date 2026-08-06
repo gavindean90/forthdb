@@ -2,6 +2,9 @@ use super::*;
 #[cfg(target_os = "linux")]
 use crate::io_uring_epoch_io::PendingIoUringEpoch;
 use crate::queued::{VmEpochMaterializer, decode_queued_intent, encode_queued_intent};
+use crate::semantic_isa::{
+    STREAM_MAGIC, decode_instruction_stream_frame, encode_instruction_stream_frame,
+};
 use crate::mmap_vm_snapshot::{MmapSnapshotMetadata, MmapVmSnapshot};
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
@@ -1206,7 +1209,11 @@ fn encode_epoch(batch: &EpochBatch) -> Vec<u8> {
     payload.extend_from_slice(&(batch.staged.len() as u32).to_le_bytes());
     for staged in &batch.staged {
         let mut encoded = Vec::new();
-        encode_queued_intent(&staged.intent, &mut encoded);
+        if let Ok(frame) = staged.intent.compile_to_stream_frame() {
+            encode_instruction_stream_frame(&frame, &mut encoded);
+        } else {
+            encode_queued_intent(&staged.intent, &mut encoded);
+        }
         payload.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         payload.extend_from_slice(&encoded);
     }
@@ -1233,8 +1240,16 @@ fn decode_epoch_payload(payload: &[u8]) -> Result<(u64, Vec<QueuedIntent>), Stri
         if end > payload.len() {
             return Err("truncated intent in admission epoch".to_owned());
         }
-        let mut intent_cursor = Cursor::new(&payload[start..end]);
-        intents.push(decode_queued_intent(&mut intent_cursor)?);
+        let intent_bytes = &payload[start..end];
+        let mut intent_cursor = Cursor::new(intent_bytes);
+
+        if intent_bytes.len() >= 4 && &intent_bytes[..4] == STREAM_MAGIC {
+            let frame = decode_instruction_stream_frame(&mut intent_cursor)?;
+            intents.push(QueuedIntent::from_stream_frame(&frame)?);
+        } else {
+            intents.push(decode_queued_intent(&mut intent_cursor)?);
+        }
+
         if intent_cursor.position() as usize != length {
             return Err("intent decoder did not consume its canonical bytes".to_owned());
         }

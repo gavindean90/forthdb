@@ -10,6 +10,7 @@ mod mmap_store;
 mod mmap_vm_snapshot;
 mod queued;
 mod queued_controller;
+pub mod semantic_isa;
 pub mod stack_vm;
 mod writer_lock;
 

@@ -50,6 +50,10 @@ pub(crate) struct PendingIoUringEpoch {
     metrics: EpochPersistMetrics,
 }
 
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) struct PendingIoUringEpoch;
+
 impl IoUringEpochFileIo {
     pub fn open_store(path: impl AsRef<Path>) -> Result<IoUringEpochStore, FileEpochStoreError> {
         Self::open_store_with_entries(path, DEFAULT_RING_ENTRIES)
@@ -141,6 +145,7 @@ impl IoUringEpochFileIo {
     ///
     /// The returned value owns every buffer referenced by the kernel. Callers
     /// must pass it to `complete_contiguous_epoch` before it is dropped.
+    #[cfg(target_os = "linux")]
     pub(crate) fn submit_contiguous_epoch(
         &mut self,
         start_offset: u64,
@@ -213,6 +218,22 @@ impl IoUringEpochFileIo {
         })
     }
 
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn submit_contiguous_epoch(
+        &mut self,
+        _start_offset: u64,
+        _records: &[Vec<u8>],
+    ) -> Result<PendingIoUringEpoch, (EpochIoPhase, std::io::Error)> {
+        Err((
+            EpochIoPhase::EpochWrite,
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "io_uring epoch transport is supported only on Linux",
+            ),
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn complete_contiguous_epoch(
         &mut self,
         mut pending: PendingIoUringEpoch,
@@ -254,6 +275,26 @@ impl IoUringEpochFileIo {
             }
         }
         (pending.metrics, result)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn complete_contiguous_epoch(
+        &mut self,
+        _pending: PendingIoUringEpoch,
+    ) -> (
+        EpochPersistMetrics,
+        Result<(), (EpochIoPhase, std::io::Error)>,
+    ) {
+        (
+            EpochPersistMetrics::default(),
+            Err((
+                EpochIoPhase::EpochWrite,
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "io_uring epoch transport is supported only on Linux",
+                ),
+            )),
+        )
     }
 }
 

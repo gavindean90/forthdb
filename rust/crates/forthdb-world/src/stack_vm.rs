@@ -20,15 +20,32 @@ pub struct SlotToken(pub u32);
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Opcode {
-    ExpectObject,
-    Allocate,
-    AllocateDiscard,
-    LoadLocal,
-    StoreLocal,
-    PushCell,
-    Define,
-    Forget,
-    Reject,
+    ExpectObject = 0,
+    Allocate = 1,
+    AllocateDiscard = 2,
+    LoadLocal = 3,
+    StoreLocal = 4,
+    PushCell = 5,
+    Define = 6,
+    Forget = 7,
+    Reject = 8,
+}
+
+impl Opcode {
+    pub fn from_u8(value: u8) -> Result<Self, String> {
+        match value {
+            0 => Ok(Self::ExpectObject),
+            1 => Ok(Self::Allocate),
+            2 => Ok(Self::AllocateDiscard),
+            3 => Ok(Self::LoadLocal),
+            4 => Ok(Self::StoreLocal),
+            5 => Ok(Self::PushCell),
+            6 => Ok(Self::Define),
+            7 => Ok(Self::Forget),
+            8 => Ok(Self::Reject),
+            other => Err(format!("unknown opcode byte {other}")),
+        }
+    }
 }
 
 #[repr(C)]
@@ -40,6 +57,30 @@ pub struct Instruction {
 }
 
 impl Instruction {
+    pub const fn raw(opcode: Opcode, argument: u32, immediate: u64) -> Self {
+        Self {
+            opcode,
+            argument,
+            immediate,
+        }
+    }
+
+    pub const fn opcode(&self) -> Opcode {
+        self.opcode
+    }
+
+    pub const fn opcode_u8(&self) -> u8 {
+        self.opcode as u8
+    }
+
+    pub const fn argument(&self) -> u32 {
+        self.argument
+    }
+
+    pub const fn immediate(&self) -> u64 {
+        self.immediate
+    }
+
     pub const fn expect_object(slot: SlotToken, expected: Cell) -> Self {
         Self {
             opcode: Opcode::ExpectObject,

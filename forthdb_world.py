@@ -27,6 +27,17 @@ from forthdb_kernel import (
     Symbol,
     Variable,
 )
+from forthdb_compiler import (
+    AtomRef,
+    EntityRef,
+    InstructionStreamFrame,
+    LiteralRef,
+    Opcode,
+    SemanticCompiler,
+    TempEntity,
+    TransactionBuilder,
+    VM_LITERAL_BASE,
+)
 
 
 MAGIC = b"FDB1"
@@ -203,6 +214,92 @@ def _world_projection(kernel: ForthDB) -> Mapping[str, object]:
 
 def _world_digest(kernel: ForthDB) -> str:
     return hashlib.sha256(_canonical_bytes(_world_projection(kernel))).hexdigest()
+
+
+def execute_isa_frame(kernel: ForthDB, frame: InstructionStreamFrame) -> Tuple[Record, ...]:
+    slot_map = {token: SlotId(name) for token, name in frame.dictionary.slots}
+    pred_map = {cell: Predicate(name) for cell, name in frame.dictionary.predicates}
+    lit_map = {cell: Literal(name) for cell, name in frame.dictionary.literals}
+
+    records: List[Record] = []
+    locals_vec: List[object] = [None] * (frame.local_count + 16)
+    stack: List[object] = []
+
+    def resolve_atom(val: object) -> Atom:
+        if isinstance(val, (EntityId, Literal)):
+            return val
+        if isinstance(val, int):
+            if val < VM_LITERAL_BASE:
+                return EntityId(val)
+            if val in lit_map:
+                return lit_map[val]
+            return Literal(f"lit_{val}")
+        raise TypeError(f"cannot resolve atom from: {val!r}")
+
+    idx = 0
+    instructions = frame.instructions
+
+    while idx < len(instructions):
+        inst = instructions[idx]
+        opcode = inst.opcode
+
+        if opcode == Opcode.ALLOCATE:
+            entity = EntityId(kernel._next_entity)
+            kernel._next_entity += 1
+            if idx + 1 < len(instructions) and instructions[idx + 1].opcode == Opcode.STORE_LOCAL:
+                store_inst = instructions[idx + 1]
+                locals_vec[store_inst.argument] = entity
+                idx += 1
+            else:
+                stack.append(entity)
+        elif opcode == Opcode.ALLOCATE_DISCARD:
+            kernel._next_entity += 1
+        elif opcode == Opcode.STORE_LOCAL:
+            val = stack.pop()
+            locals_vec[inst.argument] = val
+        elif opcode == Opcode.LOAD_LOCAL:
+            val = locals_vec[inst.argument]
+            stack.append(val)
+        elif opcode == Opcode.PUSH_CELL:
+            stack.append(inst.immediate)
+        elif opcode == Opcode.DEFINE:
+            if len(stack) >= 3:
+                obj_raw = stack.pop()
+                pred_raw = stack.pop()
+                subj_raw = stack.pop()
+
+                if isinstance(pred_raw, int) and pred_raw in pred_map:
+                    predicate = pred_map[pred_raw]
+                elif isinstance(pred_raw, Predicate):
+                    predicate = pred_raw
+                else:
+                    predicate = Predicate(str(pred_raw))
+
+                subject = resolve_atom(subj_raw)
+                object_ = resolve_atom(obj_raw)
+                slot_id = slot_map[inst.argument]
+
+                record = kernel.define(slot_id, Fact(subject, predicate, object_))
+                records.append(record)
+        elif opcode == Opcode.FORGET:
+            slot_id = slot_map[inst.argument]
+            record = kernel.forget(slot_id)
+            records.append(record)
+        elif opcode == Opcode.EXPECT_OBJECT:
+            slot_id = slot_map[inst.argument]
+            actual = kernel.resolve(slot_id)
+            expected_cell = inst.immediate
+            if actual is None:
+                raise ConstraintViolation(f"precondition failed: slot {slot_id.value} is empty")
+            actual_cell = actual.object.value if isinstance(actual.object, EntityId) else (
+                [c for c, l in lit_map.items() if l == actual.object] or [0]
+            )[0]
+            if actual_cell != expected_cell and actual.object != lit_map.get(expected_cell):
+                raise ConstraintViolation(f"precondition failed on slot {slot_id.value}")
+
+        idx += 1
+
+    return tuple(records)
 
 
 def _apply_operations(kernel: ForthDB, operations: Iterable[Operation]) -> Tuple[Record, ...]:

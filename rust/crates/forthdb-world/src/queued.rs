@@ -1,7 +1,8 @@
 use super::*;
 use crate::stack_vm::{
-    Cell, ExecutionOutcome, Instruction, IntentProgram, SlotToken, Workspace as VmWorkspace,
+    Cell, ExecutionOutcome, Instruction, IntentProgram, Opcode, SlotToken, Workspace as VmWorkspace,
 };
+use crate::semantic_isa::{InstructionStreamFrame, StreamDictionary};
 use crate::mmap_vm_snapshot::MmapVmSnapshot;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
@@ -185,6 +186,279 @@ impl QueuedIntent {
 
     pub fn forget(&mut self, slot: SlotId) {
         self.operations.push(IntentOperation::Forget { slot });
+    }
+
+    pub fn compile_to_stream_frame(&self) -> Result<InstructionStreamFrame, String> {
+        let mut slots = BTreeMap::<SlotId, SlotToken>::new();
+        let mut slot_vec = Vec::new();
+
+        let mut predicates = BTreeMap::<Predicate, Cell>::new();
+        let mut pred_vec = Vec::new();
+
+        let mut literals = BTreeMap::<Literal, Cell>::new();
+        let mut lit_vec = Vec::new();
+
+        let mut get_slot = |slot: &SlotId| -> SlotToken {
+            if let Some(&token) = slots.get(slot) {
+                token
+            } else {
+                let token = SlotToken(slots.len() as u32);
+                slots.insert(slot.clone(), token);
+                slot_vec.push((token, slot.clone()));
+                token
+            }
+        };
+
+        let mut get_predicate = |pred: &Predicate| -> Cell {
+            if let Some(&cell) = predicates.get(pred) {
+                cell
+            } else {
+                let cell = Cell(predicates.len() as u64);
+                predicates.insert(pred.clone(), cell);
+                pred_vec.push((cell, pred.clone()));
+                cell
+            }
+        };
+
+        let mut get_literal = |lit: &Literal| -> Cell {
+            if let Some(&cell) = literals.get(lit) {
+                cell
+            } else {
+                let cell = Cell(VM_LITERAL_BASE + literals.len() as u64);
+                literals.insert(lit.clone(), cell);
+                lit_vec.push((cell, lit.clone()));
+                cell
+            }
+        };
+
+        let mut instructions = Vec::new();
+
+        for prec in &self.preconditions {
+            match prec {
+                IntentPrecondition::ExpectedWorld(world) => {
+                    instructions.push(Instruction::raw(Opcode::ExpectObject, u32::MAX, world.value()));
+                }
+                IntentPrecondition::ExpectedSlot { slot, expected } => {
+                    let slot_token = get_slot(slot);
+                    match expected {
+                        Some(fact) => {
+                            match &fact.subject {
+                                Atom::Entity(e) => instructions.push(Instruction::push(Cell(e.value()))),
+                                Atom::Literal(l) => instructions.push(Instruction::push(get_literal(l))),
+                            }
+                            instructions.push(Instruction::push(get_predicate(&fact.predicate)));
+                            match &fact.object {
+                                Atom::Entity(e) => instructions.push(Instruction::push(Cell(e.value()))),
+                                Atom::Literal(l) => instructions.push(Instruction::push(get_literal(l))),
+                            }
+                            instructions.push(Instruction::expect_object(slot_token, Cell(1)));
+                        }
+                        None => {
+                            instructions.push(Instruction::expect_object(slot_token, Cell(0)));
+                        }
+                    }
+                }
+            }
+        }
+
+        for op in &self.operations {
+            match op {
+                IntentOperation::AllocateEntity { temporary } => {
+                    instructions.push(Instruction::allocate());
+                    instructions.push(Instruction::store_local(temporary.index));
+                }
+                IntentOperation::Define { slot, fact } => {
+                    let slot_token = get_slot(slot);
+
+                    match &fact.subject {
+                        IntentAtom::Entity(e) => instructions.push(Instruction::push(Cell(e.value()))),
+                        IntentAtom::Temporary(t) => instructions.push(Instruction::load_local(t.index)),
+                        IntentAtom::Literal(l) => instructions.push(Instruction::push(get_literal(l))),
+                    }
+                    instructions.push(Instruction::push(get_predicate(&fact.predicate)));
+                    match &fact.object {
+                        IntentAtom::Entity(e) => instructions.push(Instruction::push(Cell(e.value()))),
+                        IntentAtom::Temporary(t) => instructions.push(Instruction::load_local(t.index)),
+                        IntentAtom::Literal(l) => instructions.push(Instruction::push(get_literal(l))),
+                    }
+
+                    instructions.push(Instruction::define(slot_token));
+                }
+                IntentOperation::Forget { slot } => {
+                    let slot_token = get_slot(slot);
+                    instructions.push(Instruction::forget(slot_token));
+                }
+            }
+        }
+
+        let dictionary = StreamDictionary {
+            slots: slot_vec,
+            predicates: pred_vec,
+            literals: lit_vec,
+        };
+
+        Ok(InstructionStreamFrame::new(
+            self.namespace,
+            dictionary,
+            self.next_temporary,
+            instructions,
+        ))
+    }
+
+    pub fn from_stream_frame(frame: &InstructionStreamFrame) -> Result<Self, String> {
+        let mut slot_map = BTreeMap::<u32, SlotId>::new();
+        for (token, slot) in &frame.dictionary.slots {
+            slot_map.insert(token.0, slot.clone());
+        }
+
+        let mut pred_map = BTreeMap::<u64, Predicate>::new();
+        for (cell, pred) in &frame.dictionary.predicates {
+            pred_map.insert(cell.0, pred.clone());
+        }
+
+        let mut lit_map = BTreeMap::<u64, Literal>::new();
+        for (cell, lit) in &frame.dictionary.literals {
+            lit_map.insert(cell.0, lit.clone());
+        }
+
+        #[derive(Clone, Debug)]
+        enum StackVal {
+            Atom(IntentAtom),
+            CellVal(u64),
+        }
+
+        let mut intent = QueuedIntent::new();
+        intent.namespace = frame.namespace;
+        let mut stack = Vec::<StackVal>::new();
+
+        let resolve_atom = |val: &StackVal, lit_map: &BTreeMap<u64, Literal>| -> IntentAtom {
+            match val {
+                StackVal::Atom(a) => a.clone(),
+                StackVal::CellVal(c) => {
+                    if *c < VM_LITERAL_BASE {
+                        IntentAtom::Entity(EntityId::new(*c))
+                    } else if let Some(lit) = lit_map.get(c) {
+                        IntentAtom::Literal(lit.clone())
+                    } else {
+                        IntentAtom::Literal(Literal::new(&format!("lit_{c}")))
+                    }
+                }
+            }
+        };
+
+        let mut idx = 0;
+        let instructions = frame.instructions();
+
+        while idx < instructions.len() {
+            let inst = instructions[idx];
+            match inst.opcode() {
+                Opcode::Allocate => {
+                    let temp = intent.entity();
+                    if idx + 1 < instructions.len() && instructions[idx + 1].opcode() == Opcode::StoreLocal {
+                        idx += 1;
+                    }
+                }
+                Opcode::AllocateDiscard => {
+                    intent.entity();
+                }
+                Opcode::PushCell => {
+                    stack.push(StackVal::CellVal(inst.immediate()));
+                }
+                Opcode::LoadLocal => {
+                    let temp = TempEntity {
+                        namespace: intent.namespace,
+                        index: inst.argument(),
+                    };
+                    stack.push(StackVal::Atom(IntentAtom::Temporary(temp)));
+                }
+                Opcode::Define => {
+                    if stack.len() >= 3 {
+                        let obj_val = stack.pop().unwrap();
+                        let pred_val = stack.pop().unwrap();
+                        let subj_val = stack.pop().unwrap();
+
+                        let predicate = match pred_val {
+                            StackVal::CellVal(c) => pred_map
+                                .get(&c)
+                                .cloned()
+                                .unwrap_or_else(|| Predicate::new(&format!("pred_{c}"))),
+                            StackVal::Atom(IntentAtom::Literal(l)) => Predicate::new(l.as_str()),
+                            _ => Predicate::new("predicate"),
+                        };
+
+                        let subject = resolve_atom(&subj_val, &lit_map);
+                        let object = resolve_atom(&obj_val, &lit_map);
+
+                        let slot_id = slot_map
+                            .get(&inst.argument())
+                            .cloned()
+                            .ok_or_else(|| format!("unknown slot token {}", inst.argument()))?;
+
+                        let fact = IntentFact {
+                            subject,
+                            predicate,
+                            object,
+                        };
+                        intent.define(slot_id, fact);
+                    }
+                }
+                Opcode::Forget => {
+                    let slot_id = slot_map
+                        .get(&inst.argument())
+                        .cloned()
+                        .ok_or_else(|| format!("unknown slot token {}", inst.argument()))?;
+                    intent.forget(slot_id);
+                }
+                Opcode::ExpectObject => {
+                    if inst.argument() == u32::MAX {
+                        intent.expect_world(WorldId::new(inst.immediate()));
+                    } else {
+                        let slot_id = slot_map
+                            .get(&inst.argument())
+                            .cloned()
+                            .ok_or_else(|| format!("unknown slot token {}", inst.argument()))?;
+
+                        if inst.immediate() == 0 {
+                            intent.expect_absent(slot_id);
+                        } else if stack.len() >= 3 {
+                            let obj_val = stack.pop().unwrap();
+                            let pred_val = stack.pop().unwrap();
+                            let subj_val = stack.pop().unwrap();
+
+                            let predicate = match pred_val {
+                                StackVal::CellVal(c) => pred_map
+                                    .get(&c)
+                                    .cloned()
+                                    .unwrap_or_else(|| Predicate::new(&format!("pred_{c}"))),
+                                StackVal::Atom(IntentAtom::Literal(l)) => Predicate::new(l.as_str()),
+                                _ => Predicate::new("predicate"),
+                            };
+
+                            let subj_atom = resolve_atom(&subj_val, &lit_map);
+                            let obj_atom = resolve_atom(&obj_val, &lit_map);
+
+                            let subject = match subj_atom {
+                                IntentAtom::Entity(e) => Atom::Entity(e),
+                                IntentAtom::Literal(l) => Atom::Literal(l),
+                                IntentAtom::Temporary(_) => Atom::Entity(EntityId::new(0)),
+                            };
+
+                            let object = match obj_atom {
+                                IntentAtom::Entity(e) => Atom::Entity(e),
+                                IntentAtom::Literal(l) => Atom::Literal(l),
+                                IntentAtom::Temporary(_) => Atom::Entity(EntityId::new(0)),
+                            };
+
+                            intent.expect_value(slot_id, Fact::new(subject, predicate, object));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        Ok(intent)
     }
 }
 
