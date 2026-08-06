@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const PHASE_QUEUED: u8 = 0;
 const PHASE_CLAIMED: u8 = 1;
@@ -26,6 +27,7 @@ pub struct TicketState {
     pub abandoned: bool,
 }
 
+#[derive(Debug)]
 struct TicketLifecycle {
     phase: AtomicU8,
     abandoned: AtomicBool,
@@ -81,6 +83,18 @@ pub enum TicketRejection {
     Validation(String),
 }
 
+impl fmt::Display for TicketRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorldPrecondition { expected, actual } => write!(f, "world precondition mismatch: expected {expected:?}, actual {actual:?}"),
+            Self::SlotPrecondition { slot, expected, actual } => write!(f, "slot precondition mismatch on {slot:?}: expected {expected:?}, actual {actual:?}"),
+            Self::UnknownTemporaryEntity(temp) => write!(f, "unknown temporary entity: {temp:?}"),
+            Self::Candidate(msg) => write!(f, "candidate rejection: {msg}"),
+            Self::Validation(msg) => write!(f, "validation failure: {msg}"),
+        }
+    }
+}
+
 impl TicketRejection {
     fn from_intent_rejection(error: &IntentRejection) -> Self {
         match error {
@@ -99,50 +113,19 @@ impl TicketRejection {
                 expected: expected.clone(),
                 actual: actual.clone(),
             },
-            IntentRejection::UnknownTemporaryEntity(entity) => {
-                Self::UnknownTemporaryEntity(*entity)
+            IntentRejection::UnknownTemporaryEntity(temp) => {
+                Self::UnknownTemporaryEntity(*temp)
             }
-            IntentRejection::Candidate(error) => Self::Candidate(error.to_string()),
+            IntentRejection::Candidate(message) => Self::Candidate(message.to_string()),
             IntentRejection::Validation(message) => Self::Validation(message.clone()),
         }
     }
 }
 
-impl fmt::Display for TicketRejection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::WorldPrecondition { expected, actual } => write!(
-                formatter,
-                "queued intent expected predecessor {expected}, found {actual}"
-            ),
-            Self::SlotPrecondition {
-                slot,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "queued intent slot precondition failed for {slot:?}: expected {expected:?}, found {actual:?}"
-            ),
-            Self::UnknownTemporaryEntity(entity) => write!(
-                formatter,
-                "queued intent referenced temporary entity {} from another scope or before allocation",
-                entity.index()
-            ),
-            Self::Candidate(message) => write!(formatter, "queued candidate failed: {message}"),
-            Self::Validation(message) => {
-                write!(formatter, "queued candidate validation failed: {message}")
-            }
-        }
-    }
-}
-
-impl Error for TicketRejection {}
-
 #[derive(Debug)]
 pub enum TicketOutcome {
     Accepted {
         world: Arc<World>,
-        frame: Arc<CommitFrame>,
         entities: BTreeMap<TempEntity, EntityId>,
     },
     Rejected(TicketRejection),
@@ -152,8 +135,7 @@ impl TicketOutcome {
     fn from_epoch_outcome(outcome: &EpochOutcome) -> Self {
         match outcome {
             EpochOutcome::Accepted(accepted) => Self::Accepted {
-                world: accepted.world(),
-                frame: accepted.frame(),
+                world: accepted.world().clone(),
                 entities: accepted.entities().clone(),
             },
             EpochOutcome::Rejected(rejected) => {
@@ -161,66 +143,15 @@ impl TicketOutcome {
             }
         }
     }
-
-    pub fn world(&self) -> Option<Arc<World>> {
-        match self {
-            Self::Accepted { world, .. } => Some(world.clone()),
-            Self::Rejected(_) => None,
-        }
-    }
-
-    pub fn frame(&self) -> Option<Arc<CommitFrame>> {
-        match self {
-            Self::Accepted { frame, .. } => Some(frame.clone()),
-            Self::Rejected(_) => None,
-        }
-    }
-
-    pub fn entity(&self, temporary: TempEntity) -> Option<EntityId> {
-        match self {
-            Self::Accepted { entities, .. } => entities.get(&temporary).copied(),
-            Self::Rejected(_) => None,
-        }
-    }
-
-    pub fn rejection(&self) -> Option<&TicketRejection> {
-        match self {
-            Self::Accepted { .. } => None,
-            Self::Rejected(error) => Some(error),
-        }
-    }
 }
 
 #[derive(Debug)]
-pub struct TicketWaitError;
-
-impl fmt::Display for TicketWaitError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "queued-intent controller stopped before resolving ticket"
-        )
-    }
-}
-
-impl Error for TicketWaitError {}
-
 pub struct CommitTicket {
     id: u64,
-    receiver: Option<Receiver<TicketOutcome>>,
+    receiver: Option<mpsc::Receiver<TicketOutcome>>,
     lifecycle: Arc<TicketLifecycle>,
     metrics: Arc<ControllerMetricsInner>,
     observed: bool,
-}
-
-impl fmt::Debug for CommitTicket {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CommitTicket")
-            .field("id", &self.id)
-            .field("state", &self.state())
-            .finish()
-    }
 }
 
 impl CommitTicket {
@@ -236,42 +167,41 @@ impl CommitTicket {
         let receiver = self
             .receiver
             .take()
-            .expect("commit ticket receiver can be consumed only once");
-        let result = receiver.recv().map_err(|_| TicketWaitError);
-        self.observed = true;
-        result
-    }
-
-    pub fn try_wait(&mut self) -> Result<Option<TicketOutcome>, TicketWaitError> {
-        let receiver = self
-            .receiver
-            .as_ref()
-            .expect("commit ticket receiver can be consumed only once");
-        match receiver.try_recv() {
+            .expect("wait can be called at most once");
+        match receiver.recv() {
             Ok(outcome) => {
                 self.observed = true;
-                self.receiver.take();
-                Ok(Some(outcome))
+                Ok(outcome)
             }
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => {
-                self.observed = true;
-                self.receiver.take();
-                Err(TicketWaitError)
-            }
+            Err(_) => Err(TicketWaitError::WorkerStopped),
         }
     }
 }
 
 impl Drop for CommitTicket {
     fn drop(&mut self) {
-        if !self.observed && self.lifecycle.abandon() {
-            self.metrics
-                .abandoned_tickets
-                .fetch_add(1, Ordering::Relaxed);
+        if !self.observed {
+            if self.lifecycle.abandon() {
+                self.metrics.abandoned_tickets.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TicketWaitError {
+    WorkerStopped,
+}
+
+impl fmt::Display for TicketWaitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkerStopped => write!(formatter, "queued intent worker stopped"),
+        }
+    }
+}
+
+impl Error for TicketWaitError {}
 
 #[derive(Debug)]
 pub enum SubmitError {
@@ -279,61 +209,74 @@ pub enum SubmitError {
     Closed(QueuedIntent),
 }
 
-impl SubmitError {
-    pub fn into_intent(self) -> QueuedIntent {
-        match self {
-            Self::Full(intent) | Self::Closed(intent) => intent,
-        }
-    }
-}
-
 impl fmt::Display for SubmitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Full(_) => write!(formatter, "queued-intent ingress is full"),
-            Self::Closed(_) => write!(formatter, "queued-intent controller is closed"),
+            Self::Full(_) => write!(formatter, "queued intent controller channel full"),
+            Self::Closed(_) => write!(formatter, "queued intent controller worker stopped"),
         }
     }
 }
 
 impl Error for SubmitError {}
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControllerConfigError {
     ZeroCapacity,
     ZeroBatchSize,
-    Spawn(std::io::Error),
+    Spawn(std::io::ErrorKind),
 }
 
 impl fmt::Display for ControllerConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ZeroCapacity => write!(formatter, "queued ingress capacity must be nonzero"),
-            Self::ZeroBatchSize => write!(formatter, "queued maximum batch size must be nonzero"),
-            Self::Spawn(error) => write!(formatter, "failed to start queued committer: {error}"),
+            Self::ZeroCapacity => write!(formatter, "capacity must be positive"),
+            Self::ZeroBatchSize => write!(formatter, "max batch must be positive"),
+            Self::Spawn(kind) => write!(formatter, "worker thread spawn failed: {kind:?}"),
         }
     }
 }
 
-impl Error for ControllerConfigError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Spawn(error) => Some(error),
-            Self::ZeroCapacity | Self::ZeroBatchSize => None,
-        }
-    }
-}
+impl Error for ControllerConfigError {}
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControllerStopped;
 
 impl fmt::Display for ControllerStopped {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "queued-intent controller is stopped")
+        write!(formatter, "queued intent controller worker stopped")
     }
 }
 
 impl Error for ControllerStopped {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchPolicy {
+    ImmediateDrain {
+        max_batch: usize,
+    },
+    Coalesce {
+        max_batch: usize,
+        max_delay: Duration,
+    },
+    Adaptive {
+        min_batch: usize,
+        max_batch: usize,
+        latency_budget: Duration,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BatchSealReason {
+    Capacity,
+    Timeout,
+    Drain,
+    Width,
+    Latency,
+    LowTraffic,
+    SourceStalled,
+    Barrier,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueuedControllerMetrics {
@@ -351,9 +294,20 @@ pub struct QueuedControllerMetrics {
     pub maximum_queue_depth: u64,
     pub in_flight: u64,
     pub worker_alive: bool,
+    pub batches_sealed_by_capacity: u64,
+    pub batches_sealed_by_timeout: u64,
+    pub batches_sealed_by_drain: u64,
+    pub batches_sealed_by_width: u64,
+    pub batches_sealed_by_latency: u64,
+    pub batches_sealed_by_low_traffic: u64,
+    pub batches_sealed_by_source_stalled: u64,
+    pub batches_sealed_by_barrier: u64,
+    pub maximum_target_width: usize,
+    pub total_adaptive_probe_wait_ns: u64,
+    pub maximum_oldest_age_at_seal_ns: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ControllerMetricsInner {
     submitted: AtomicU64,
     backpressured: AtomicU64,
@@ -367,6 +321,17 @@ struct ControllerMetricsInner {
     maximum_queue_depth: AtomicU64,
     in_flight: AtomicU64,
     worker_alive: AtomicBool,
+    batches_sealed_by_capacity: AtomicU64,
+    batches_sealed_by_timeout: AtomicU64,
+    batches_sealed_by_drain: AtomicU64,
+    batches_sealed_by_width: AtomicU64,
+    batches_sealed_by_latency: AtomicU64,
+    batches_sealed_by_low_traffic: AtomicU64,
+    batches_sealed_by_source_stalled: AtomicU64,
+    batches_sealed_by_barrier: AtomicU64,
+    maximum_target_width: AtomicU64,
+    total_adaptive_probe_wait_ns: AtomicU64,
+    maximum_oldest_age_at_seal_ns: AtomicU64,
 }
 
 impl ControllerMetricsInner {
@@ -409,6 +374,67 @@ impl ControllerMetricsInner {
         }
     }
 
+    fn record_seal_reason(&self, reason: BatchSealReason) {
+        match reason {
+            BatchSealReason::Capacity => {
+                self.batches_sealed_by_capacity.fetch_add(1, Ordering::Relaxed);
+            }
+            BatchSealReason::Timeout => {
+                self.batches_sealed_by_timeout.fetch_add(1, Ordering::Relaxed);
+            }
+            BatchSealReason::Drain => {
+                self.batches_sealed_by_drain.fetch_add(1, Ordering::Relaxed);
+            }
+            BatchSealReason::Width => {
+                self.batches_sealed_by_width.fetch_add(1, Ordering::Relaxed);
+            }
+            BatchSealReason::Latency => {
+                self.batches_sealed_by_latency.fetch_add(1, Ordering::Relaxed);
+            }
+            BatchSealReason::LowTraffic => {
+                self.batches_sealed_by_low_traffic.fetch_add(1, Ordering::Relaxed);
+            }
+            BatchSealReason::SourceStalled => {
+                self.batches_sealed_by_source_stalled.fetch_add(1, Ordering::Relaxed);
+            }
+            BatchSealReason::Barrier => {
+                self.batches_sealed_by_barrier.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_max_target_width(&self, width: usize) {
+        let width = width as u64;
+        let mut prev = self.maximum_target_width.load(Ordering::Relaxed);
+        while width > prev {
+            match self.maximum_target_width.compare_exchange_weak(
+                prev,
+                width,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    fn record_oldest_age_at_seal(&self, age: Duration) {
+        let age_ns = age.as_nanos() as u64;
+        let mut prev = self.maximum_oldest_age_at_seal_ns.load(Ordering::Relaxed);
+        while age_ns > prev {
+            match self.maximum_oldest_age_at_seal_ns.compare_exchange_weak(
+                prev,
+                age_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
     fn snapshot(&self, capacity: usize, max_batch: usize) -> QueuedControllerMetrics {
         QueuedControllerMetrics {
             capacity,
@@ -427,6 +453,17 @@ impl ControllerMetricsInner {
             maximum_queue_depth: self.maximum_queue_depth.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Acquire),
             worker_alive: self.worker_alive.load(Ordering::Acquire),
+            batches_sealed_by_capacity: self.batches_sealed_by_capacity.load(Ordering::Relaxed),
+            batches_sealed_by_timeout: self.batches_sealed_by_timeout.load(Ordering::Relaxed),
+            batches_sealed_by_drain: self.batches_sealed_by_drain.load(Ordering::Relaxed),
+            batches_sealed_by_width: self.batches_sealed_by_width.load(Ordering::Relaxed),
+            batches_sealed_by_latency: self.batches_sealed_by_latency.load(Ordering::Relaxed),
+            batches_sealed_by_low_traffic: self.batches_sealed_by_low_traffic.load(Ordering::Relaxed),
+            batches_sealed_by_source_stalled: self.batches_sealed_by_source_stalled.load(Ordering::Relaxed),
+            batches_sealed_by_barrier: self.batches_sealed_by_barrier.load(Ordering::Relaxed),
+            maximum_target_width: self.maximum_target_width.load(Ordering::Relaxed) as usize,
+            total_adaptive_probe_wait_ns: self.total_adaptive_probe_wait_ns.load(Ordering::Relaxed),
+            maximum_oldest_age_at_seal_ns: self.maximum_oldest_age_at_seal_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -435,6 +472,7 @@ struct StagedIntent {
     intent: QueuedIntent,
     completion: mpsc::Sender<TicketOutcome>,
     lifecycle: Arc<TicketLifecycle>,
+    enqueued_at: Instant,
 }
 
 enum ControllerCommand {
@@ -442,18 +480,75 @@ enum ControllerCommand {
     Barrier(mpsc::Sender<()>),
 }
 
-/// Bounded Stage 6A.2 ingress and in-memory committer.
-///
-/// The worker blocks for the first intent, drains an already-arrived burst up
-/// to `max_batch`, derives and publishes one in-memory epoch, then resolves each
-/// caller independently. It performs no file I/O and makes no durability claim.
+const ARRIVAL_ALPHA: f64 = 0.20;
+
+struct AdaptiveState {
+    ewma_interarrival_time_ns: f64,
+    last_arrival_time: Option<Instant>,
+    target_width: usize,
+    epochs_sealed: u64,
+}
+
+impl AdaptiveState {
+    fn new(initial_target: usize) -> Self {
+        Self {
+            ewma_interarrival_time_ns: 10_000.0,
+            last_arrival_time: None,
+            target_width: initial_target,
+            epochs_sealed: 0,
+        }
+    }
+
+    fn observe_arrival(&mut self, enqueued_at: Instant) {
+        if let Some(previous) = self.last_arrival_time {
+            if let Some(interval) = enqueued_at.checked_duration_since(previous) {
+                let interval_ns = interval.as_nanos() as f64;
+                self.ewma_interarrival_time_ns = (1.0 - ARRIVAL_ALPHA) * self.ewma_interarrival_time_ns
+                    + ARRIVAL_ALPHA * interval_ns;
+            }
+        }
+        self.last_arrival_time = Some(
+            self.last_arrival_time
+                .map_or(enqueued_at, |previous| previous.max(enqueued_at)),
+        );
+    }
+
+    fn update_target(&mut self, reason: BatchSealReason, achieved_width: usize, min_batch: usize, max_batch: usize) {
+        self.epochs_sealed += 1;
+        match reason {
+            BatchSealReason::Width if achieved_width >= self.target_width => {
+                self.target_width = (self.target_width + 1)
+                    .saturating_mul(2)
+                    .min(max_batch);
+            }
+            BatchSealReason::Width => {
+                self.target_width = self.target_width
+                    .saturating_add(min_batch.max(1))
+                    .min(max_batch);
+            }
+            BatchSealReason::Latency => {
+                self.target_width = self.target_width
+                    .saturating_div(2)
+                    .max(min_batch);
+            }
+            BatchSealReason::SourceStalled => {
+                self.target_width = achieved_width.max(min_batch).min(max_batch);
+            }
+            BatchSealReason::LowTraffic => {
+                self.target_width = achieved_width.max(min_batch).min(max_batch);
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct QueuedIntentController {
     database: Arc<Database<MemoryCommitStore>>,
     sender: Option<SyncSender<ControllerCommand>>,
     worker: Option<JoinHandle<()>>,
     metrics: Arc<ControllerMetricsInner>,
     capacity: usize,
-    max_batch: usize,
+    policy: BatchPolicy,
 }
 
 impl fmt::Debug for QueuedIntentController {
@@ -461,7 +556,7 @@ impl fmt::Debug for QueuedIntentController {
         formatter
             .debug_struct("QueuedIntentController")
             .field("capacity", &self.capacity)
-            .field("max_batch", &self.max_batch)
+            .field("policy", &self.policy)
             .field("metrics", &self.metrics())
             .finish()
     }
@@ -471,11 +566,16 @@ impl QueuedIntentController {
     pub fn new(
         database: Arc<Database<MemoryCommitStore>>,
         capacity: usize,
-        max_batch: usize,
+        policy: BatchPolicy,
     ) -> Result<Self, ControllerConfigError> {
         if capacity == 0 {
             return Err(ControllerConfigError::ZeroCapacity);
         }
+        let max_batch = match policy {
+            BatchPolicy::ImmediateDrain { max_batch }
+            | BatchPolicy::Coalesce { max_batch, .. }
+            | BatchPolicy::Adaptive { max_batch, .. } => max_batch,
+        };
         if max_batch == 0 {
             return Err(ControllerConfigError::ZeroBatchSize);
         }
@@ -487,10 +587,10 @@ impl QueuedIntentController {
         let worker_metrics = metrics.clone();
         let worker = thread::Builder::new()
             .name("forthdb-queued-committer".to_owned())
-            .spawn(move || run_worker(worker_database, receiver, max_batch, worker_metrics))
+            .spawn(move || run_worker(worker_database, receiver, policy, worker_metrics))
             .map_err(|error| {
                 metrics.worker_alive.store(false, Ordering::Release);
-                ControllerConfigError::Spawn(error)
+                ControllerConfigError::Spawn(error.kind())
             })?;
 
         Ok(Self {
@@ -499,7 +599,7 @@ impl QueuedIntentController {
             worker: Some(worker),
             metrics,
             capacity,
-            max_batch,
+            policy,
         })
     }
 
@@ -522,6 +622,7 @@ impl QueuedIntentController {
             intent,
             completion,
             lifecycle: lifecycle.clone(),
+            enqueued_at: Instant::now(),
         });
 
         match sender.try_send(command) {
@@ -550,8 +651,6 @@ impl QueuedIntentController {
         }
     }
 
-    /// Wait until every command submitted before this call has been processed.
-    /// This is an administrative/test barrier, not a durability operation.
     pub fn flush(&self) -> Result<(), ControllerStopped> {
         let Some(sender) = self.sender.as_ref() else {
             return Err(ControllerStopped);
@@ -564,7 +663,12 @@ impl QueuedIntentController {
     }
 
     pub fn metrics(&self) -> QueuedControllerMetrics {
-        self.metrics.snapshot(self.capacity, self.max_batch)
+        let max_batch = match self.policy {
+            BatchPolicy::ImmediateDrain { max_batch }
+            | BatchPolicy::Coalesce { max_batch, .. }
+            | BatchPolicy::Adaptive { max_batch, .. } => max_batch,
+        };
+        self.metrics.snapshot(self.capacity, max_batch)
     }
 }
 
@@ -588,11 +692,19 @@ impl Drop for WorkerLiveness {
 fn run_worker(
     database: Arc<Database<MemoryCommitStore>>,
     receiver: Receiver<ControllerCommand>,
-    max_batch: usize,
+    policy: BatchPolicy,
     metrics: Arc<ControllerMetricsInner>,
 ) {
     let _liveness = WorkerLiveness(metrics.clone());
     let mut pending = VecDeque::new();
+
+    let (min_batch, max_batch) = match policy {
+        BatchPolicy::ImmediateDrain { max_batch } => (1, max_batch),
+        BatchPolicy::Coalesce { max_batch, .. } => (1, max_batch),
+        BatchPolicy::Adaptive { min_batch, max_batch, .. } => (min_batch, max_batch),
+    };
+
+    let mut state = AdaptiveState::new(min_batch.max(16).min(max_batch));
 
     loop {
         let command = match pending.pop_front() {
@@ -606,22 +718,160 @@ fn run_worker(
         match command {
             ControllerCommand::Intent(first) => {
                 let mut batch = Vec::with_capacity(max_batch);
+                let mut oldest_enqueued_at = first.enqueued_at;
+                let enqueued_at = first.enqueued_at;
                 claim(first, &metrics, &mut batch);
-                while batch.len() < max_batch {
-                    match receiver.try_recv() {
-                        Ok(ControllerCommand::Intent(staged)) => {
-                            claim(staged, &metrics, &mut batch);
+                state.observe_arrival(enqueued_at);
+
+                let seal_reason = match policy {
+                    BatchPolicy::ImmediateDrain { .. } => {
+                        while batch.len() < max_batch {
+                            match receiver.try_recv() {
+                                Ok(ControllerCommand::Intent(staged)) => {
+                                    let enqueued_at = staged.enqueued_at;
+                                    oldest_enqueued_at = oldest_enqueued_at.min(enqueued_at);
+                                    claim(staged, &metrics, &mut batch);
+                                    state.observe_arrival(enqueued_at);
+                                }
+                                Ok(command @ ControllerCommand::Barrier(_)) => {
+                                    pending.push_back(command);
+                                    break;
+                                }
+                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                            }
                         }
-                        Ok(command @ ControllerCommand::Barrier(_)) => {
-                            pending.push_back(command);
-                            break;
+                        if batch.len() >= max_batch {
+                            BatchSealReason::Capacity
+                        } else {
+                            BatchSealReason::Drain
                         }
-                        Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                     }
-                }
+                    BatchPolicy::Coalesce { max_delay, .. } => {
+                        let deadline = Instant::now() + max_delay;
+                        while batch.len() < max_batch {
+                            let now = Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            let remaining = deadline - now;
+                            match receiver.recv_timeout(remaining) {
+                                Ok(ControllerCommand::Intent(staged)) => {
+                                    let enqueued_at = staged.enqueued_at;
+                                    oldest_enqueued_at = oldest_enqueued_at.min(enqueued_at);
+                                    claim(staged, &metrics, &mut batch);
+                                    state.observe_arrival(enqueued_at);
+                                }
+                                Ok(command @ ControllerCommand::Barrier(_)) => {
+                                    pending.push_back(command);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if batch.len() >= max_batch {
+                            BatchSealReason::Capacity
+                        } else {
+                            BatchSealReason::Timeout
+                        }
+                    }
+                    BatchPolicy::Adaptive { latency_budget, .. } => {
+                        let batch_start = Instant::now();
+                        
+                        // 1. Immediate drain phase
+                        while batch.len() < state.target_width {
+                            match receiver.try_recv() {
+                                Ok(ControllerCommand::Intent(staged)) => {
+                                    let enqueued_at = staged.enqueued_at;
+                                    oldest_enqueued_at = oldest_enqueued_at.min(enqueued_at);
+                                    claim(staged, &metrics, &mut batch);
+                                    state.observe_arrival(enqueued_at);
+                                }
+                                Ok(command @ ControllerCommand::Barrier(_)) => {
+                                    pending.push_back(command);
+                                    break;
+                                }
+                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                            }
+                        }
+
+                        let mut reason = if batch.len() >= state.target_width {
+                            BatchSealReason::Width
+                        } else {
+                            // 2. Predictive probe wait phase
+                            let now = Instant::now();
+                            let age = now.saturating_duration_since(oldest_enqueued_at);
+                            if age >= latency_budget {
+                                BatchSealReason::Latency
+                            } else {
+                                let remaining_budget = latency_budget - age;
+                                let predicted_interarrival = Duration::from_nanos(state.ewma_interarrival_time_ns as u64);
+                                let probe_wait = (predicted_interarrival * 2)
+                                    .clamp(Duration::from_micros(10), Duration::from_micros(250))
+                                    .min(remaining_budget);
+
+                                metrics.total_adaptive_probe_wait_ns.fetch_add(probe_wait.as_nanos() as u64, Ordering::Relaxed);
+
+                                match receiver.recv_timeout(probe_wait) {
+                                    Ok(ControllerCommand::Intent(staged)) => {
+                                        let enqueued_at = staged.enqueued_at;
+                                        oldest_enqueued_at = oldest_enqueued_at.min(enqueued_at);
+                                        claim(staged, &metrics, &mut batch);
+                                        state.observe_arrival(enqueued_at);
+
+                                        while batch.len() < state.target_width {
+                                            match receiver.try_recv() {
+                                                Ok(ControllerCommand::Intent(staged)) => {
+                                                    let enqueued_at = staged.enqueued_at;
+                                                    oldest_enqueued_at = oldest_enqueued_at.min(enqueued_at);
+                                                    claim(staged, &metrics, &mut batch);
+                                                    state.observe_arrival(enqueued_at);
+                                                }
+                                                Ok(command @ ControllerCommand::Barrier(_)) => {
+                                                    pending.push_back(command);
+                                                    break;
+                                                }
+                                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                                            }
+                                        }
+
+                                        if batch.len() >= state.target_width {
+                                            BatchSealReason::Width
+                                        } else {
+                                            BatchSealReason::LowTraffic
+                                        }
+                                    }
+                                    Ok(command @ ControllerCommand::Barrier(_)) => {
+                                        pending.push_back(command);
+                                        BatchSealReason::Barrier
+                                    }
+                                    Err(_) => {
+                                        if predicted_interarrival > latency_budget / 2 {
+                                            BatchSealReason::LowTraffic
+                                        } else {
+                                            BatchSealReason::SourceStalled
+                                        }
+                                    }
+                                }
+                            }
+                        };
+
+                        if batch.len() >= max_batch {
+                            reason = BatchSealReason::Capacity;
+                        }
+
+                        let seal_age = Instant::now().saturating_duration_since(oldest_enqueued_at);
+                        metrics.record_oldest_age_at_seal(seal_age);
+                        state.update_target(reason, batch.len(), min_batch, max_batch);
+                        metrics.record_max_target_width(state.target_width);
+                        reason
+                    }
+                };
+
+                metrics.record_seal_reason(seal_reason);
                 process_batch(&database, batch, &metrics);
             }
             ControllerCommand::Barrier(completed) => {
+                metrics.record_seal_reason(BatchSealReason::Barrier);
                 let _ = completed.send(());
             }
         }
@@ -655,8 +905,6 @@ fn process_batch(
         routes.push((staged.completion, staged.lifecycle));
     }
 
-    // The memory control returns only after accepted frames are appended and
-    // the reader head is swapped once to the epoch tail.
     let plan = database.commit_queued_epoch(intents);
     debug_assert_eq!(plan.outcomes().len(), routes.len());
 
@@ -726,7 +974,8 @@ mod tests {
         });
 
         let controller =
-            QueuedIntentController::new(database, 1, 1).expect("controller starts");
+            QueuedIntentController::new(database, 1, BatchPolicy::ImmediateDrain { max_batch: 1 })
+                .expect("controller starts");
         let first = controller
             .submit(QueuedIntent::new())
             .expect("first intent enters worker");
@@ -777,7 +1026,8 @@ mod tests {
         });
 
         let controller =
-            QueuedIntentController::new(database.clone(), 4, 4).expect("controller starts");
+            QueuedIntentController::new(database.clone(), 4, BatchPolicy::ImmediateDrain { max_batch: 4 })
+                .expect("controller starts");
         let mut intent = QueuedIntent::new();
         intent.define_fact(
             SlotId::new("abandoned/state"),
@@ -809,7 +1059,8 @@ mod tests {
             Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
         );
         let controller =
-            QueuedIntentController::new(database.clone(), 8, 8).expect("controller starts");
+            QueuedIntentController::new(database.clone(), 8, BatchPolicy::ImmediateDrain { max_batch: 8 })
+                .expect("controller starts");
         let slot = SlotId::new("pipeline/state");
 
         let mut first = QueuedIntent::new();
@@ -865,7 +1116,8 @@ mod tests {
             Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
         );
         let controller =
-            QueuedIntentController::new(database.clone(), 4, 4).expect("controller starts");
+            QueuedIntentController::new(database.clone(), 4, BatchPolicy::ImmediateDrain { max_batch: 4 })
+                .expect("controller starts");
         let slot = SlotId::new("published/state");
         let mut intent = QueuedIntent::new();
         intent.define_fact(slot.clone(), state_fact(EntityId::new(7), "visible"));
@@ -887,7 +1139,8 @@ mod tests {
             Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
         );
         let controller =
-            QueuedIntentController::new(database, 4, 4).expect("controller starts");
+            QueuedIntentController::new(database, 4, BatchPolicy::ImmediateDrain { max_batch: 4 })
+                .expect("controller starts");
 
         for _ in 0..1_000 {
             let ticket = loop {

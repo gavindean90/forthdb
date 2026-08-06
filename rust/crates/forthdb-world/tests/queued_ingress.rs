@@ -1,7 +1,7 @@
 use forthdb_core::{Atom, EntityId, Fact, Literal, Predicate, SlotId};
 use forthdb_world::{
-    Database, MemoryCommitStore, QueuedIntent, QueuedIntentController, SubmitError, TicketOutcome,
-    TicketPhase,
+    BatchPolicy, Database, MemoryCommitStore, QueuedIntent, QueuedIntentController, SubmitError,
+    TicketOutcome, TicketPhase,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex};
@@ -25,7 +25,7 @@ fn concurrent_producers_lose_or_duplicate_no_admitted_intents() {
         Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
     );
     let controller = Arc::new(
-        QueuedIntentController::new(database.clone(), 64, 16).expect("controller starts"),
+        QueuedIntentController::new(database.clone(), 64, BatchPolicy::ImmediateDrain { max_batch: 16 }).expect("controller starts"),
     );
     let start = Arc::new(Barrier::new(PRODUCERS + 1));
     let (ticket_tx, ticket_rx) = mpsc::channel();
@@ -122,7 +122,7 @@ fn dropping_a_ticket_before_claim_does_not_remove_its_intent() {
     });
 
     let controller =
-        QueuedIntentController::new(database.clone(), 1, 1).expect("controller starts");
+        QueuedIntentController::new(database.clone(), 1, BatchPolicy::ImmediateDrain { max_batch: 1 }).expect("controller starts");
     let first = controller
         .submit(QueuedIntent::new())
         .expect("first intent is claimed");

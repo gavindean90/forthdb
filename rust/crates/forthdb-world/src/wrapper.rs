@@ -42,7 +42,7 @@ pub use queued::{
 pub use queued_controller::{
     CommitTicket, ControllerConfigError, ControllerStopped, QueuedControllerMetrics,
     QueuedIntentController, SubmitError, TicketOutcome, TicketPhase, TicketRejection, TicketState,
-    TicketWaitError,
+    TicketWaitError, BatchPolicy,
 };
 
 pub use writer_lock::{WriterLease, WriterLeaseError, lock_path as writer_lock_path};
