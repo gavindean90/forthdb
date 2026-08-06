@@ -267,7 +267,7 @@ pub enum BatchPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BatchSealReason {
+pub(crate) enum BatchSealReason {
     Capacity,
     Timeout,
     Drain,
@@ -482,15 +482,15 @@ enum ControllerCommand {
 
 const ARRIVAL_ALPHA: f64 = 0.20;
 
-struct AdaptiveState {
-    ewma_interarrival_time_ns: f64,
-    last_arrival_time: Option<Instant>,
-    target_width: usize,
-    epochs_sealed: u64,
+pub(crate) struct AdaptiveState {
+    pub(crate) ewma_interarrival_time_ns: f64,
+    pub(crate) last_arrival_time: Option<Instant>,
+    pub(crate) target_width: usize,
+    pub(crate) epochs_sealed: u64,
 }
 
 impl AdaptiveState {
-    fn new(initial_target: usize) -> Self {
+    pub(crate) fn new(initial_target: usize) -> Self {
         Self {
             ewma_interarrival_time_ns: 10_000.0,
             last_arrival_time: None,
@@ -499,7 +499,7 @@ impl AdaptiveState {
         }
     }
 
-    fn observe_arrival(&mut self, enqueued_at: Instant) {
+    pub(crate) fn observe_arrival(&mut self, enqueued_at: Instant) {
         if let Some(previous) = self.last_arrival_time {
             if let Some(interval) = enqueued_at.checked_duration_since(previous) {
                 let interval_ns = interval.as_nanos() as f64;
@@ -513,7 +513,7 @@ impl AdaptiveState {
         );
     }
 
-    fn update_target(&mut self, reason: BatchSealReason, achieved_width: usize, min_batch: usize, max_batch: usize) {
+    pub(crate) fn update_target(&mut self, reason: BatchSealReason, achieved_width: usize, min_batch: usize, max_batch: usize) {
         self.epochs_sealed += 1;
         match reason {
             BatchSealReason::Width if achieved_width >= self.target_width => {

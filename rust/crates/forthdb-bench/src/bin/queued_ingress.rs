@@ -104,8 +104,12 @@ fn run_workload(
     let database = database_from_frames(base_frames);
     let base_version = database.snapshot().version();
     let controller = Arc::new(
-        QueuedIntentController::new(database.clone(), CAPACITY, MAX_BATCH)
-            .expect("controller starts"),
+        QueuedIntentController::new(
+            database.clone(),
+            CAPACITY,
+            forthdb_world::BatchPolicy::ImmediateDrain { max_batch: MAX_BATCH },
+        )
+        .expect("controller starts"),
     );
     let start_gate = Arc::new(Barrier::new(producers + 1));
     let (ticket_tx, ticket_rx) = mpsc::channel();

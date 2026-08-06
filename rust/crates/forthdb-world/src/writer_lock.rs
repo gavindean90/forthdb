@@ -95,7 +95,7 @@ pub fn lock_path(database_path: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn acquire_platform_lock(file: &File, path: &Path) -> Result<(), WriterLeaseError> {
     use std::os::fd::AsRawFd;
 
@@ -114,18 +114,19 @@ fn acquire_platform_lock(file: &File, path: &Path) -> Result<(), WriterLeaseErro
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(unix)]
+fn release_platform_lock(file: &File) {
+    use std::os::fd::AsRawFd;
+
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[cfg(not(unix))]
 fn acquire_platform_lock(_file: &File, _path: &Path) -> Result<(), WriterLeaseError> {
     Err(WriterLeaseError::Unsupported)
 }
 
-#[cfg(target_os = "linux")]
-fn release_platform_lock(file: &File) {
-    use std::os::fd::AsRawFd;
-    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-}
-
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 fn release_platform_lock(_file: &File) {}
 
 #[cfg(test)]
