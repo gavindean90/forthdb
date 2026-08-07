@@ -228,6 +228,11 @@ impl StrRef {
     }
 }
 
+pub struct TransientProgram<'a> {
+    pub local_count: u32,
+    pub instructions: &'a [Instruction],
+}
+
 #[derive(Default)]
 pub struct LoweringContext {
     // Intermediate views (safe handles resolving into the AST)
@@ -246,6 +251,24 @@ pub struct LoweringContext {
 impl LoweringContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_lowered<'tx, S, F, R>(
+        &mut self,
+        namespace: u64,
+        source: &'tx S,
+        callback: F,
+    ) -> Result<R, LoweringError>
+    where
+        S: OperationSource<'tx>,
+        F: for<'frame> FnOnce(TransientProgram<'frame>) -> R,
+    {
+        let local_count = self.lower_transient(namespace, source)?;
+        let program = TransientProgram {
+            local_count,
+            instructions: &self.instructions,
+        };
+        Ok(callback(program))
     }
 
     pub fn clear(&mut self) {
@@ -267,11 +290,11 @@ impl LoweringContext {
         self.clear();
     }
 
-    pub fn lower_from_source<'a, S: OperationSource<'a>>(
+    pub fn lower_transient<'a, S: OperationSource<'a>>(
         &mut self,
-        namespace: u64,
+        _namespace: u64,
         source: &S,
-    ) -> Result<InstructionStreamFrame, LoweringError> {
+    ) -> Result<u32, LoweringError> {
         self.clear();
 
         for i in 0..source.len() {
@@ -330,24 +353,7 @@ impl LoweringContext {
         self.scratch_literals
             .dedup_by(|a, b| a.as_str(source) == b.as_str(source));
 
-        for (i, slot_ref) in self.scratch_slots.iter().enumerate() {
-            let token = SlotToken(i as u32);
-            self.dict_slots
-                .push((token, SlotId::new(slot_ref.as_str(source))));
-        }
-
-        for (i, pred_ref) in self.scratch_predicates.iter().enumerate() {
-            let cell = Cell(i as u64);
-            self.dict_predicates
-                .push((cell, Predicate::new(pred_ref.as_str(source))));
-        }
-
         let literal_offset = self.scratch_predicates.len();
-        for (i, lit_ref) in self.scratch_literals.iter().enumerate() {
-            let cell = Cell((i + literal_offset) as u64);
-            self.dict_literals
-                .push((cell, Literal::new(lit_ref.as_str(source))));
-        }
 
         let load_atom = |atom: &AtomRefView<'a>| -> Result<Instruction, LoweringError> {
             match atom {
@@ -444,6 +450,35 @@ impl LoweringContext {
                     self.instructions.push(Instruction::reject());
                 }
             }
+        }
+
+        Ok(local_count)
+    }
+
+    pub fn lower_from_source<'a, S: OperationSource<'a>>(
+        &mut self,
+        namespace: u64,
+        source: &S,
+    ) -> Result<InstructionStreamFrame, LoweringError> {
+        let local_count = self.lower_transient(namespace, source)?;
+
+        for (i, slot_ref) in self.scratch_slots.iter().enumerate() {
+            let token = SlotToken(i as u32);
+            self.dict_slots
+                .push((token, SlotId::new(slot_ref.as_str(source))));
+        }
+
+        for (i, pred_ref) in self.scratch_predicates.iter().enumerate() {
+            let cell = Cell(i as u64);
+            self.dict_predicates
+                .push((cell, Predicate::new(pred_ref.as_str(source))));
+        }
+
+        let literal_offset = self.scratch_predicates.len();
+        for (i, lit_ref) in self.scratch_literals.iter().enumerate() {
+            let cell = Cell((i + literal_offset) as u64);
+            self.dict_literals
+                .push((cell, Literal::new(lit_ref.as_str(source))));
         }
 
         let dict = StreamDictionary {
@@ -750,6 +785,94 @@ mod tests {
             assert_eq!(ref_res, new_res_oneshot);
             assert_eq!(ref_res, new_res_pooled);
             assert_eq!(ref_res, new_res_view);
+        }
+    }
+
+    #[test]
+    fn execution_differential_fuzzing() {
+        struct Lcg { seed: u32 }
+        impl Lcg {
+            fn next_u32(&mut self) -> u32 {
+                self.seed = self.seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                self.seed
+            }
+            fn next_string(&mut self, opts: &[&str]) -> String {
+                let idx = (self.next_u32() as usize) % opts.len();
+                opts[idx].to_string()
+            }
+            fn next_atom(&mut self) -> AtomRef {
+                match self.next_u32() % 3 {
+                    0 => AtomRef::Entity(EntityId(self.next_u32() as u64 % 100)),
+                    1 => AtomRef::Literal(self.next_string(&["a", "b", "c", "d", "e", "f"])),
+                    _ => AtomRef::Symbol(self.next_string(&["temp0", "temp1", "temp2"])),
+                }
+            }
+        }
+
+        let mut rng = Lcg { seed: 54321 };
+
+        let slots = ["slot1", "slot2", "slot3", "slot4"];
+        let predicates = ["is", "has", "can", "should"];
+        let symbols = ["temp0", "temp1", "temp2"];
+
+        let mut ctx = LoweringContext::new();
+
+        use crate::stack_vm::{Workspace, IntentProgram};
+        
+        for _ in 0..10_000 {
+            let op_count = (rng.next_u32() % 20) as usize;
+            let mut operations = Vec::with_capacity(op_count);
+            
+            for _ in 0..op_count {
+                let op = match rng.next_u32() % 6 {
+                    0 => TransactionOp::Allocate { result: rng.next_string(&symbols) },
+                    1 => TransactionOp::ExpectWorld { expected: WorldId(rng.next_u32() as u64) },
+                    2 => TransactionOp::ExpectObject { 
+                        slot: rng.next_string(&slots), 
+                        expected: rng.next_atom() 
+                    },
+                    3 => TransactionOp::Define {
+                        slot: rng.next_string(&slots),
+                        subject: rng.next_atom(),
+                        predicate: rng.next_string(&predicates),
+                        object: rng.next_atom(),
+                    },
+                    4 => TransactionOp::Forget { slot: rng.next_string(&slots) },
+                    _ => TransactionOp::Reject,
+                };
+                operations.push(op);
+            }
+            
+            let ast = TransactionAST::new(rng.next_u32() as u64, operations);
+            
+            let res_owned = ast.lower_to_sisa();
+            if res_owned.is_err() {
+                // If it fails to lower, the lowering fuzzing already covers it.
+                continue;
+            }
+            let frame = res_owned.unwrap();
+            let program = IntentProgram::new(frame.local_count, frame.instructions);
+            
+            let mut workspace1 = Workspace::with_capacity(100, 32, 100, 100);
+            let outcome1 = workspace1.execute(&program);
+            
+            let mut workspace2 = Workspace::with_capacity(100, 32, 100, 100);
+            let view_ops: Vec<TransactionOpView> = (0..op_count)
+                .map(|i| OwnedOperationSource(&ast.operations).operation(i))
+                .collect();
+            let source = BorrowedOperationSource(&view_ops);
+            
+            let mut outcome2 = None;
+            let res = ctx.with_lowered(ast.namespace, &source, |transient_prog| {
+                outcome2 = Some(workspace2.execute_instructions(transient_prog.local_count, transient_prog.instructions));
+            });
+            
+            assert!(res.is_ok(), "Transient lowering should succeed if owned lowering succeeded");
+            assert_eq!(outcome1, outcome2.unwrap(), "Execution outcomes must match exactly");
+            
+            // Compare memory state in workspace (semantic_hash verifies total record and delta equivalence)
+            assert_eq!(workspace1.semantic_hash(), workspace2.semantic_hash(), "Workspace semantic states must match");
+            assert_eq!(workspace1.next_entity(), workspace2.next_entity(), "Next entity ID must match");
         }
     }
 

@@ -168,6 +168,10 @@ impl IntentProgram {
         }
     }
 
+    pub fn local_count(&self) -> u32 {
+        self.local_count
+    }
+
     pub fn instructions(&self) -> &[Instruction] {
         &self.instructions
     }
@@ -582,14 +586,22 @@ impl Workspace {
     }
 
     pub fn execute(&mut self, program: &IntentProgram) -> ExecutionOutcome {
+        self.execute_instructions(program.local_count(), program.instructions())
+    }
+
+    pub fn execute_instructions(
+        &mut self,
+        local_count: u32,
+        instructions: &[Instruction],
+    ) -> ExecutionOutcome {
         let checkpoint = self.checkpoint();
         self.frame_base = self.stack_pointer;
-        if self.reserve(program.local_count as usize).is_err() {
+        if self.reserve(local_count as usize).is_err() {
             self.rollback(checkpoint);
             return ExecutionOutcome::Rejected(ExecError::StackOverflow);
         }
 
-        for instruction in program.instructions() {
+        for instruction in instructions {
             if let Err(error) = self.execute_instruction(*instruction, checkpoint) {
                 self.rollback(checkpoint);
                 return ExecutionOutcome::Rejected(error);
@@ -621,6 +633,10 @@ impl Workspace {
 
     pub fn next_entity(&self) -> u64 {
         self.next_entity
+    }
+
+    pub fn semantic_hash(&self) -> u64 {
+        self.semantic_hash
     }
 
     pub fn record_count(&self) -> usize {

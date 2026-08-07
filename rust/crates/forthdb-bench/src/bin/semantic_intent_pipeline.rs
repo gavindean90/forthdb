@@ -309,46 +309,7 @@ fn main() {
         allocs.allocations / t
     );
 
-    // 6. Owned-as-View Full Pipeline - Pooled
-    let mut workspace =
-        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
-    let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
-    use forthdb_world::transaction_ast::{OwnedOperationSource, OperationSource, TransactionView, TransactionOpView};
-    let (min, med, max) = time_batch(|| {
-        for i in 0..TOTAL_INTENTS {
-            let ast = ast_transaction(i, reject_slot);
-            let view_ops: Vec<TransactionOpView> = (0..ast.operations.len())
-                .map(|idx| OwnedOperationSource(&ast.operations).operation(idx))
-                .collect();
-            let view = TransactionView::borrowed(ast.namespace, &view_ops);
-            let frame = view.lower_to_sisa_with(&mut ctx).unwrap();
-            let program = IntentProgram::new(frame.local_count, frame.instructions.clone());
-            black_box(workspace.execute(&program));
-            ctx.reclaim(frame);
-        }
-    });
-    let allocs = allocs_batch(|| {
-        for i in 0..TOTAL_INTENTS {
-            let ast = ast_transaction(i, reject_slot);
-            let view_ops: Vec<TransactionOpView> = (0..ast.operations.len())
-                .map(|idx| OwnedOperationSource(&ast.operations).operation(idx))
-                .collect();
-            let view = TransactionView::borrowed(ast.namespace, &view_ops);
-            let frame = view.lower_to_sisa_with(&mut ctx).unwrap();
-            let program = IntentProgram::new(frame.local_count, frame.instructions.clone());
-            black_box(workspace.execute(&program));
-            ctx.reclaim(frame);
-        }
-    });
-    println!(
-        "Owned-as-View         | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
-    );
-
-    // 7. Native Borrowed -> Owned Frame - Pooled
+    // 6. Native Borrowed -> Owned Frame - Pooled
     // We preconstruct the views to simulate the input already being in borrowed view form.
     let mut native_views = Vec::with_capacity(TOTAL_INTENTS);
     let mut native_asts = Vec::with_capacity(TOTAL_INTENTS);
@@ -366,6 +327,7 @@ fn main() {
     let mut workspace =
         Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
     let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
+    use forthdb_world::transaction_ast::{OwnedOperationSource, OperationSource, TransactionView, TransactionOpView, BorrowedOperationSource};
     let (min, med, max) = time_batch(|| {
         for view in &native_views {
             let frame = view.lower_to_sisa_with(&mut ctx).unwrap();
@@ -383,7 +345,35 @@ fn main() {
         }
     });
     println!(
-        "Native Borrowed       | {:>6} | {:>6} | {:>6} | {:>6}",
+        "Native Borrowed Frame | {:>6} | {:>6} | {:>6} | {:>6}",
+        min / t,
+        med / t,
+        max / t,
+        allocs.allocations / t
+    );
+
+    // 7. Native Borrowed -> Transient Execute
+    let mut workspace =
+        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
+    let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
+    let (min, med, max) = time_batch(|| {
+        for view in &native_views {
+            let source = BorrowedOperationSource(view.operations);
+            ctx.with_lowered(view.namespace, &source, |program| {
+                black_box(workspace.execute_instructions(program.local_count, program.instructions));
+            }).unwrap();
+        }
+    });
+    let allocs = allocs_batch(|| {
+        for view in &native_views {
+            let source = BorrowedOperationSource(view.operations);
+            ctx.with_lowered(view.namespace, &source, |program| {
+                black_box(workspace.execute_instructions(program.local_count, program.instructions));
+            }).unwrap();
+        }
+    });
+    println!(
+        "Transient Execute     | {:>6} | {:>6} | {:>6} | {:>6}",
         min / t,
         med / t,
         max / t,
