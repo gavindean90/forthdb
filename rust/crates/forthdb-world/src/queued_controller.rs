@@ -2,7 +2,7 @@ use super::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -86,8 +86,18 @@ pub enum TicketRejection {
 impl fmt::Display for TicketRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::WorldPrecondition { expected, actual } => write!(f, "world precondition mismatch: expected {expected:?}, actual {actual:?}"),
-            Self::SlotPrecondition { slot, expected, actual } => write!(f, "slot precondition mismatch on {slot:?}: expected {expected:?}, actual {actual:?}"),
+            Self::WorldPrecondition { expected, actual } => write!(
+                f,
+                "world precondition mismatch: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::SlotPrecondition {
+                slot,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "slot precondition mismatch on {slot:?}: expected {expected:?}, actual {actual:?}"
+            ),
             Self::UnknownTemporaryEntity(temp) => write!(f, "unknown temporary entity: {temp:?}"),
             Self::Candidate(msg) => write!(f, "candidate rejection: {msg}"),
             Self::Validation(msg) => write!(f, "validation failure: {msg}"),
@@ -98,12 +108,10 @@ impl fmt::Display for TicketRejection {
 impl TicketRejection {
     fn from_intent_rejection(error: &IntentRejection) -> Self {
         match error {
-            IntentRejection::WorldPrecondition { expected, actual } => {
-                Self::WorldPrecondition {
-                    expected: *expected,
-                    actual: *actual,
-                }
-            }
+            IntentRejection::WorldPrecondition { expected, actual } => Self::WorldPrecondition {
+                expected: *expected,
+                actual: *actual,
+            },
             IntentRejection::SlotPrecondition {
                 slot,
                 expected,
@@ -113,9 +121,7 @@ impl TicketRejection {
                 expected: expected.clone(),
                 actual: actual.clone(),
             },
-            IntentRejection::UnknownTemporaryEntity(temp) => {
-                Self::UnknownTemporaryEntity(*temp)
-            }
+            IntentRejection::UnknownTemporaryEntity(temp) => Self::UnknownTemporaryEntity(*temp),
             IntentRejection::Candidate(message) => Self::Candidate(message.to_string()),
             IntentRejection::Validation(message) => Self::Validation(message.clone()),
         }
@@ -182,7 +188,9 @@ impl Drop for CommitTicket {
     fn drop(&mut self) {
         if !self.observed {
             if self.lifecycle.abandon() {
-                self.metrics.abandoned_tickets.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .abandoned_tickets
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -377,10 +385,12 @@ impl ControllerMetricsInner {
     fn record_seal_reason(&self, reason: BatchSealReason) {
         match reason {
             BatchSealReason::Capacity => {
-                self.batches_sealed_by_capacity.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_capacity
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::Timeout => {
-                self.batches_sealed_by_timeout.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_timeout
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::Drain => {
                 self.batches_sealed_by_drain.fetch_add(1, Ordering::Relaxed);
@@ -389,16 +399,20 @@ impl ControllerMetricsInner {
                 self.batches_sealed_by_width.fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::Latency => {
-                self.batches_sealed_by_latency.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_latency
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::LowTraffic => {
-                self.batches_sealed_by_low_traffic.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_low_traffic
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::SourceStalled => {
-                self.batches_sealed_by_source_stalled.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_source_stalled
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::Barrier => {
-                self.batches_sealed_by_barrier.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_barrier
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -446,9 +460,7 @@ impl ControllerMetricsInner {
             rejected: self.rejected.load(Ordering::Relaxed),
             epochs: self.epochs.load(Ordering::Relaxed),
             abandoned_tickets: self.abandoned_tickets.load(Ordering::Relaxed),
-            completion_delivery_failures: self
-                .completion_delivery_failures
-                .load(Ordering::Relaxed),
+            completion_delivery_failures: self.completion_delivery_failures.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Acquire),
             maximum_queue_depth: self.maximum_queue_depth.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Acquire),
@@ -458,12 +470,18 @@ impl ControllerMetricsInner {
             batches_sealed_by_drain: self.batches_sealed_by_drain.load(Ordering::Relaxed),
             batches_sealed_by_width: self.batches_sealed_by_width.load(Ordering::Relaxed),
             batches_sealed_by_latency: self.batches_sealed_by_latency.load(Ordering::Relaxed),
-            batches_sealed_by_low_traffic: self.batches_sealed_by_low_traffic.load(Ordering::Relaxed),
-            batches_sealed_by_source_stalled: self.batches_sealed_by_source_stalled.load(Ordering::Relaxed),
+            batches_sealed_by_low_traffic: self
+                .batches_sealed_by_low_traffic
+                .load(Ordering::Relaxed),
+            batches_sealed_by_source_stalled: self
+                .batches_sealed_by_source_stalled
+                .load(Ordering::Relaxed),
             batches_sealed_by_barrier: self.batches_sealed_by_barrier.load(Ordering::Relaxed),
             maximum_target_width: self.maximum_target_width.load(Ordering::Relaxed) as usize,
             total_adaptive_probe_wait_ns: self.total_adaptive_probe_wait_ns.load(Ordering::Relaxed),
-            maximum_oldest_age_at_seal_ns: self.maximum_oldest_age_at_seal_ns.load(Ordering::Relaxed),
+            maximum_oldest_age_at_seal_ns: self
+                .maximum_oldest_age_at_seal_ns
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -503,7 +521,8 @@ impl AdaptiveState {
         if let Some(previous) = self.last_arrival_time {
             if let Some(interval) = enqueued_at.checked_duration_since(previous) {
                 let interval_ns = interval.as_nanos() as f64;
-                self.ewma_interarrival_time_ns = (1.0 - ARRIVAL_ALPHA) * self.ewma_interarrival_time_ns
+                self.ewma_interarrival_time_ns = (1.0 - ARRIVAL_ALPHA)
+                    * self.ewma_interarrival_time_ns
                     + ARRIVAL_ALPHA * interval_ns;
             }
         }
@@ -513,23 +532,26 @@ impl AdaptiveState {
         );
     }
 
-    pub(crate) fn update_target(&mut self, reason: BatchSealReason, achieved_width: usize, min_batch: usize, max_batch: usize) {
+    pub(crate) fn update_target(
+        &mut self,
+        reason: BatchSealReason,
+        achieved_width: usize,
+        min_batch: usize,
+        max_batch: usize,
+    ) {
         self.epochs_sealed += 1;
         match reason {
             BatchSealReason::Width if achieved_width >= self.target_width => {
-                self.target_width = (self.target_width + 1)
-                    .saturating_mul(2)
-                    .min(max_batch);
+                self.target_width = (self.target_width + 1).saturating_mul(2).min(max_batch);
             }
             BatchSealReason::Width => {
-                self.target_width = self.target_width
+                self.target_width = self
+                    .target_width
                     .saturating_add(min_batch.max(1))
                     .min(max_batch);
             }
             BatchSealReason::Latency => {
-                self.target_width = self.target_width
-                    .saturating_div(2)
-                    .max(min_batch);
+                self.target_width = self.target_width.saturating_div(2).max(min_batch);
             }
             BatchSealReason::SourceStalled => {
                 self.target_width = achieved_width.max(min_batch).min(max_batch);
@@ -701,7 +723,11 @@ fn run_worker(
     let (min_batch, max_batch) = match policy {
         BatchPolicy::ImmediateDrain { max_batch } => (1, max_batch),
         BatchPolicy::Coalesce { max_batch, .. } => (1, max_batch),
-        BatchPolicy::Adaptive { min_batch, max_batch, .. } => (min_batch, max_batch),
+        BatchPolicy::Adaptive {
+            min_batch,
+            max_batch,
+            ..
+        } => (min_batch, max_batch),
     };
 
     let mut state = AdaptiveState::new(min_batch.max(16).min(max_batch));
@@ -776,7 +802,7 @@ fn run_worker(
                     }
                     BatchPolicy::Adaptive { latency_budget, .. } => {
                         let batch_start = Instant::now();
-                        
+
                         // 1. Immediate drain phase
                         while batch.len() < state.target_width {
                             match receiver.try_recv() {
@@ -804,12 +830,15 @@ fn run_worker(
                                 BatchSealReason::Latency
                             } else {
                                 let remaining_budget = latency_budget - age;
-                                let predicted_interarrival = Duration::from_nanos(state.ewma_interarrival_time_ns as u64);
+                                let predicted_interarrival =
+                                    Duration::from_nanos(state.ewma_interarrival_time_ns as u64);
                                 let probe_wait = (predicted_interarrival * 2)
                                     .clamp(Duration::from_micros(10), Duration::from_micros(250))
                                     .min(remaining_budget);
 
-                                metrics.total_adaptive_probe_wait_ns.fetch_add(probe_wait.as_nanos() as u64, Ordering::Relaxed);
+                                metrics
+                                    .total_adaptive_probe_wait_ns
+                                    .fetch_add(probe_wait.as_nanos() as u64, Ordering::Relaxed);
 
                                 match receiver.recv_timeout(probe_wait) {
                                     Ok(ControllerCommand::Intent(staged)) => {
@@ -822,7 +851,8 @@ fn run_worker(
                                             match receiver.try_recv() {
                                                 Ok(ControllerCommand::Intent(staged)) => {
                                                     let enqueued_at = staged.enqueued_at;
-                                                    oldest_enqueued_at = oldest_enqueued_at.min(enqueued_at);
+                                                    oldest_enqueued_at =
+                                                        oldest_enqueued_at.min(enqueued_at);
                                                     claim(staged, &metrics, &mut batch);
                                                     state.observe_arrival(enqueued_at);
                                                 }
@@ -830,7 +860,8 @@ fn run_worker(
                                                     pending.push_back(command);
                                                     break;
                                                 }
-                                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                                                Err(TryRecvError::Empty)
+                                                | Err(TryRecvError::Disconnected) => break,
                                             }
                                         }
 
@@ -878,11 +909,7 @@ fn run_worker(
     }
 }
 
-fn claim(
-    staged: StagedIntent,
-    metrics: &ControllerMetricsInner,
-    batch: &mut Vec<StagedIntent>,
-) {
+fn claim(staged: StagedIntent, metrics: &ControllerMetricsInner, batch: &mut Vec<StagedIntent>) {
     metrics.release_ingress();
     metrics.claimed.fetch_add(1, Ordering::Relaxed);
     staged.lifecycle.claim();
@@ -952,9 +979,8 @@ mod tests {
 
     #[test]
     fn saturation_returns_the_original_intent_immediately() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -1008,9 +1034,8 @@ mod tests {
 
     #[test]
     fn dropping_a_claimed_ticket_does_not_cancel_history() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -1025,9 +1050,12 @@ mod tests {
             Ok(())
         });
 
-        let controller =
-            QueuedIntentController::new(database.clone(), 4, BatchPolicy::ImmediateDrain { max_batch: 4 })
-                .expect("controller starts");
+        let controller = QueuedIntentController::new(
+            database.clone(),
+            4,
+            BatchPolicy::ImmediateDrain { max_batch: 4 },
+        )
+        .expect("controller starts");
         let mut intent = QueuedIntent::new();
         intent.define_fact(
             SlotId::new("abandoned/state"),
@@ -1040,7 +1068,9 @@ mod tests {
         assert_eq!(ticket.state().phase, TicketPhase::Claimed);
         drop(ticket);
         release_tx.send(()).expect("release worker");
-        controller.flush().expect("abandoned intent still completes");
+        controller
+            .flush()
+            .expect("abandoned intent still completes");
 
         let world = database.snapshot();
         assert_eq!(world.version(), 1);
@@ -1055,12 +1085,14 @@ mod tests {
 
     #[test]
     fn rejection_routes_only_to_its_own_ticket() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
-        let controller =
-            QueuedIntentController::new(database.clone(), 8, BatchPolicy::ImmediateDrain { max_batch: 8 })
-                .expect("controller starts");
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
+        let controller = QueuedIntentController::new(
+            database.clone(),
+            8,
+            BatchPolicy::ImmediateDrain { max_batch: 8 },
+        )
+        .expect("controller starts");
         let slot = SlotId::new("pipeline/state");
 
         let mut first = QueuedIntent::new();
@@ -1080,7 +1112,9 @@ mod tests {
             SlotId::new("pipeline/rejected"),
             state_fact(EntityId::new(2), "never"),
         );
-        let rejected = controller.submit(rejected).expect("rejected intent submitted");
+        let rejected = controller
+            .submit(rejected)
+            .expect("rejected intent submitted");
 
         let mut third = QueuedIntent::new();
         third.define_fact(
@@ -1097,14 +1131,18 @@ mod tests {
         controller.flush().expect("controller drains");
 
         assert_eq!(third_world.version(), 2);
-        assert!(database
-            .snapshot()
-            .resolve(&SlotId::new("pipeline/rejected"))
-            .is_none());
-        assert!(database
-            .snapshot()
-            .resolve(&SlotId::new("pipeline/third"))
-            .is_some());
+        assert!(
+            database
+                .snapshot()
+                .resolve(&SlotId::new("pipeline/rejected"))
+                .is_none()
+        );
+        assert!(
+            database
+                .snapshot()
+                .resolve(&SlotId::new("pipeline/third"))
+                .is_some()
+        );
         let metrics = controller.metrics();
         assert_eq!(metrics.accepted, 2);
         assert_eq!(metrics.rejected, 1);
@@ -1112,12 +1150,14 @@ mod tests {
 
     #[test]
     fn ticket_resolution_never_precedes_tail_publication() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
-        let controller =
-            QueuedIntentController::new(database.clone(), 4, BatchPolicy::ImmediateDrain { max_batch: 4 })
-                .expect("controller starts");
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
+        let controller = QueuedIntentController::new(
+            database.clone(),
+            4,
+            BatchPolicy::ImmediateDrain { max_batch: 4 },
+        )
+        .expect("controller starts");
         let slot = SlotId::new("published/state");
         let mut intent = QueuedIntent::new();
         intent.define_fact(slot.clone(), state_fact(EntityId::new(7), "visible"));
@@ -1135,9 +1175,8 @@ mod tests {
 
     #[test]
     fn fast_claims_never_underflow_ingress_accounting() {
-        let database = Arc::new(
-            Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"),
-        );
+        let database =
+            Arc::new(Database::new(MemoryCommitStore::new()).expect("empty memory store is valid"));
         let controller =
             QueuedIntentController::new(database, 4, BatchPolicy::ImmediateDrain { max_batch: 4 })
                 .expect("controller starts");

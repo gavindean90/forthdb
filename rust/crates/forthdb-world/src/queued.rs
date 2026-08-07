@@ -1,9 +1,9 @@
 use super::*;
+use crate::mmap_vm_snapshot::MmapVmSnapshot;
+use crate::semantic_isa::{InstructionStreamFrame, StreamDictionary};
 use crate::stack_vm::{
     Cell, ExecutionOutcome, Instruction, IntentProgram, Opcode, SlotToken, Workspace as VmWorkspace,
 };
-use crate::semantic_isa::{InstructionStreamFrame, StreamDictionary};
-use crate::mmap_vm_snapshot::MmapVmSnapshot;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -236,20 +236,32 @@ impl QueuedIntent {
         for prec in &self.preconditions {
             match prec {
                 IntentPrecondition::ExpectedWorld(world) => {
-                    instructions.push(Instruction::raw(Opcode::ExpectObject, u32::MAX, world.value()));
+                    instructions.push(Instruction::raw(
+                        Opcode::ExpectObject,
+                        u32::MAX,
+                        world.value(),
+                    ));
                 }
                 IntentPrecondition::ExpectedSlot { slot, expected } => {
                     let slot_token = get_slot(slot);
                     match expected {
                         Some(fact) => {
                             match &fact.subject {
-                                Atom::Entity(e) => instructions.push(Instruction::push(Cell(e.value()))),
-                                Atom::Literal(l) => instructions.push(Instruction::push(get_literal(l))),
+                                Atom::Entity(e) => {
+                                    instructions.push(Instruction::push(Cell(e.value())))
+                                }
+                                Atom::Literal(l) => {
+                                    instructions.push(Instruction::push(get_literal(l)))
+                                }
                             }
                             instructions.push(Instruction::push(get_predicate(&fact.predicate)));
                             match &fact.object {
-                                Atom::Entity(e) => instructions.push(Instruction::push(Cell(e.value()))),
-                                Atom::Literal(l) => instructions.push(Instruction::push(get_literal(l))),
+                                Atom::Entity(e) => {
+                                    instructions.push(Instruction::push(Cell(e.value())))
+                                }
+                                Atom::Literal(l) => {
+                                    instructions.push(Instruction::push(get_literal(l)))
+                                }
                             }
                             instructions.push(Instruction::expect_object(slot_token, Cell(1)));
                         }
@@ -271,15 +283,27 @@ impl QueuedIntent {
                     let slot_token = get_slot(slot);
 
                     match &fact.subject {
-                        IntentAtom::Entity(e) => instructions.push(Instruction::push(Cell(e.value()))),
-                        IntentAtom::Temporary(t) => instructions.push(Instruction::load_local(t.index)),
-                        IntentAtom::Literal(l) => instructions.push(Instruction::push(get_literal(l))),
+                        IntentAtom::Entity(e) => {
+                            instructions.push(Instruction::push(Cell(e.value())))
+                        }
+                        IntentAtom::Temporary(t) => {
+                            instructions.push(Instruction::load_local(t.index))
+                        }
+                        IntentAtom::Literal(l) => {
+                            instructions.push(Instruction::push(get_literal(l)))
+                        }
                     }
                     instructions.push(Instruction::push(get_predicate(&fact.predicate)));
                     match &fact.object {
-                        IntentAtom::Entity(e) => instructions.push(Instruction::push(Cell(e.value()))),
-                        IntentAtom::Temporary(t) => instructions.push(Instruction::load_local(t.index)),
-                        IntentAtom::Literal(l) => instructions.push(Instruction::push(get_literal(l))),
+                        IntentAtom::Entity(e) => {
+                            instructions.push(Instruction::push(Cell(e.value())))
+                        }
+                        IntentAtom::Temporary(t) => {
+                            instructions.push(Instruction::load_local(t.index))
+                        }
+                        IntentAtom::Literal(l) => {
+                            instructions.push(Instruction::push(get_literal(l)))
+                        }
                     }
 
                     instructions.push(Instruction::define(slot_token));
@@ -354,7 +378,9 @@ impl QueuedIntent {
             match inst.opcode() {
                 Opcode::Allocate => {
                     let temp = intent.entity();
-                    if idx + 1 < instructions.len() && instructions[idx + 1].opcode() == Opcode::StoreLocal {
+                    if idx + 1 < instructions.len()
+                        && instructions[idx + 1].opcode() == Opcode::StoreLocal
+                    {
                         idx += 1;
                     }
                 }
@@ -430,7 +456,9 @@ impl QueuedIntent {
                                     .get(&c)
                                     .cloned()
                                     .unwrap_or_else(|| Predicate::new(&format!("pred_{c}"))),
-                                StackVal::Atom(IntentAtom::Literal(l)) => Predicate::new(l.as_str()),
+                                StackVal::Atom(IntentAtom::Literal(l)) => {
+                                    Predicate::new(l.as_str())
+                                }
                                 _ => Predicate::new("predicate"),
                             };
 
@@ -2341,7 +2369,10 @@ mod tests {
         }
 
         let final_slot = SlotId::new("vm/dependent/63");
-        assert_eq!(vm_world.resolve(&final_slot), reference_world.resolve(&final_slot));
+        assert_eq!(
+            vm_world.resolve(&final_slot),
+            reference_world.resolve(&final_slot)
+        );
         assert!(vm_world.is_query_projection_materialized());
         assert!(!vm_world.is_legacy_query_projection_materialized());
     }

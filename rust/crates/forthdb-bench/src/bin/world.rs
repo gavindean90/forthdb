@@ -210,9 +210,8 @@ fn reconstruction_measurement(frame_count: u64, iterations: u64) -> Measurement 
                         .append(frame.clone())
                         .expect("memory append is infallible");
                 }
-                let database = black_box(
-                    Database::new(store).expect("benchmark history must reconstruct"),
-                );
+                let database =
+                    black_box(Database::new(store).expect("benchmark history must reconstruct"));
                 let world = database.snapshot();
                 checksum = checksum
                     .wrapping_add(world.id().value())

@@ -40,9 +40,9 @@ pub use queued::{
     IntentRejection, QueuedIntent, RejectedIntent, TempEntity, derive_epoch, derive_epoch_world,
 };
 pub use queued_controller::{
-    CommitTicket, ControllerConfigError, ControllerStopped, QueuedControllerMetrics,
+    BatchPolicy, CommitTicket, ControllerConfigError, ControllerStopped, QueuedControllerMetrics,
     QueuedIntentController, SubmitError, TicketOutcome, TicketPhase, TicketRejection, TicketState,
-    TicketWaitError, BatchPolicy,
+    TicketWaitError,
 };
 
 pub use writer_lock::{WriterLease, WriterLeaseError, lock_path as writer_lock_path};

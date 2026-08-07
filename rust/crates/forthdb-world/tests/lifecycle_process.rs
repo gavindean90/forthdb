@@ -2,9 +2,8 @@
 
 use forthdb_core::{Atom, EntityId, Fact, Literal, Predicate, SlotId};
 use forthdb_world::{
-    CommitStore, DurableControllerOpenError, DurableControllerState,
-    DurableQueuedIntentController, FileCommitStore, FileEpochSyncPolicy, QueuedIntent,
-    WriterLeaseError, writer_lock_path,
+    CommitStore, DurableControllerOpenError, DurableControllerState, DurableQueuedIntentController,
+    FileCommitStore, FileEpochSyncPolicy, QueuedIntent, WriterLeaseError, writer_lock_path,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -133,12 +132,8 @@ fn writer_lease_is_exclusive_across_processes_and_released_after_sigkill() {
     let mut child = spawn_child("hold-writer-lock", &database, Some(&ready), None);
     wait_for_file(&ready);
 
-    let second = DurableQueuedIntentController::open_owned(
-        &database,
-        FileEpochSyncPolicy::PerEpoch,
-        16,
-        8,
-    );
+    let second =
+        DurableQueuedIntentController::open_owned(&database, FileEpochSyncPolicy::PerEpoch, 16, 8);
     assert!(matches!(
         second,
         Err(DurableControllerOpenError::WriterLease(
@@ -151,13 +146,9 @@ fn writer_lease_is_exclusive_across_processes_and_released_after_sigkill() {
     let status = child.wait().expect("killed child is reaped");
     assert!(!status.success());
 
-    let controller = DurableQueuedIntentController::open_owned(
-        &database,
-        FileEpochSyncPolicy::PerEpoch,
-        16,
-        8,
-    )
-    .expect("writer ownership is released by process death");
+    let controller =
+        DurableQueuedIntentController::open_owned(&database, FileEpochSyncPolicy::PerEpoch, 16, 8)
+            .expect("writer ownership is released by process death");
     let report = controller.shutdown();
     assert_eq!(report.final_state, DurableControllerState::Closed);
 

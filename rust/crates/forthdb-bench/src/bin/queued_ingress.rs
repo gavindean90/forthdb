@@ -6,7 +6,7 @@ use forthdb_world::{
 use serde::Serialize;
 use std::env;
 use std::fs;
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -107,7 +107,9 @@ fn run_workload(
         QueuedIntentController::new(
             database.clone(),
             CAPACITY,
-            forthdb_world::BatchPolicy::ImmediateDrain { max_batch: MAX_BATCH },
+            forthdb_world::BatchPolicy::ImmediateDrain {
+                max_batch: MAX_BATCH,
+            },
         )
         .expect("controller starts"),
     );

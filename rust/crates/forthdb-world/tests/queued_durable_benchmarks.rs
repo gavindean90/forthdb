@@ -1,6 +1,7 @@
 use forthdb_core::{Atom, EntityId, Fact, Literal, Predicate, SlotId};
 use forthdb_world::{
-    BatchPolicy, Database, DurableQueuedIntentController, FileEpochStore, FileEpochSyncPolicy, QueuedIntent,
+    BatchPolicy, Database, DurableQueuedIntentController, FileEpochStore, FileEpochSyncPolicy,
+    QueuedIntent,
 };
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +13,11 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(100);
 
 fn temp_db_path() -> std::path::PathBuf {
     let id = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("forthdb_durable_lib_bench_{}_{}.fdb", std::process::id(), id))
+    std::env::temp_dir().join(format!(
+        "forthdb_durable_lib_bench_{}_{}.fdb",
+        std::process::id(),
+        id
+    ))
 }
 
 fn make_library_intent(copy_id: u64, patron_id: u64, cycle: u64) -> QueuedIntent {
@@ -56,7 +61,9 @@ fn run_durable_library_benchmark(
 
     let start = Instant::now();
     let mut handles = Vec::new();
-    let latencies_mutex = Arc::new(Mutex::new(Vec::with_capacity(concurrent_clients * intents_per_client)));
+    let latencies_mutex = Arc::new(Mutex::new(Vec::with_capacity(
+        concurrent_clients * intents_per_client,
+    )));
 
     for client_idx in 0..concurrent_clients {
         let controller = controller.clone();
@@ -96,25 +103,39 @@ fn run_durable_library_benchmark(
 
     println!("=== LIBRARY WORKLOAD BENCHMARK: {} ===", name);
     println!("Policy: {:?}", policy);
-    println!("Clients: {}, Intents/Client: {}, Total Intents: {}", concurrent_clients, intents_per_client, total_intents);
+    println!(
+        "Clients: {}, Intents/Client: {}, Total Intents: {}",
+        concurrent_clients, intents_per_client, total_intents
+    );
     println!("Time: {:?}, Ops/sec: {:.2}", elapsed, ops_per_sec);
     println!("Latency p50: {:?}, p95: {:?}, p99: {:?}", p50, p95, p99);
-    println!("Epochs/Syncs: {}, Avg Batch Size: {:.2}", metrics.epochs, total_intents as f64 / metrics.epochs as f64);
-    println!("Seals: Capacity: {}, Timeout: {}, Drain: {}, Width: {}, Latency: {}, LowTraffic: {}, SourceStalled: {}", 
-             metrics.batches_sealed_by_capacity,
-             metrics.batches_sealed_by_timeout,
-             metrics.batches_sealed_by_drain,
-             metrics.batches_sealed_by_width,
-             metrics.batches_sealed_by_latency,
-             metrics.batches_sealed_by_low_traffic,
-             metrics.batches_sealed_by_source_stalled);
+    println!(
+        "Epochs/Syncs: {}, Avg Batch Size: {:.2}",
+        metrics.epochs,
+        total_intents as f64 / metrics.epochs as f64
+    );
+    println!(
+        "Seals: Capacity: {}, Timeout: {}, Drain: {}, Width: {}, Latency: {}, LowTraffic: {}, SourceStalled: {}",
+        metrics.batches_sealed_by_capacity,
+        metrics.batches_sealed_by_timeout,
+        metrics.batches_sealed_by_drain,
+        metrics.batches_sealed_by_width,
+        metrics.batches_sealed_by_latency,
+        metrics.batches_sealed_by_low_traffic,
+        metrics.batches_sealed_by_source_stalled
+    );
 
     // Verify exact recovery
     let live_version = controller.database().snapshot().version();
     drop(controller);
-    let recovered_store = FileEpochStore::open(&db_path, FileEpochSyncPolicy::PerEpoch).expect("reopen store");
+    let recovered_store =
+        FileEpochStore::open(&db_path, FileEpochSyncPolicy::PerEpoch).expect("reopen store");
     let recovered_db = Database::new(recovered_store).expect("recovered db");
-    assert_eq!(recovered_db.snapshot().version(), live_version, "Recovery parity check failed");
+    assert_eq!(
+        recovered_db.snapshot().version(),
+        live_version,
+        "Recovery parity check failed"
+    );
     println!("Recovery Parity: OK (Version {})", live_version);
     let _ = fs::remove_file(&db_path);
     println!();
@@ -131,12 +152,8 @@ fn run_in_memory_library_benchmark(
     );
 
     let controller = Arc::new(
-        forthdb_world::QueuedIntentController::new(
-            database.clone(),
-            65536,
-            policy,
-        )
-        .expect("in-memory controller starts"),
+        forthdb_world::QueuedIntentController::new(database.clone(), 65536, policy)
+            .expect("in-memory controller starts"),
     );
 
     let start = Instant::now();
@@ -166,9 +183,16 @@ fn run_in_memory_library_benchmark(
 
     println!("=== IN-MEMORY LIBRARY BENCHMARK: {} ===", name);
     println!("Policy: {:?}", policy);
-    println!("Clients: {}, Total Intents: {}", concurrent_clients, total_intents);
+    println!(
+        "Clients: {}, Total Intents: {}",
+        concurrent_clients, total_intents
+    );
     println!("Time: {:?}, Ops/sec: {:.2}", elapsed, ops_per_sec);
-    println!("Epochs: {}, Avg Batch Size: {:.2}", metrics.epochs, total_intents as f64 / metrics.epochs as f64);
+    println!(
+        "Epochs: {}, Avg Batch Size: {:.2}",
+        metrics.epochs,
+        total_intents as f64 / metrics.epochs as f64
+    );
     println!();
 }
 
@@ -185,7 +209,10 @@ fn run_io_uring_library_benchmark(
     let store = match forthdb_world::IoUringEpochFileIo::open_store(&db_path) {
         Ok(store) => store,
         Err(err) => {
-            println!("=== IO_URING BENCHMARK: {} (UNSUPPORTED IN CONTAINER KERNEL: {}) ===", name, err);
+            println!(
+                "=== IO_URING BENCHMARK: {} (UNSUPPORTED IN CONTAINER KERNEL: {}) ===",
+                name, err
+            );
             println!();
             let _ = fs::remove_file(&db_path);
             return;
@@ -194,12 +221,8 @@ fn run_io_uring_library_benchmark(
     let database = Arc::new(Database::new(store).expect("database"));
 
     let controller = Arc::new(
-        DurableQueuedIntentController::new_with_policy(
-            database,
-            65536,
-            policy,
-        )
-        .expect("durable controller starts"),
+        DurableQueuedIntentController::new_with_policy(database, 65536, policy)
+            .expect("durable controller starts"),
     );
 
     let start = Instant::now();
@@ -230,9 +253,16 @@ fn run_io_uring_library_benchmark(
 
     println!("=== IO_URING BENCHMARK: {} ===", name);
     println!("Policy: {:?}", policy);
-    println!("Clients: {}, Total Intents: {}", concurrent_clients, total_intents);
+    println!(
+        "Clients: {}, Total Intents: {}",
+        concurrent_clients, total_intents
+    );
     println!("Time: {:?}, Ops/sec: {:.2}", elapsed, ops_per_sec);
-    println!("Epochs: {}, Avg Batch Size: {:.2}", metrics.epochs, total_intents as f64 / metrics.epochs as f64);
+    println!(
+        "Epochs: {}, Avg Batch Size: {:.2}",
+        metrics.epochs,
+        total_intents as f64 / metrics.epochs as f64
+    );
     println!();
     let _ = fs::remove_file(&db_path);
 }
@@ -256,7 +286,11 @@ fn run_library_workload_experiment() {
         );
         run_durable_library_benchmark(
             &format!("Adaptive (Durable C={})", clients),
-            BatchPolicy::Adaptive { min_batch: 1, max_batch: 4096, latency_budget: Duration::from_millis(2) },
+            BatchPolicy::Adaptive {
+                min_batch: 1,
+                max_batch: 4096,
+                latency_budget: Duration::from_millis(2),
+            },
             clients,
             intents,
         );
@@ -271,7 +305,11 @@ fn run_library_workload_experiment() {
             );
             run_io_uring_library_benchmark(
                 &format!("Adaptive (io_uring C={})", clients),
-                BatchPolicy::Adaptive { min_batch: 1, max_batch: 4096, latency_budget: Duration::from_millis(2) },
+                BatchPolicy::Adaptive {
+                    min_batch: 1,
+                    max_batch: 4096,
+                    latency_budget: Duration::from_millis(2),
+                },
                 clients,
                 intents,
             );
@@ -285,7 +323,11 @@ fn run_library_workload_experiment() {
         );
         run_in_memory_library_benchmark(
             &format!("Adaptive (In-Mem C={})", clients),
-            BatchPolicy::Adaptive { min_batch: 1, max_batch: 4096, latency_budget: Duration::from_millis(2) },
+            BatchPolicy::Adaptive {
+                min_batch: 1,
+                max_batch: 4096,
+                latency_budget: Duration::from_millis(2),
+            },
             clients,
             intents,
         );

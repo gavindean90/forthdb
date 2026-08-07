@@ -545,8 +545,7 @@ impl Workspace {
         for (index, record) in records.iter().enumerate() {
             if record.kind != RecordKind::Define
                 || record.resulting_visible != index as u32
-                || (record.previous_visible != NONE
-                    && record.previous_visible as usize >= index)
+                || (record.previous_visible != NONE && record.previous_visible as usize >= index)
                 || record.slot.0 as usize >= accepted_heads.len()
             {
                 return Err(format!("invalid physical fact record {index}"));
@@ -1550,21 +1549,20 @@ mod tests {
             );
         }
     }
-    
+
     #[test]
     fn expect_world_accepts_matching_predecessor() {
         let mut workspace = Workspace::with_capacity(4, 16, 16, 16);
         let current_world = workspace.semantic_hash;
         let expected = IntentProgram::new(
             0,
-            vec![
-                Instruction::raw(Opcode::ExpectObject, u32::MAX, current_world),
-            ],
+            vec![Instruction::raw(
+                Opcode::ExpectObject,
+                u32::MAX,
+                current_world,
+            )],
         );
-        assert_eq!(
-            workspace.execute(&expected),
-            ExecutionOutcome::Accepted
-        );
+        assert_eq!(workspace.execute(&expected), ExecutionOutcome::Accepted);
     }
 
     #[test]
@@ -1572,9 +1570,7 @@ mod tests {
         let mut workspace = Workspace::with_capacity(4, 16, 16, 16);
         let expected = IntentProgram::new(
             0,
-            vec![
-                Instruction::raw(Opcode::ExpectObject, u32::MAX, 99999),
-            ],
+            vec![Instruction::raw(Opcode::ExpectObject, u32::MAX, 99999)],
         );
         assert_eq!(
             workspace.execute(&expected),

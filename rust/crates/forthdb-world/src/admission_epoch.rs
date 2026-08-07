@@ -1,11 +1,11 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use crate::io_uring_epoch_io::PendingIoUringEpoch;
+use crate::mmap_vm_snapshot::{MmapSnapshotMetadata, MmapVmSnapshot};
 use crate::queued::{VmEpochMaterializer, decode_queued_intent, encode_queued_intent};
 use crate::semantic_isa::{
     STREAM_MAGIC, decode_instruction_stream_frame, encode_instruction_stream_frame,
 };
-use crate::mmap_vm_snapshot::{MmapSnapshotMetadata, MmapVmSnapshot};
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -183,9 +183,7 @@ impl Metrics {
             vm_materialized_epochs: self.vm_materialized_epochs.load(Ordering::Relaxed),
             world_materialized_epochs: self.world_materialized_epochs.load(Ordering::Relaxed),
             mmap_snapshot_loaded: self.mmap_snapshot_loaded.load(Ordering::Relaxed),
-            mmap_snapshot_epochs_skipped: self
-                .mmap_snapshot_epochs_skipped
-                .load(Ordering::Relaxed),
+            mmap_snapshot_epochs_skipped: self.mmap_snapshot_epochs_skipped.load(Ordering::Relaxed),
             mmap_snapshot_bytes: self.mmap_snapshot_bytes.load(Ordering::Relaxed),
         }
     }
@@ -1173,15 +1171,15 @@ fn replay_epochs(
     validators: &[Validator],
     materializer: AdmissionMaterializer,
 ) -> Result<(Arc<World>, EpochMaterializer), AdmissionEpochOpenError> {
-    let mut world = snapshot
-        .as_ref()
-        .map_or_else(|| Arc::new(World::genesis()), |snapshot| World::from_mmap(snapshot.clone()));
+    let mut world = snapshot.as_ref().map_or_else(
+        || Arc::new(World::genesis()),
+        |snapshot| World::from_mmap(snapshot.clone()),
+    );
     let mut materializer = match materializer {
         AdmissionMaterializer::World => EpochMaterializer::World,
         AdmissionMaterializer::TokenVm => {
             let vm = if let Some(snapshot) = snapshot {
-                VmEpochMaterializer::from_mmap(snapshot)
-                    .map_err(AdmissionEpochOpenError::Format)?
+                VmEpochMaterializer::from_mmap(snapshot).map_err(AdmissionEpochOpenError::Format)?
             } else {
                 VmEpochMaterializer::new(world.next_entity())
             };
@@ -1424,13 +1422,9 @@ mod tests {
         assert_eq!(recovered.epochs.len(), 2);
         assert_eq!(recovered.file_len, expected_len as u64);
         assert_eq!(fs::metadata(&path).unwrap().len(), expected_len as u64);
-        let (world, _) = replay_epochs(
-            None,
-            &recovered.epochs,
-            &[],
-            AdmissionMaterializer::TokenVm,
-        )
-        .expect("epochs materialize");
+        let (world, _) =
+            replay_epochs(None, &recovered.epochs, &[], AdmissionMaterializer::TokenVm)
+                .expect("epochs materialize");
         assert_eq!(world.version(), 2);
         assert!(world.resolve(&SlotId::new("replay/name")).is_some());
         assert!(world.resolve(&SlotId::new("replay/state")).is_some());
@@ -1506,10 +1500,12 @@ mod tests {
         assert!(reopened.snapshot().is_query_projection_materialized());
         assert!(reopened.metrics().mmap_snapshot_loaded);
         assert_eq!(reopened.metrics().mmap_snapshot_epochs_skipped, 1);
-        assert!(reopened
-            .snapshot()
-            .resolve(&SlotId::new("live/name"))
-            .is_some());
+        assert!(
+            reopened
+                .snapshot()
+                .resolve(&SlotId::new("live/name"))
+                .is_some()
+        );
         let mut next = QueuedIntent::new();
         next.define(
             SlotId::new("live/after-reopen"),
@@ -1519,7 +1515,9 @@ mod tests {
                 Literal::new("mapped"),
             ),
         );
-        let ticket = reopened.submit(next).expect("mapped VM accepts a successor");
+        let ticket = reopened
+            .submit(next)
+            .expect("mapped VM accepts a successor");
         ticket.wait_admitted().expect("successor is durable");
         let successor_world = match ticket.wait().expect("successor materializes") {
             AdmissionEpochTicketOutcome::Accepted { world, .. } => {
@@ -1562,10 +1560,12 @@ mod tests {
             .expect("a corrupt image falls back to the authoritative journal");
         assert!(!corrupt.metrics().mmap_snapshot_loaded);
         assert_eq!(corrupt.snapshot().id(), successor_id);
-        assert!(corrupt
-            .snapshot()
-            .resolve(&SlotId::new("live/after-reopen"))
-            .is_some());
+        assert!(
+            corrupt
+                .snapshot()
+                .resolve(&SlotId::new("live/after-reopen"))
+                .is_some()
+        );
         corrupt.shutdown();
         drop(corrupt);
         fs::remove_file(&path).unwrap();

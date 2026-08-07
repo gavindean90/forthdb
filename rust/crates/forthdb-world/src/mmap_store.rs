@@ -174,9 +174,10 @@ impl MmapCommitStore {
                 frame.parent_version()
             )));
         }
-        let expected_resulting_version = expected_parent_version.checked_add(1).ok_or_else(|| {
-            FileCommitStoreError::NonLinearAppend("world version overflow".to_owned())
-        })?;
+        let expected_resulting_version =
+            expected_parent_version.checked_add(1).ok_or_else(|| {
+                FileCommitStoreError::NonLinearAppend("world version overflow".to_owned())
+            })?;
         if frame.resulting_version() != expected_resulting_version {
             return Err(FileCommitStoreError::NonLinearAppend(format!(
                 "expected resulting version {expected_resulting_version}, found {}",
@@ -314,8 +315,18 @@ mod mmap_tests {
         assert_eq!(store.len(), 1);
         assert!(store.mapping_is_current());
         assert_eq!(store.mapped_frame_count(), 1);
-        assert!(store.mapped_record(0).expect("record").starts_with(FRAME_MAGIC));
-        assert!(store.mapped_record(0).expect("record").ends_with(FRAME_TRAILER));
+        assert!(
+            store
+                .mapped_record(0)
+                .expect("record")
+                .starts_with(FRAME_MAGIC)
+        );
+        assert!(
+            store
+                .mapped_record(0)
+                .expect("record")
+                .ends_with(FRAME_TRAILER)
+        );
         assert!(!store.mapped_payload(0).expect("payload").is_empty());
         assert_eq!(&store.mapped_bytes().expect("mapping")[..8], FILE_MAGIC);
         let database = Database::new(store).expect("mapped history reconstructs");
@@ -332,7 +343,9 @@ mod mmap_tests {
         let entity = transaction.entity();
         let slot = SlotId::new("mapped/append");
         transaction.define(slot.clone(), state_fact(entity, "committed"));
-        let world = database.commit(transaction).expect("mapped commit succeeds");
+        let world = database
+            .commit(transaction)
+            .expect("mapped commit succeeds");
         drop(database);
 
         let file_store = FileCommitStore::open(temp.path()).expect("file store reopens mmap bytes");

@@ -330,7 +330,10 @@ mod linux {
         let (snapshot_creation_us, snapshot_bytes) = if materializer.uses_vm() {
             let started = Instant::now();
             let snapshot = controller.write_mmap_snapshot()?;
-            (Some(started.elapsed().as_micros()), Some(snapshot.snapshot_bytes))
+            (
+                Some(started.elapsed().as_micros()),
+                Some(snapshot.snapshot_bytes),
+            )
         } else {
             (None, None)
         };
@@ -404,8 +407,7 @@ mod linux {
             workload_elapsed_us: workload_elapsed.as_micros(),
             query_projection_was_deferred,
             query_projection_elapsed_us: query_projection_elapsed.as_micros(),
-            legacy_query_projection_materialized: world
-                .is_legacy_query_projection_materialized(),
+            legacy_query_projection_materialized: world.is_legacy_query_projection_materialized(),
             intents_per_second: intent_count / workload_elapsed.as_secs_f64(),
             admission_latency: summarize_latencies(admission_latencies),
             semantic_latency: summarize_latencies(semantic_latencies),

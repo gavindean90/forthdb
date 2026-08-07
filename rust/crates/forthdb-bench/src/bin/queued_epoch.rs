@@ -1,7 +1,5 @@
 use forthdb_core::{Atom, Fact, ForthDb, Literal, Predicate, SlotId};
-use forthdb_world::{
-    derive_epoch, Database, IntentFact, MemoryCommitStore, QueuedIntent, World,
-};
+use forthdb_world::{Database, IntentFact, MemoryCommitStore, QueuedIntent, World, derive_epoch};
 use serde::Serialize;
 use std::env;
 use std::hint::black_box;
@@ -101,9 +99,7 @@ fn build_base(retained_definitions: u64) -> Arc<World> {
             ),
         );
     }
-    database
-        .commit(transaction)
-        .expect("retained base commits");
+    database.commit(transaction).expect("retained base commits");
     database.snapshot()
 }
 
@@ -178,11 +174,7 @@ fn build_intents(sample: usize, batch_size: usize) -> Vec<QueuedIntent> {
             let entity = intent.entity();
             intent.define(
                 SlotId::new(format!("epoch/{sample}/{position}")),
-                IntentFact::new(
-                    entity,
-                    Predicate::new("state"),
-                    Literal::new("ready"),
-                ),
+                IntentFact::new(entity, Predicate::new("state"), Literal::new("ready")),
             );
             intent
         })

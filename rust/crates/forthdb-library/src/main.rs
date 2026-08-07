@@ -349,8 +349,7 @@ mod linux {
             Term::Atom(Atom::Entity(resolve_symbol(&renamed_world, "Alice")?)),
         );
         let new_compiled_after_symbol_rebind = query(&renamed_world, &[newly_compiled_alice]);
-        let final_query_projection_was_deferred =
-            !final_world.is_query_projection_materialized();
+        let final_query_projection_was_deferred = !final_world.is_query_projection_materialized();
         let final_projection_started = Instant::now();
         final_world.materialize_query_projection();
         let final_query_projection_elapsed = final_projection_started.elapsed();

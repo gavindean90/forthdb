@@ -105,8 +105,8 @@ fn main() {
 
     let base_frames = build_base_frames(retained_definitions);
     let path = temp_path();
-    let mut store = FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch)
-        .expect("file epoch store opens");
+    let mut store =
+        FileEpochStore::open(&path, FileEpochSyncPolicy::PerEpoch).expect("file epoch store opens");
     store
         .append_epoch(&base_frames)
         .expect("base frame becomes durable");
@@ -160,7 +160,9 @@ fn main() {
     let started = Instant::now();
     start_gate.wait();
     for _ in 0..intents {
-        let ticket = ticket_rx.recv().expect("every admitted ticket is collected");
+        let ticket = ticket_rx
+            .recv()
+            .expect("every admitted ticket is collected");
         match ticket.wait().expect("ticket resolves") {
             DurableTicketOutcome::Accepted { .. } => {}
             DurableTicketOutcome::Rejected(error) => panic!("intent rejected: {error}"),
@@ -175,7 +177,9 @@ fn main() {
     for producer in producers {
         producer.join().expect("producer does not panic");
     }
-    controller.flush().expect("controller reaches timing barrier");
+    controller
+        .flush()
+        .expect("controller reaches timing barrier");
     let elapsed = started.elapsed();
 
     let metrics = controller.metrics();
@@ -226,7 +230,10 @@ fn main() {
     };
 
     let shutdown = controller.shutdown();
-    assert_eq!(shutdown.final_state, forthdb_world::DurableControllerState::Closed);
+    assert_eq!(
+        shutdown.final_state,
+        forthdb_world::DurableControllerState::Closed
+    );
     drop(controller);
     drop(database);
     let _ = fs::remove_file(path);

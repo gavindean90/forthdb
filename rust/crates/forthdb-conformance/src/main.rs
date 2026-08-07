@@ -7,8 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn default_fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../conformance/v1/kernel_cases.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../conformance/v1/kernel_cases.json")
 }
 
 fn main() -> ExitCode {

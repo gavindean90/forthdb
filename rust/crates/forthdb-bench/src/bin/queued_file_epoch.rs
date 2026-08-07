@@ -1,8 +1,7 @@
 use forthdb_core::{Atom, EntityId, Fact, ForthDb, Literal, Predicate, SlotId};
 use forthdb_world::{
-    CommitStore, Database, DurableQueuedIntentController, DurableSubmitError,
-    DurableTicketOutcome, FileCommitStore, FileEpochStore, FileEpochSyncPolicy, MemoryCommitStore,
-    QueuedIntent,
+    CommitStore, Database, DurableQueuedIntentController, DurableSubmitError, DurableTicketOutcome,
+    FileCommitStore, FileEpochStore, FileEpochSyncPolicy, MemoryCommitStore, QueuedIntent,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -10,7 +9,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -206,7 +205,9 @@ fn run_policy(
     let started = Instant::now();
     start_gate.wait();
     for _ in 0..total {
-        let ticket = ticket_rx.recv().expect("every admitted ticket is collected");
+        let ticket = ticket_rx
+            .recv()
+            .expect("every admitted ticket is collected");
         match ticket.wait().expect("durable ticket resolves") {
             DurableTicketOutcome::Accepted { .. } => {}
             DurableTicketOutcome::Rejected(error) => panic!("intent rejected: {error}"),
@@ -299,10 +300,7 @@ fn aggregate(raw: &[RawMeasurement]) -> Vec<AggregateMeasurement> {
     groups
         .into_iter()
         .map(|(key, items)| {
-            let throughput: Vec<f64> = items
-                .iter()
-                .map(|item| item.intents_per_second)
-                .collect();
+            let throughput: Vec<f64> = items.iter().map(|item| item.intents_per_second).collect();
             AggregateMeasurement {
                 policy: if key.policy_rank == 0 {
                     "per_frame"
@@ -312,13 +310,9 @@ fn aggregate(raw: &[RawMeasurement]) -> Vec<AggregateMeasurement> {
                 max_batch: key.max_batch,
                 rounds: items.len(),
                 intents_per_round: items[0].intents,
-                median_ns_per_intent: median(
-                    items.iter().map(|item| item.ns_per_intent).collect(),
-                ),
+                median_ns_per_intent: median(items.iter().map(|item| item.ns_per_intent).collect()),
                 median_intents_per_second: median(throughput.clone()),
-                median_average_batch: median(
-                    items.iter().map(|item| item.average_batch).collect(),
-                ),
+                median_average_batch: median(items.iter().map(|item| item.average_batch).collect()),
                 median_data_writes: median(
                     items.iter().map(|item| item.data_writes as f64).collect(),
                 ),

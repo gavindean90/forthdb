@@ -1,7 +1,5 @@
 use super::*;
-use crate::stack_vm::{
-    Cell, FactRecord, RecordKind, SlotToken, NONE,
-};
+use crate::stack_vm::{Cell, FactRecord, NONE, RecordKind, SlotToken};
 use memmap2::{Mmap, MmapOptions};
 use std::cmp::Ordering as CompareOrdering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -393,7 +391,8 @@ impl MmapVmSnapshot {
     pub(crate) fn open(journal_path: &Path, journal: &[u8]) -> Result<Arc<Self>, String> {
         let path = Self::path_for(journal_path);
         let file = File::open(&path).map_err(|error| error.to_string())?;
-        let mapping = unsafe { MmapOptions::new().map(&file) }.map_err(|error| error.to_string())?;
+        let mapping =
+            unsafe { MmapOptions::new().map(&file) }.map_err(|error| error.to_string())?;
         if mapping.len() < HEADER_LEN + TRAILER.len()
             || mapping.len() > MAX_SNAPSHOT_BYTES
             || &mapping[0..8] != MAGIC
@@ -923,11 +922,7 @@ impl MmapVmSnapshot {
         }
     }
 
-    fn resolved_predicate_cell(
-        &self,
-        term: &PredicateTerm,
-        binding: &Binding,
-    ) -> Option<Resolved> {
+    fn resolved_predicate_cell(&self, term: &PredicateTerm, binding: &Binding) -> Option<Resolved> {
         match term {
             PredicateTerm::Predicate(predicate) => Some(
                 self.predicate_token(predicate.as_str())
@@ -937,10 +932,8 @@ impl MmapVmSnapshot {
                 Some(value) => value
                     .as_predicate()
                     .map(|predicate| {
-                        self.predicate_token(predicate.as_str()).map_or(
-                            Resolved::Missing,
-                            |token| Resolved::Value(u64::from(token)),
-                        )
+                        self.predicate_token(predicate.as_str())
+                            .map_or(Resolved::Missing, |token| Resolved::Value(u64::from(token)))
                     })
                     .or(Some(Resolved::Missing)),
                 None => Some(Resolved::Unbound),
@@ -1031,8 +1024,10 @@ impl MmapVmSnapshot {
 
     pub(crate) fn frames(&self) -> Vec<Arc<CommitFrame>> {
         self.decoded_frames
-            .get_or_init(|| decode_frames(&self.mapping[self.sections[FRAMES].clone()])
-                .expect("validated mapped history must decode"))
+            .get_or_init(|| {
+                decode_frames(&self.mapping[self.sections[FRAMES].clone()])
+                    .expect("validated mapped history must decode")
+            })
             .clone()
     }
 }
@@ -1062,11 +1057,7 @@ enum CandidateSpec {
     Range(usize, [u64; 3], usize),
 }
 
-fn mapped_unify_variable(
-    name: &str,
-    value: BoundValue,
-    binding: &Binding,
-) -> Option<Binding> {
+fn mapped_unify_variable(name: &str, value: BoundValue, binding: &Binding) -> Option<Binding> {
     match binding.get(name) {
         Some(existing) if existing == &value => Some(binding.clone()),
         Some(_) => None,
@@ -1282,19 +1273,25 @@ fn read_cursor_string(cursor: &mut Cursor<&[u8]>) -> Result<String, String> {
 
 fn read_cursor_u8(cursor: &mut Cursor<&[u8]>) -> Result<u8, String> {
     let mut bytes = [0; 1];
-    cursor.read_exact(&mut bytes).map_err(|error| error.to_string())?;
+    cursor
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
     Ok(bytes[0])
 }
 
 fn read_cursor_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, String> {
     let mut bytes = [0; 4];
-    cursor.read_exact(&mut bytes).map_err(|error| error.to_string())?;
+    cursor
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
     Ok(u32::from_le_bytes(bytes))
 }
 
 fn read_cursor_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64, String> {
     let mut bytes = [0; 8];
-    cursor.read_exact(&mut bytes).map_err(|error| error.to_string())?;
+    cursor
+        .read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
     Ok(u64::from_le_bytes(bytes))
 }
 

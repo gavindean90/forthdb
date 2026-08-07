@@ -1,361 +1,316 @@
-use forthdb_world::semantic_isa::{
-    decode_instruction_stream_frame, encode_instruction_stream_frame,
-};
-use forthdb_world::stack_vm::{ExecutionOutcome, IntentProgram, Workspace};
-use forthdb_world::transaction_ast::{AtomRef, EntityId, TransactionAST, TransactionOp, WorldId};
-use serde_json::{Value, json};
+use forthdb_world::semantic_isa::InstructionStreamFrame;
+use forthdb_world::stack_vm::{IntentProgram, Workspace};
+use forthdb_world::transaction_ast::{AtomRef, TransactionAST, TransactionOp};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-const ROUNDS: usize = 5;
+const TOTAL_INTENTS: usize = 8_192;
+const REJECT_EVERY: usize = 17;
+const ROUNDS: usize = 50;
 
-#[derive(Clone, Copy)]
-struct Shape {
-    name: &'static str,
-    build: fn() -> TransactionAST,
-}
+struct CountingAllocator;
 
-fn define_one() -> TransactionAST {
-    TransactionAST::new(
-        1,
-        vec![TransactionOp::Define {
-            slot: "book/42/status".to_owned(),
-            subject: AtomRef::Entity(EntityId(42)),
-            predicate: "status".to_owned(),
-            object: AtomRef::Literal("available".to_owned()),
-        }],
-    )
-}
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+static ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
+static DEALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
 
-fn conditional_write() -> TransactionAST {
-    TransactionAST::new(
-        1,
-        vec![
-            TransactionOp::ExpectObject {
-                slot: "book/42/status".to_owned(),
-                expected: AtomRef::Literal("available".to_owned()),
-            },
-            TransactionOp::Define {
-                slot: "book/42/status".to_owned(),
-                subject: AtomRef::Entity(EntityId(42)),
-                predicate: "status".to_owned(),
-                object: AtomRef::Literal("checked_out".to_owned()),
-            },
-        ],
-    )
-}
-
-fn allocated_entity() -> TransactionAST {
-    TransactionAST::new(
-        1,
-        vec![
-            TransactionOp::Allocate {
-                result: "book".to_owned(),
-            },
-            TransactionOp::Define {
-                slot: "book/new/kind".to_owned(),
-                subject: AtomRef::Symbol("book".to_owned()),
-                predicate: "kind".to_owned(),
-                object: AtomRef::Literal("book".to_owned()),
-            },
-            TransactionOp::Define {
-                slot: "book/new/status".to_owned(),
-                subject: AtomRef::Symbol("book".to_owned()),
-                predicate: "status".to_owned(),
-                object: AtomRef::Literal("available".to_owned()),
-            },
-            TransactionOp::Define {
-                slot: "book/new/location".to_owned(),
-                subject: AtomRef::Symbol("book".to_owned()),
-                predicate: "located_at".to_owned(),
-                object: AtomRef::Entity(EntityId(7)),
-            },
-        ],
-    )
-}
-
-fn library_checkout() -> TransactionAST {
-    TransactionAST::new(
-        1,
-        vec![
-            TransactionOp::ExpectWorld {
-                expected: WorldId(100),
-            },
-            TransactionOp::ExpectObject {
-                slot: "copy/42/status".to_owned(),
-                expected: AtomRef::Literal("available".to_owned()),
-            },
-            TransactionOp::Define {
-                slot: "copy/42/borrower".to_owned(),
-                subject: AtomRef::Entity(EntityId(42)),
-                predicate: "borrowed_by".to_owned(),
-                object: AtomRef::Entity(EntityId(9001)),
-            },
-            TransactionOp::Define {
-                slot: "copy/42/status".to_owned(),
-                subject: AtomRef::Entity(EntityId(42)),
-                predicate: "status".to_owned(),
-                object: AtomRef::Literal("checked_out".to_owned()),
-            },
-        ],
-    )
-}
-
-fn measure<F, G>(iterations: usize, mut factory: G) -> Value
-where
-    F: FnMut() -> usize,
-    G: FnMut() -> F,
-{
-    let mut elapsed_ns = Vec::with_capacity(ROUNDS);
-    let mut checksum = 0usize;
-    for _ in 0..ROUNDS {
-        let mut operation = factory();
-        let started = Instant::now();
-        for _ in 0..iterations {
-            checksum = checksum.wrapping_add(black_box(operation()));
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-        elapsed_ns.push(started.elapsed().as_nanos());
+        pointer
     }
-    elapsed_ns.sort_unstable();
-    let median_elapsed_ns = elapsed_ns[ROUNDS / 2];
-    let median_ns_per_transaction = median_elapsed_ns as f64 / iterations as f64;
-    json!({
-        "iterations_per_round": iterations,
-        "rounds": ROUNDS,
-        "median_elapsed_ns": median_elapsed_ns,
-        "median_ns_per_transaction": median_ns_per_transaction,
-        "transactions_per_second": 1_000_000_000.0 / median_ns_per_transaction,
-        "sample_elapsed_ns": elapsed_ns,
-        "checksum": checksum,
-    })
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+        unsafe { System.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
+        let replacement = unsafe { System.realloc(pointer, old, new_size) };
+        if !replacement.is_null() && new_size > old.size() {
+            ALLOCATED_BYTES.fetch_add((new_size - old.size()) as u64, Ordering::Relaxed);
+        }
+        ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+        replacement
+    }
 }
 
-fn enrich(mut measurement: Value, semantic_ops: usize, instructions: usize, bytes: usize) -> Value {
-    let transactions_per_second = measurement["transactions_per_second"]
-        .as_f64()
-        .expect("measurement throughput");
-    let object = measurement
-        .as_object_mut()
-        .expect("measurement is an object");
-    object.insert("semantic_ops_per_transaction".to_owned(), json!(semantic_ops));
-    object.insert("sisa_instructions_per_transaction".to_owned(), json!(instructions));
-    object.insert("encoded_bytes_per_transaction".to_owned(), json!(bytes));
-    object.insert(
-        "semantic_ops_per_second".to_owned(),
-        json!(transactions_per_second * semantic_ops as f64),
-    );
-    object.insert(
-        "sisa_instructions_per_second".to_owned(),
-        json!(transactions_per_second * instructions as f64),
-    );
-    object.insert(
-        "encoded_megabytes_per_second".to_owned(),
-        json!(transactions_per_second * bytes as f64 / 1_000_000.0),
-    );
-    measurement
+// NOTE: To get uninstrumented timings, comment out the global allocator.
+#[global_allocator]
+static GLOBAL: CountingAllocator = CountingAllocator;
+
+#[derive(Clone, Copy, Debug)]
+struct Counters {
+    allocated_bytes: u64,
+    allocations: u64,
+    deallocations: u64,
+}
+
+impl Counters {
+    fn capture() -> Self {
+        Self {
+            allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+            allocations: ALLOCATION_COUNT.load(Ordering::Relaxed),
+            deallocations: DEALLOCATION_COUNT.load(Ordering::Relaxed),
+        }
+    }
+
+    fn since(self, before: Self) -> Self {
+        Self {
+            allocated_bytes: self.allocated_bytes.saturating_sub(before.allocated_bytes),
+            allocations: self.allocations.saturating_sub(before.allocations),
+            deallocations: self.deallocations.saturating_sub(before.deallocations),
+        }
+    }
+}
+
+fn ast_transaction(index: usize, reject_slot: &str) -> TransactionAST {
+    let mut operations = Vec::new();
+    let slot = if index % REJECT_EVERY == 0 {
+        reject_slot.to_string()
+    } else {
+        format!("phase1/accepted/{index}")
+    };
+
+    operations.push(TransactionOp::Allocate {
+        result: "temp".to_string(),
+    });
+    operations.push(TransactionOp::Define {
+        slot,
+        subject: AtomRef::Symbol("temp".to_string()),
+        predicate: "phase1_value".to_string(),
+        object: AtomRef::Literal(index.to_string()),
+    });
+
+    if index % REJECT_EVERY == 0 {
+        operations.push(TransactionOp::Reject);
+    }
+
+    TransactionAST::new(1, operations)
+}
+
+fn time_batch<F>(mut f: F) -> (u64, u64, u64)
+where
+    F: FnMut(),
+{
+    let mut timings = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        f();
+        let elapsed = start.elapsed().as_nanos() as u64;
+        timings.push(elapsed);
+    }
+    timings.sort_unstable();
+    (
+        timings[0],
+        timings[timings.len() / 2],
+        timings[timings.len() - 1],
+    )
+}
+
+fn allocs_batch<F>(mut f: F) -> Counters
+where
+    F: FnMut(),
+{
+    // Warmup
+    for _ in 0..5 {
+        f();
+    }
+
+    let mut min_counters = Counters {
+        allocated_bytes: u64::MAX,
+        allocations: u64::MAX,
+        deallocations: u64::MAX,
+    };
+
+    for _ in 0..ROUNDS {
+        let before = Counters::capture();
+        f();
+        let delta = Counters::capture().since(before);
+        if delta.allocations < min_counters.allocations {
+            min_counters = delta;
+        }
+    }
+
+    min_counters
 }
 
 fn main() {
-    let shapes = [
-        Shape {
-            name: "define_one",
-            build: define_one,
-        },
-        Shape {
-            name: "conditional_write",
-            build: conditional_write,
-        },
-        Shape {
-            name: "allocated_entity_three_defines",
-            build: allocated_entity,
-        },
-        Shape {
-            name: "library_checkout",
-            build: library_checkout,
-        },
-    ];
+    let reject_slot = "phase1/reject";
 
-    let mut shape_reports = Vec::new();
-    for shape in shapes {
-        let exemplar = (shape.build)();
-        let frame = exemplar
-            .lower_to_sisa()
-            .unwrap_or_else(|error| panic!("{} lowering failed: {error}", shape.name));
-        let mut encoded = Vec::new();
-        encode_instruction_stream_frame(&frame, &mut encoded);
-        let semantic_ops = exemplar.operations.len();
-        let instructions = frame.instructions.len();
-        let bytes = encoded.len();
+    println!("Phase                 | min ns | med ns | max ns | allocs");
+    println!("------------------------------------------------------------");
 
-        let build = enrich(
-            measure(100_000, || {
-                let build = shape.build;
-                move || (build)().operations.len()
-            }),
-            semantic_ops,
-            instructions,
-            bytes,
-        );
+    let t = TOTAL_INTENTS as u64;
 
-        let lower_ast = exemplar.clone();
-        let lower = enrich(
-            measure(20_000, || {
-                let ast = lower_ast.clone();
-                move || {
-                    ast.lower_to_sisa()
-                        .expect("representative AST lowers")
-                        .instructions
-                        .len()
-                }
-            }),
-            semantic_ops,
-            instructions,
-            bytes,
-        );
+    // 1. AST Build
+    let (min, med, max) = time_batch(|| {
+        for i in 0..TOTAL_INTENTS {
+            black_box(ast_transaction(i, reject_slot));
+        }
+    });
+    let allocs = allocs_batch(|| {
+        for i in 0..TOTAL_INTENTS {
+            black_box(ast_transaction(i, reject_slot));
+        }
+    });
+    println!(
+        "AST build             | {:>6} | {:>6} | {:>6} | {:>6}",
+        min / t,
+        med / t,
+        max / t,
+        allocs.allocations / t
+    );
 
-        let encode_frame = frame.clone();
-        let encode = enrich(
-            measure(100_000, || {
-                let frame = encode_frame.clone();
-                let mut output = Vec::with_capacity(bytes);
-                move || {
-                    output.clear();
-                    encode_instruction_stream_frame(&frame, &mut output);
-                    output.len()
-                }
-            }),
-            semantic_ops,
-            instructions,
-            bytes,
-        );
-
-        let decode_bytes = encoded.clone();
-        let decode = enrich(
-            measure(100_000, || {
-                let bytes = decode_bytes.clone();
-                move || {
-                    let mut cursor = Cursor::new(bytes.as_slice());
-                    let decoded = decode_instruction_stream_frame(&mut cursor)
-                        .expect("representative SISA decodes");
-                    decoded.instructions.len()
-                }
-            }),
-            semantic_ops,
-            instructions,
-            bytes,
-        );
-
-        shape_reports.push(json!({
-            "name": shape.name,
-            "semantic_ops": semantic_ops,
-            "sisa_instructions": instructions,
-            "encoded_bytes": bytes,
-            "ast_construction": build,
-            "validate_and_lower": lower,
-            "encode": encode,
-            "decode": decode,
-        }));
+    // Prepare ASTs for phase 2
+    let mut asts = Vec::with_capacity(TOTAL_INTENTS);
+    for i in 0..TOTAL_INTENTS {
+        asts.push(ast_transaction(i, reject_slot));
     }
 
-    let representative = allocated_entity();
-    let representative_frame = representative
-        .lower_to_sisa()
-        .expect("representative AST lowers");
-    let mut representative_bytes = Vec::new();
-    encode_instruction_stream_frame(&representative_frame, &mut representative_bytes);
-    let semantic_ops = representative.operations.len();
-    let instructions = representative_frame.instructions.len();
-    let bytes = representative_bytes.len();
-    let slot_count = representative_frame.dictionary.slots.len();
-    let program = IntentProgram::new(
-        representative_frame.local_count(),
-        representative_frame.instructions().to_vec(),
-    );
-
-    let execute_iterations = 100_000usize;
-    let execute = enrich(
-        measure(execute_iterations, || {
-            let program = program.clone();
-            let record_capacity = execute_iterations * 3 + 1_024;
-            let mut workspace = Workspace::with_indexes(
-                slot_count,
-                64,
-                record_capacity,
-                record_capacity,
-            );
-            move || match workspace.execute(&program) {
-                ExecutionOutcome::Accepted => 1,
-                ExecutionOutcome::Rejected(error) => {
-                    panic!("representative predecoded execution rejected: {error:?}")
-                }
-            }
-        }),
-        semantic_ops,
-        instructions,
-        bytes,
-    );
-
-    let full_iterations = 20_000usize;
-    let full_pipeline = enrich(
-        measure(full_iterations, || {
-            let record_capacity = full_iterations * 3 + 1_024;
-            let mut workspace = Workspace::with_indexes(
-                slot_count,
-                64,
-                record_capacity,
-                record_capacity,
-            );
-            move || {
-                let ast = allocated_entity();
-                let frame = ast.lower_to_sisa().expect("full pipeline lowers");
-                let mut encoded = Vec::with_capacity(bytes);
-                encode_instruction_stream_frame(&frame, &mut encoded);
-                let mut cursor = Cursor::new(encoded.as_slice());
-                let decoded = decode_instruction_stream_frame(&mut cursor)
-                    .expect("full pipeline decodes");
-                let program = IntentProgram::new(
-                    decoded.local_count(),
-                    decoded.instructions().to_vec(),
-                );
-                match workspace.execute(&program) {
-                    ExecutionOutcome::Accepted => encoded.len(),
-                    ExecutionOutcome::Rejected(error) => {
-                        panic!("full semantic pipeline rejected: {error:?}")
-                    }
-                }
-            }
-        }),
-        semantic_ops,
-        instructions,
-        bytes,
-    );
-
+    // 2a. Validation & Lowering (One-shot)
+    let (min, med, max) = time_batch(|| {
+        for ast in &asts {
+            black_box(ast.lower_to_sisa().unwrap());
+        }
+    });
+    let allocs = allocs_batch(|| {
+        for ast in &asts {
+            black_box(ast.lower_to_sisa().unwrap());
+        }
+    });
     println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "status": "observational",
-            "scope": "transaction-ast-v0-to-sisa-v1-semantic-intent-pipeline",
-            "profile": "release",
-            "environment": {
-                "os": std::env::consts::OS,
-                "architecture": std::env::consts::ARCH,
-                "git_sha": std::env::var("GITHUB_SHA").ok(),
-                "github_run_id": std::env::var("GITHUB_RUN_ID").ok(),
-            },
-            "shape_profiles": shape_reports,
-            "representative_pipeline": {
-                "shape": "allocated_entity_three_defines",
-                "predecoded_indexed_vm_execution": execute,
-                "ast_build_lower_encode_decode_indexed_execute": full_pipeline,
-            },
-            "units": {
-                "transaction": "one TransactionAST frame",
-                "semantic_operation": "one TransactionOp",
-                "sisa_instruction": "one fixed-width SISA VM instruction",
-                "encoded_megabyte": "1,000,000 encoded bytes",
-            },
-        }))
-        .expect("benchmark report serializes")
+        "Lowering (One-shot)   | {:>6} | {:>6} | {:>6} | {:>6}",
+        min / t,
+        med / t,
+        max / t,
+        allocs.allocations / t
     );
+
+    // 2b. Validation & Lowering (Pooled)
+    let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
+    let (min, med, max) = time_batch(|| {
+        for ast in &asts {
+            let frame = ast.lower_to_sisa_with(&mut ctx).unwrap();
+            ctx.reclaim(frame);
+        }
+    });
+    let allocs = allocs_batch(|| {
+        for ast in &asts {
+            let frame = ast.lower_to_sisa_with(&mut ctx).unwrap();
+            ctx.reclaim(frame);
+        }
+    });
+    println!(
+        "Lowering (Pooled)     | {:>6} | {:>6} | {:>6} | {:>6}",
+        min / t,
+        med / t,
+        max / t,
+        allocs.allocations / t
+    );
+
+    // Prepare programs for phase 3
+    let mut programs = Vec::with_capacity(TOTAL_INTENTS);
+    for ast in &asts {
+        let frame = ast.lower_to_sisa().unwrap();
+        programs.push(IntentProgram::new(frame.local_count, frame.instructions));
+    }
+
+    // 3. VM Execution
+    let mut workspace =
+        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
+    let (min, med, max) = time_batch(|| {
+        for program in &programs {
+            black_box(workspace.execute(program));
+        }
+    });
+    let allocs = allocs_batch(|| {
+        for program in &programs {
+            black_box(workspace.execute(program));
+        }
+    });
+    println!(
+        "VM execution          | {:>6} | {:>6} | {:>6} | {:>6}",
+        min / t,
+        med / t,
+        max / t,
+        allocs.allocations / t
+    );
+
+    // 4. One-Shot Full Pipeline
+    let mut workspace =
+        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
+    let (min, med, max) = time_batch(|| {
+        for i in 0..TOTAL_INTENTS {
+            let ast = ast_transaction(i, reject_slot);
+            let frame = ast.lower_to_sisa().unwrap();
+            let program = IntentProgram::new(frame.local_count, frame.instructions);
+            black_box(workspace.execute(&program));
+        }
+    });
+    let allocs = allocs_batch(|| {
+        for i in 0..TOTAL_INTENTS {
+            let ast = ast_transaction(i, reject_slot);
+            let frame = ast.lower_to_sisa().unwrap();
+            let program = IntentProgram::new(frame.local_count, frame.instructions);
+            black_box(workspace.execute(&program));
+        }
+    });
+    println!(
+        "Full Pipe (One-shot)  | {:>6} | {:>6} | {:>6} | {:>6}",
+        min / t,
+        med / t,
+        max / t,
+        allocs.allocations / t
+    );
+
+    // 5. Pooled Full Pipeline
+    let mut workspace =
+        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
+    let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
+    let (min, med, max) = time_batch(|| {
+        for i in 0..TOTAL_INTENTS {
+            let ast = ast_transaction(i, reject_slot);
+            let frame = ast.lower_to_sisa_with(&mut ctx).unwrap();
+            let program = IntentProgram::new(frame.local_count, frame.instructions.clone());
+            black_box(workspace.execute(&program));
+            ctx.reclaim(frame);
+        }
+    });
+    let allocs = allocs_batch(|| {
+        for i in 0..TOTAL_INTENTS {
+            let ast = ast_transaction(i, reject_slot);
+            let frame = ast.lower_to_sisa_with(&mut ctx).unwrap();
+            let program = IntentProgram::new(frame.local_count, frame.instructions.clone());
+            black_box(workspace.execute(&program));
+            ctx.reclaim(frame);
+        }
+    });
+    println!(
+        "Full Pipe (Pooled)    | {:>6} | {:>6} | {:>6} | {:>6}",
+        min / t,
+        med / t,
+        max / t,
+        allocs.allocations / t
+    );
+    println!("============================================================");
+
+    // Calculate transactions per second for the pooled full pipeline (based on median time)
+    let tps = 1_000_000_000u64 / (med / t);
+    println!("Pooled Transactions/Sec: {}", tps);
 }

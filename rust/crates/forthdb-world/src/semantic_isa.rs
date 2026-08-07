@@ -215,7 +215,9 @@ fn take_u64(input: &mut Cursor<&[u8]>) -> Result<u64, String> {
 fn take_string(input: &mut Cursor<&[u8]>) -> Result<String, String> {
     let len = take_u32(input)? as usize;
     let pos = input.position() as usize;
-    let end = pos.checked_add(len).ok_or_else(|| "string length overflow".to_string())?;
+    let end = pos
+        .checked_add(len)
+        .ok_or_else(|| "string length overflow".to_string())?;
     let buf = input.get_ref();
     if end > buf.len() {
         return Err("truncated string in stream".to_owned());
@@ -263,7 +265,8 @@ mod tests {
         if python_file.exists() {
             let bytes = std::fs::read(python_file).unwrap();
             let mut cursor = std::io::Cursor::new(bytes.as_slice());
-            let frame = decode_instruction_stream_frame(&mut cursor).expect("should decode python frame");
+            let frame =
+                decode_instruction_stream_frame(&mut cursor).expect("should decode python frame");
             assert_eq!(frame.version, SEMANTIC_ISA_VERSION_1);
             assert_eq!(frame.local_count, 2);
             assert!(!frame.instructions().is_empty());

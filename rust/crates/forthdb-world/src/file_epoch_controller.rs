@@ -1,6 +1,6 @@
-use crate::queued::VmEpochMaterializer;
 use super::queued_controller::{AdaptiveState, BatchSealReason};
 use super::*;
+use crate::queued::VmEpochMaterializer;
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -616,10 +616,12 @@ impl DurableControllerMetricsInner {
     fn record_seal_reason(&self, reason: BatchSealReason) {
         match reason {
             BatchSealReason::Capacity => {
-                self.batches_sealed_by_capacity.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_capacity
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::Timeout => {
-                self.batches_sealed_by_timeout.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_timeout
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::Drain => {
                 self.batches_sealed_by_drain.fetch_add(1, Ordering::Relaxed);
@@ -628,16 +630,20 @@ impl DurableControllerMetricsInner {
                 self.batches_sealed_by_width.fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::Latency => {
-                self.batches_sealed_by_latency.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_latency
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::LowTraffic => {
-                self.batches_sealed_by_low_traffic.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_low_traffic
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::SourceStalled => {
-                self.batches_sealed_by_source_stalled.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_source_stalled
+                    .fetch_add(1, Ordering::Relaxed);
             }
             BatchSealReason::Barrier => {
-                self.batches_sealed_by_barrier.fetch_add(1, Ordering::Relaxed);
+                self.batches_sealed_by_barrier
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -707,12 +713,18 @@ impl DurableControllerMetricsInner {
             batches_sealed_by_drain: self.batches_sealed_by_drain.load(Ordering::Relaxed),
             batches_sealed_by_width: self.batches_sealed_by_width.load(Ordering::Relaxed),
             batches_sealed_by_latency: self.batches_sealed_by_latency.load(Ordering::Relaxed),
-            batches_sealed_by_low_traffic: self.batches_sealed_by_low_traffic.load(Ordering::Relaxed),
-            batches_sealed_by_source_stalled: self.batches_sealed_by_source_stalled.load(Ordering::Relaxed),
+            batches_sealed_by_low_traffic: self
+                .batches_sealed_by_low_traffic
+                .load(Ordering::Relaxed),
+            batches_sealed_by_source_stalled: self
+                .batches_sealed_by_source_stalled
+                .load(Ordering::Relaxed),
             batches_sealed_by_barrier: self.batches_sealed_by_barrier.load(Ordering::Relaxed),
             maximum_target_width: self.maximum_target_width.load(Ordering::Relaxed) as usize,
             total_adaptive_probe_wait_ns: self.total_adaptive_probe_wait_ns.load(Ordering::Relaxed),
-            maximum_oldest_age_at_seal_ns: self.maximum_oldest_age_at_seal_ns.load(Ordering::Relaxed),
+            maximum_oldest_age_at_seal_ns: self
+                .maximum_oldest_age_at_seal_ns
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -776,7 +788,8 @@ impl DurableQueuedIntentController<StdEpochFileIo> {
         let lease = WriterLease::acquire(path)?;
         let store = FileEpochStore::open(path, sync_policy)?;
         let database = Arc::new(Database::new(store)?);
-        Self::new_with_lease_policy(database, capacity, batch_policy, Some(lease)).map_err(Into::into)
+        Self::new_with_lease_policy(database, capacity, batch_policy, Some(lease))
+            .map_err(Into::into)
     }
 }
 
@@ -834,7 +847,11 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
         capacity: usize,
         max_batch: usize,
     ) -> Result<Self, DurableControllerConfigError> {
-        Self::new_with_policy(database, capacity, BatchPolicy::ImmediateDrain { max_batch })
+        Self::new_with_policy(
+            database,
+            capacity,
+            BatchPolicy::ImmediateDrain { max_batch },
+        )
     }
 
     pub fn new_with_policy(
@@ -851,13 +868,7 @@ impl<I: EpochFileIo + 'static> DurableQueuedIntentController<I> {
         policy: BatchPolicy,
         lease: Option<WriterLease>,
     ) -> Result<Self, DurableControllerConfigError> {
-        Self::new_with_runner(
-            database,
-            capacity,
-            policy,
-            lease,
-            run_durable_worker::<I>,
-        )
+        Self::new_with_runner(database, capacity, policy, lease, run_durable_worker::<I>)
     }
 
     fn new_with_runner<F>(
@@ -1588,7 +1599,11 @@ fn run_durable_worker_loop<I: EpochFileIo + 'static>(
     let (min_batch, max_batch) = match policy {
         BatchPolicy::ImmediateDrain { max_batch } => (1, max_batch),
         BatchPolicy::Coalesce { max_batch, .. } => (1, max_batch),
-        BatchPolicy::Adaptive { min_batch, max_batch, .. } => (min_batch, max_batch),
+        BatchPolicy::Adaptive {
+            min_batch,
+            max_batch,
+            ..
+        } => (min_batch, max_batch),
     };
     let mut state = AdaptiveState::new(min_batch.max(16).min(max_batch));
 
@@ -1633,7 +1648,9 @@ fn run_durable_worker_loop<I: EpochFileIo + 'static>(
 
                 let seal_reason = match policy {
                     BatchPolicy::ImmediateDrain { .. } => {
-                        while batch.len() < max_batch && metrics.state() == DurableControllerState::Running {
+                        while batch.len() < max_batch
+                            && metrics.state() == DurableControllerState::Running
+                        {
                             match receiver.try_recv() {
                                 Ok(DurableControllerCommand::Intent(staged)) => {
                                     let enqueued_at = staged.admitted_at;
@@ -1656,7 +1673,9 @@ fn run_durable_worker_loop<I: EpochFileIo + 'static>(
                     }
                     BatchPolicy::Coalesce { max_delay, .. } => {
                         let deadline = Instant::now() + max_delay;
-                        while batch.len() < max_batch && metrics.state() == DurableControllerState::Running {
+                        while batch.len() < max_batch
+                            && metrics.state() == DurableControllerState::Running
+                        {
                             let now = Instant::now();
                             if now >= deadline {
                                 break;
@@ -1683,7 +1702,9 @@ fn run_durable_worker_loop<I: EpochFileIo + 'static>(
                         }
                     }
                     BatchPolicy::Adaptive { latency_budget, .. } => {
-                        while batch.len() < state.target_width && metrics.state() == DurableControllerState::Running {
+                        while batch.len() < state.target_width
+                            && metrics.state() == DurableControllerState::Running
+                        {
                             match receiver.try_recv() {
                                 Ok(DurableControllerCommand::Intent(staged)) => {
                                     let enqueued_at = staged.admitted_at;
@@ -1708,12 +1729,15 @@ fn run_durable_worker_loop<I: EpochFileIo + 'static>(
                                 BatchSealReason::Latency
                             } else {
                                 let remaining_budget = latency_budget - age;
-                                let predicted_interarrival = Duration::from_nanos(state.ewma_interarrival_time_ns as u64);
+                                let predicted_interarrival =
+                                    Duration::from_nanos(state.ewma_interarrival_time_ns as u64);
                                 let probe_wait = (predicted_interarrival * 2)
                                     .clamp(Duration::from_micros(10), Duration::from_micros(250))
                                     .min(remaining_budget);
 
-                                metrics.total_adaptive_probe_wait_ns.fetch_add(probe_wait.as_nanos() as u64, Ordering::Relaxed);
+                                metrics
+                                    .total_adaptive_probe_wait_ns
+                                    .fetch_add(probe_wait.as_nanos() as u64, Ordering::Relaxed);
 
                                 match receiver.recv_timeout(probe_wait) {
                                     Ok(DurableControllerCommand::Intent(staged)) => {
@@ -1722,19 +1746,25 @@ fn run_durable_worker_loop<I: EpochFileIo + 'static>(
                                         claim(staged, metrics, &mut batch);
                                         state.observe_arrival(enqueued_at);
 
-                                        while batch.len() < state.target_width && metrics.state() == DurableControllerState::Running {
+                                        while batch.len() < state.target_width
+                                            && metrics.state() == DurableControllerState::Running
+                                        {
                                             match receiver.try_recv() {
                                                 Ok(DurableControllerCommand::Intent(staged)) => {
                                                     let enqueued_at = staged.admitted_at;
-                                                    oldest_enqueued_at = oldest_enqueued_at.min(enqueued_at);
+                                                    oldest_enqueued_at =
+                                                        oldest_enqueued_at.min(enqueued_at);
                                                     claim(staged, metrics, &mut batch);
                                                     state.observe_arrival(enqueued_at);
                                                 }
-                                                Ok(command @ DurableControllerCommand::Barrier(_)) => {
+                                                Ok(
+                                                    command @ DurableControllerCommand::Barrier(_),
+                                                ) => {
                                                     pending.push_back(command);
                                                     break;
                                                 }
-                                                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                                                Err(TryRecvError::Empty)
+                                                | Err(TryRecvError::Disconnected) => break,
                                             }
                                         }
 
