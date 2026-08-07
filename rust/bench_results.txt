@@ -1,0 +1,22 @@
+Transactions executed per benchmark round: 8192
+
+=== Mixed Size (1-16 ops) ===
+Path                            | min ns | med ns | max ns | Allocations
+------------------------------------------------------------------------
+Predecoded VM                   |     67 |     70 |    323 |           0
+Preconstructed Borrowed View    |   1526 |   2061 |   3727 |           0
+Construct Borrowed View         |   1646 |   1944 |   2786 |           1
+
+=== Small Size (2 ops) ===
+Path                            | min ns | med ns | max ns | Allocations
+------------------------------------------------------------------------
+Predecoded VM                   |     12 |     14 |     74 |           0
+Preconstructed Borrowed View    |     89 |     96 |    243 |           0
+Construct Borrowed View         |    117 |    133 |   1663 |           1
+
+=== Large Size (64 ops) ===
+Path                            | min ns | med ns | max ns | Allocations
+------------------------------------------------------------------------
+Predecoded VM                   |     63 |     68 |    254 |           0
+Preconstructed Borrowed View    |  18543 |  21491 |  28145 |           0
+Construct Borrowed View         |  18736 |  20302 |  38965 |           1

@@ -46,6 +46,40 @@ pub struct TransactionAST {
     pub operations: Vec<TransactionOp>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SemanticIntent {
+    pub ast: TransactionAST,
+}
+
+impl SemanticIntent {
+    pub fn new(ast: TransactionAST) -> Self {
+        Self { ast }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SemanticBindings {
+    entries: Vec<(String, EntityId)>,
+}
+
+impl SemanticBindings {
+    pub fn new(entries: Vec<(String, EntityId)>) -> Self {
+        Self { entries }
+    }
+
+    pub fn get(&self, symbol: &str) -> Option<EntityId> {
+        self.entries
+            .iter()
+            .find_map(|(name, entity)| (name == symbol).then_some(*entity))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, EntityId)> {
+        self.entries
+            .iter()
+            .map(|(name, entity)| (name.as_str(), *entity))
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AtomRefView<'a> {
     Entity(EntityId),
@@ -89,8 +123,12 @@ impl<'a> OperationSource<'a> for OwnedOperationSource<'a> {
     }
     fn operation(&self, index: usize) -> TransactionOpView<'a> {
         match &self.0[index] {
-            TransactionOp::Allocate { result } => TransactionOpView::Allocate { result: result.as_str() },
-            TransactionOp::ExpectWorld { expected } => TransactionOpView::ExpectWorld { expected: expected.clone() },
+            TransactionOp::Allocate { result } => TransactionOpView::Allocate {
+                result: result.as_str(),
+            },
+            TransactionOp::ExpectWorld { expected } => TransactionOpView::ExpectWorld {
+                expected: expected.clone(),
+            },
             TransactionOp::ExpectObject { slot, expected } => TransactionOpView::ExpectObject {
                 slot: slot.as_str(),
                 expected: match expected {
@@ -99,7 +137,12 @@ impl<'a> OperationSource<'a> for OwnedOperationSource<'a> {
                     AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
                 },
             },
-            TransactionOp::Define { slot, subject, predicate, object } => TransactionOpView::Define {
+            TransactionOp::Define {
+                slot,
+                subject,
+                predicate,
+                object,
+            } => TransactionOpView::Define {
                 slot: slot.as_str(),
                 subject: match subject {
                     AtomRef::Entity(e) => AtomRefView::Entity(e.clone()),
@@ -113,7 +156,9 @@ impl<'a> OperationSource<'a> for OwnedOperationSource<'a> {
                     AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
                 },
             },
-            TransactionOp::Forget { slot } => TransactionOpView::Forget { slot: slot.as_str() },
+            TransactionOp::Forget { slot } => TransactionOpView::Forget {
+                slot: slot.as_str(),
+            },
             TransactionOp::Reject => TransactionOpView::Reject,
         }
     }
@@ -137,7 +182,10 @@ pub struct TransactionView<'a> {
 
 impl<'a> TransactionView<'a> {
     pub fn borrowed(namespace: u64, operations: &'a [TransactionOpView<'a>]) -> Self {
-        Self { namespace, operations }
+        Self {
+            namespace,
+            operations,
+        }
     }
 
     pub fn lower_to_sisa_with(
@@ -160,10 +208,15 @@ pub enum LoweringError {
 impl std::fmt::Display for LoweringError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoweringError::DuplicateAllocation(sym) => write!(f, "duplicate allocation for symbol '{}'", sym),
+            LoweringError::DuplicateAllocation(sym) => {
+                write!(f, "duplicate allocation for symbol '{}'", sym)
+            }
             LoweringError::UndefinedSymbol(sym) => write!(f, "use of undefined symbol '{}'", sym),
             LoweringError::LocalCountOverflow => write!(f, "local count overflow"),
-            LoweringError::UnsupportedDynamicSymbolExpectObject => write!(f, "ExpectObject cannot take a dynamic symbol as expected value in SISA v1"),
+            LoweringError::UnsupportedDynamicSymbolExpectObject => write!(
+                f,
+                "ExpectObject cannot take a dynamic symbol as expected value in SISA v1"
+            ),
         }
     }
 }
@@ -251,6 +304,19 @@ pub struct LoweringContext {
 impl LoweringContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_capacity(scratch_capacity: usize, dict_capacity: usize) -> Self {
+        Self {
+            scratch_slots: Vec::with_capacity(scratch_capacity),
+            scratch_predicates: Vec::with_capacity(scratch_capacity),
+            scratch_literals: Vec::with_capacity(scratch_capacity),
+            scratch_symbols: Vec::with_capacity(scratch_capacity),
+            instructions: Vec::with_capacity(dict_capacity),
+            dict_slots: Vec::with_capacity(dict_capacity),
+            dict_predicates: Vec::with_capacity(dict_capacity),
+            dict_literals: Vec::with_capacity(dict_capacity),
+        }
     }
 
     pub fn with_lowered<'tx, S, F, R>(
@@ -406,10 +472,15 @@ impl LoweringContext {
                     let cell = match expected {
                         AtomRefView::Entity(e) => Cell(e.0),
                         AtomRefView::Literal(l) => {
-                            let idx = self.scratch_literals.binary_search_by_key(&l, |&r| r.as_str(source)).unwrap();
+                            let idx = self
+                                .scratch_literals
+                                .binary_search_by_key(&l, |&r| r.as_str(source))
+                                .unwrap();
                             Cell((idx + literal_offset) as u64)
                         }
-                        AtomRefView::Symbol(_) => return Err(LoweringError::UnsupportedDynamicSymbolExpectObject),
+                        AtomRefView::Symbol(_) => {
+                            return Err(LoweringError::UnsupportedDynamicSymbolExpectObject);
+                        }
                     };
                     self.instructions.push(Instruction::raw(
                         Opcode::ExpectObject,
@@ -553,14 +624,12 @@ mod tests {
     fn ast_validation_rejects_undefined_symbol() {
         let ast = TransactionAST::new(
             42,
-            vec![
-                TransactionOp::Define {
-                    slot: "status".to_string(),
-                    subject: AtomRef::Symbol("undefined".to_string()),
-                    predicate: "is".to_string(),
-                    object: AtomRef::Literal("available".to_string()),
-                }
-            ],
+            vec![TransactionOp::Define {
+                slot: "status".to_string(),
+                subject: AtomRef::Symbol("undefined".to_string()),
+                predicate: "is".to_string(),
+                object: AtomRef::Literal("available".to_string()),
+            }],
         );
         let err = ast.lower_to_sisa().unwrap_err();
         assert_eq!(err, LoweringError::UndefinedSymbol("undefined".to_string()));
@@ -570,7 +639,7 @@ mod tests {
     impl TransactionAST {
         pub fn lower_to_sisa_reference(&self) -> Result<InstructionStreamFrame, String> {
             use std::collections::{BTreeMap, BTreeSet};
-            
+
             let mut slots = BTreeSet::new();
             let mut predicates = BTreeSet::new();
             let mut literals = BTreeSet::new();
@@ -596,7 +665,12 @@ mod tests {
                             _ => {}
                         }
                     }
-                    TransactionOp::Define { slot, subject, predicate, object } => {
+                    TransactionOp::Define {
+                        slot,
+                        subject,
+                        predicate,
+                        object,
+                    } => {
                         slots.insert(slot.clone());
                         predicates.insert(predicate.clone());
                         for atom in [subject, object] {
@@ -617,7 +691,7 @@ mod tests {
 
             let mut slot_map = BTreeMap::new();
             let mut dict = StreamDictionary::new();
-            
+
             for (i, slot) in slots.into_iter().enumerate() {
                 let token = SlotToken(i as u32);
                 slot_map.insert(slot.clone(), token);
@@ -665,7 +739,11 @@ mod tests {
                         instructions.push(Instruction::store_local(*local));
                     }
                     TransactionOp::ExpectWorld { expected } => {
-                        instructions.push(Instruction::raw(Opcode::ExpectObject, u32::MAX, expected.0));
+                        instructions.push(Instruction::raw(
+                            Opcode::ExpectObject,
+                            u32::MAX,
+                            expected.0,
+                        ));
                     }
                     TransactionOp::ExpectObject { slot, expected } => {
                         let token = slot_map.get(slot).unwrap();
@@ -676,7 +754,12 @@ mod tests {
                         };
                         instructions.push(Instruction::raw(Opcode::ExpectObject, token.0, cell.0));
                     }
-                    TransactionOp::Define { slot, subject, predicate, object } => {
+                    TransactionOp::Define {
+                        slot,
+                        subject,
+                        predicate,
+                        object,
+                    } => {
                         instructions.push(load_atom(subject)?);
                         let pred_cell = predicate_map.get(predicate).unwrap();
                         instructions.push(Instruction::push(*pred_cell));
@@ -705,7 +788,9 @@ mod tests {
 
     #[test]
     fn ast_differential_fuzzing() {
-        struct Lcg { seed: u32 }
+        struct Lcg {
+            seed: u32,
+        }
         impl Lcg {
             fn next_u32(&mut self) -> u32 {
                 self.seed = self.seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -735,14 +820,18 @@ mod tests {
         for _ in 0..10_000 {
             let op_count = (rng.next_u32() % 20) as usize;
             let mut operations = Vec::with_capacity(op_count);
-            
+
             for _ in 0..op_count {
                 let op = match rng.next_u32() % 6 {
-                    0 => TransactionOp::Allocate { result: rng.next_string(&symbols) },
-                    1 => TransactionOp::ExpectWorld { expected: WorldId(rng.next_u32() as u64) },
-                    2 => TransactionOp::ExpectObject { 
-                        slot: rng.next_string(&slots), 
-                        expected: rng.next_atom() 
+                    0 => TransactionOp::Allocate {
+                        result: rng.next_string(&symbols),
+                    },
+                    1 => TransactionOp::ExpectWorld {
+                        expected: WorldId(rng.next_u32() as u64),
+                    },
+                    2 => TransactionOp::ExpectObject {
+                        slot: rng.next_string(&slots),
+                        expected: rng.next_atom(),
                     },
                     3 => TransactionOp::Define {
                         slot: rng.next_string(&slots),
@@ -750,17 +839,19 @@ mod tests {
                         predicate: rng.next_string(&predicates),
                         object: rng.next_atom(),
                     },
-                    4 => TransactionOp::Forget { slot: rng.next_string(&slots) },
+                    4 => TransactionOp::Forget {
+                        slot: rng.next_string(&slots),
+                    },
                     _ => TransactionOp::Reject,
                 };
                 operations.push(op);
             }
-            
+
             let ast = TransactionAST::new(rng.next_u32() as u64, operations);
-            
+
             let ref_res = ast.lower_to_sisa_reference();
             let new_res_oneshot = ast.lower_to_sisa().map_err(|e| e.to_string());
-            
+
             let res_pooled = ast.lower_to_sisa_with(&mut ctx);
             let new_res_pooled = res_pooled.clone().map_err(|e| e.to_string());
             if let Ok(frame) = res_pooled {
@@ -773,7 +864,7 @@ mod tests {
                 .map(|i| OwnedOperationSource(&ast.operations).operation(i))
                 .collect();
             let view = TransactionView::borrowed(ast.namespace, &view_ops);
-            
+
             let res_view = view.lower_to_sisa_with(&mut ctx);
             let new_res_view = res_view.clone().map_err(|e| e.to_string());
             if let Ok(frame) = res_view {
@@ -781,7 +872,7 @@ mod tests {
             } else {
                 ctx.clear();
             }
-            
+
             assert_eq!(ref_res, new_res_oneshot);
             assert_eq!(ref_res, new_res_pooled);
             assert_eq!(ref_res, new_res_view);
@@ -790,7 +881,9 @@ mod tests {
 
     #[test]
     fn execution_differential_fuzzing() {
-        struct Lcg { seed: u32 }
+        struct Lcg {
+            seed: u32,
+        }
         impl Lcg {
             fn next_u32(&mut self) -> u32 {
                 self.seed = self.seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -817,19 +910,23 @@ mod tests {
 
         let mut ctx = LoweringContext::new();
 
-        use crate::stack_vm::{Workspace, IntentProgram};
-        
+        use crate::stack_vm::{IntentProgram, Workspace};
+
         for _ in 0..10_000 {
             let op_count = (rng.next_u32() % 20) as usize;
             let mut operations = Vec::with_capacity(op_count);
-            
+
             for _ in 0..op_count {
                 let op = match rng.next_u32() % 6 {
-                    0 => TransactionOp::Allocate { result: rng.next_string(&symbols) },
-                    1 => TransactionOp::ExpectWorld { expected: WorldId(rng.next_u32() as u64) },
-                    2 => TransactionOp::ExpectObject { 
-                        slot: rng.next_string(&slots), 
-                        expected: rng.next_atom() 
+                    0 => TransactionOp::Allocate {
+                        result: rng.next_string(&symbols),
+                    },
+                    1 => TransactionOp::ExpectWorld {
+                        expected: WorldId(rng.next_u32() as u64),
+                    },
+                    2 => TransactionOp::ExpectObject {
+                        slot: rng.next_string(&slots),
+                        expected: rng.next_atom(),
                     },
                     3 => TransactionOp::Define {
                         slot: rng.next_string(&slots),
@@ -837,14 +934,16 @@ mod tests {
                         predicate: rng.next_string(&predicates),
                         object: rng.next_atom(),
                     },
-                    4 => TransactionOp::Forget { slot: rng.next_string(&slots) },
+                    4 => TransactionOp::Forget {
+                        slot: rng.next_string(&slots),
+                    },
                     _ => TransactionOp::Reject,
                 };
                 operations.push(op);
             }
-            
+
             let ast = TransactionAST::new(rng.next_u32() as u64, operations);
-            
+
             let res_owned = ast.lower_to_sisa();
             if res_owned.is_err() {
                 // If it fails to lower, the lowering fuzzing already covers it.
@@ -852,27 +951,46 @@ mod tests {
             }
             let frame = res_owned.unwrap();
             let program = IntentProgram::new(frame.local_count, frame.instructions);
-            
+
             let mut workspace1 = Workspace::with_capacity(100, 32, 100, 100);
             let outcome1 = workspace1.execute(&program);
-            
+
             let mut workspace2 = Workspace::with_capacity(100, 32, 100, 100);
             let view_ops: Vec<TransactionOpView> = (0..op_count)
                 .map(|i| OwnedOperationSource(&ast.operations).operation(i))
                 .collect();
             let source = BorrowedOperationSource(&view_ops);
-            
+
             let mut outcome2 = None;
             let res = ctx.with_lowered(ast.namespace, &source, |transient_prog| {
-                outcome2 = Some(workspace2.execute_instructions(transient_prog.local_count, transient_prog.instructions));
+                outcome2 =
+                    Some(workspace2.execute_instructions(
+                        transient_prog.local_count,
+                        transient_prog.instructions,
+                    ));
             });
-            
-            assert!(res.is_ok(), "Transient lowering should succeed if owned lowering succeeded");
-            assert_eq!(outcome1, outcome2.unwrap(), "Execution outcomes must match exactly");
-            
+
+            assert!(
+                res.is_ok(),
+                "Transient lowering should succeed if owned lowering succeeded"
+            );
+            assert_eq!(
+                outcome1,
+                outcome2.unwrap(),
+                "Execution outcomes must match exactly"
+            );
+
             // Compare memory state in workspace (semantic_hash verifies total record and delta equivalence)
-            assert_eq!(workspace1.semantic_hash(), workspace2.semantic_hash(), "Workspace semantic states must match");
-            assert_eq!(workspace1.next_entity(), workspace2.next_entity(), "Next entity ID must match");
+            assert_eq!(
+                workspace1.semantic_hash(),
+                workspace2.semantic_hash(),
+                "Workspace semantic states must match"
+            );
+            assert_eq!(
+                workspace1.next_entity(),
+                workspace2.next_entity(),
+                "Next entity ID must match"
+            );
         }
     }
 

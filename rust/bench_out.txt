@@ -1,0 +1,564 @@
+warning: unused import: `self`
+  --> crates/forthdb-world/src/admission_epoch.rs:19:19
+   |
+19 | use std::thread::{self, JoinHandle};
+   |                   ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `File` and `OpenOptions`
+ --> crates/forthdb-world/src/io_uring_epoch_io.rs:2:15
+  |
+2 | use std::fs::{File, OpenOptions};
+  |               ^^^^  ^^^^^^^^^^^
+
+warning: unused imports: `Read`, `SeekFrom`, `Seek`, and `Write`
+ --> crates/forthdb-world/src/io_uring_epoch_io.rs:3:15
+  |
+3 | use std::io::{Read, Seek, SeekFrom, Write};
+  |               ^^^^  ^^^^  ^^^^^^^^  ^^^^^
+
+warning: unused import: `Mutex`
+ --> crates/forthdb-world/src/queued_controller.rs:7:22
+  |
+7 | use std::sync::{Arc, Mutex};
+  |                      ^^^^^
+
+warning: unused imports: `BTreeMap` and `BTreeSet`
+ --> crates/forthdb-world/src/transaction_ast.rs:4:24
+  |
+4 | use std::collections::{BTreeMap, BTreeSet};
+  |                        ^^^^^^^^  ^^^^^^^^
+
+warning: unused variable: `materializer`
+   --> crates/forthdb-world/src/admission_epoch.rs:379:9
+    |
+379 |         materializer: AdmissionMaterializer,
+    |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_materializer`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `temp`
+   --> crates/forthdb-world/src/queued.rs:380:25
+    |
+380 |                     let temp = intent.entity();
+    |                         ^^^^ help: if this is intentional, prefix it with an underscore: `_temp`
+
+warning: unused variable: `batch_start`
+   --> crates/forthdb-world/src/queued_controller.rs:804:29
+    |
+804 |                         let batch_start = Instant::now();
+    |                             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_start`
+
+warning: associated functions `from_mmap` and `from_history` are never used
+   --> crates/forthdb-world/src/lib.rs:203:8
+    |
+202 | impl VmQueryProjection {
+    | ---------------------- associated functions in this implementation
+203 |     fn from_mmap(snapshot: Arc<MmapVmSnapshot>) -> Self {
+    |        ^^^^^^^^^
+...
+210 |     fn from_history(history: &HistoryNode) -> Self {
+    |        ^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `from_mmap` is never used
+   --> crates/forthdb-world/src/lib.rs:719:19
+    |
+568 | impl World {
+    | ---------- associated function in this implementation
+...
+719 |     pub(crate) fn from_mmap(snapshot: Arc<MmapVmSnapshot>) -> Arc<Self> {
+    |                   ^^^^^^^^^
+
+warning: constant `JOURNAL_MAGIC` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:21:7
+   |
+21 | const JOURNAL_MAGIC: &[u8; 8] = b"FTHADM01";
+   |       ^^^^^^^^^^^^^
+
+warning: constant `JOURNAL_VERSION` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:22:7
+   |
+22 | const JOURNAL_VERSION: u32 = 1;
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `JOURNAL_HEADER_LEN` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:23:7
+   |
+23 | const JOURNAL_HEADER_LEN: usize = 16;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `EPOCH_MAGIC` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:24:7
+   |
+24 | const EPOCH_MAGIC: &[u8; 4] = b"AEP1";
+   |       ^^^^^^^^^^^
+
+warning: constant `EPOCH_TRAILER` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:25:7
+   |
+25 | const EPOCH_TRAILER: &[u8; 4] = b"END1";
+   |       ^^^^^^^^^^^^^
+
+warning: constant `EPOCH_PREFIX_LEN` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:26:7
+   |
+26 | const EPOCH_PREFIX_LEN: usize = 20;
+   |       ^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_EPOCH_BYTES` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:27:7
+   |
+27 | const MAX_EPOCH_BYTES: usize = 64 * 1024 * 1024;
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `CHECKSUM_OFFSET` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:28:7
+   |
+28 | const CHECKSUM_OFFSET: u64 = 0xcbf29ce484222325;
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `CHECKSUM_PRIME` is never used
+  --> crates/forthdb-world/src/admission_epoch.rs:29:7
+   |
+29 | const CHECKSUM_PRIME: u64 = 0x100000001b3;
+   |       ^^^^^^^^^^^^^^
+
+warning: method `observe_lag` is never used
+   --> crates/forthdb-world/src/admission_epoch.rs:191:8
+    |
+168 | impl Metrics {
+    | ------------ method in this implementation
+...
+191 |     fn observe_lag(&self) {
+    |        ^^^^^^^^^^^
+
+warning: enum `EpochMaterializer` is never used
+   --> crates/forthdb-world/src/admission_epoch.rs:206:6
+    |
+206 | enum EpochMaterializer {
+    |      ^^^^^^^^^^^^^^^^^
+
+warning: fields `admission` and `outcome` are never read
+   --> crates/forthdb-world/src/admission_epoch.rs:213:5
+    |
+211 | struct StagedIntent {
+    |        ------------ fields in this struct
+212 |     intent: QueuedIntent,
+213 |     admission: mpsc::Sender<Result<AdmissionEpochReceipt, String>>,
+    |     ^^^^^^^^^
+214 |     outcome: mpsc::Sender<AdmissionEpochTicketOutcome>,
+    |     ^^^^^^^
+
+warning: field `0` is never read
+   --> crates/forthdb-world/src/admission_epoch.rs:220:13
+    |
+220 |     Barrier(mpsc::Sender<Result<(), String>>),
+    |     ------- ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |     |
+    |     field in this variant
+    |
+help: consider changing the field to be of unit type to suppress this warning while preserving the field numbering, or remove the field
+    |
+220 -     Barrier(mpsc::Sender<Result<(), String>>),
+220 +     Barrier(()),
+    |
+
+warning: struct `EpochBatch` is never constructed
+   --> crates/forthdb-world/src/admission_epoch.rs:223:8
+    |
+223 | struct EpochBatch {
+    |        ^^^^^^^^^^
+
+warning: function `claim_batch` is never used
+   --> crates/forthdb-world/src/admission_epoch.rs:841:4
+    |
+841 | fn claim_batch(
+    |    ^^^^^^^^^^^
+
+warning: function `notify_admitted` is never used
+   --> crates/forthdb-world/src/admission_epoch.rs:931:4
+    |
+931 | fn notify_admitted(batch: &EpochBatch) {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `materialize` is never used
+   --> crates/forthdb-world/src/admission_epoch.rs:940:4
+    |
+940 | fn materialize(
+    |    ^^^^^^^^^^^
+
+warning: function `fail_batch` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1029:4
+     |
+1029 | fn fail_batch(batch: EpochBatch, error: String) {
+     |    ^^^^^^^^^^
+
+warning: function `fail_outcomes` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1038:4
+     |
+1038 | fn fail_outcomes(batch: EpochBatch, error: String) {
+     |    ^^^^^^^^^^^^^
+
+warning: function `fail_durable_backlog` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1046:4
+     |
+1046 | fn fail_durable_backlog(backlog: &mut VecDeque<EpochBatch>, error: String) {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `panic_message` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1052:4
+     |
+1052 | fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+     |    ^^^^^^^^^^^^^
+
+warning: struct `RecoveredJournal` is never constructed
+    --> crates/forthdb-world/src/admission_epoch.rs:1062:8
+     |
+1062 | struct RecoveredJournal {
+     |        ^^^^^^^^^^^^^^^^
+
+warning: function `recover_journal` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1069:4
+     |
+1069 | fn recover_journal(
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `replay_epochs` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1168:4
+     |
+1168 | fn replay_epochs(
+     |    ^^^^^^^^^^^^^
+
+warning: function `encode_epoch` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1204:4
+     |
+1204 | fn encode_epoch(batch: &EpochBatch) -> Vec<u8> {
+     |    ^^^^^^^^^^^^
+
+warning: function `decode_epoch_payload` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1227:4
+     |
+1227 | fn decode_epoch_payload(payload: &[u8]) -> Result<(u64, Vec<QueuedIntent>), String> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `read_u32` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1262:4
+     |
+1262 | fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32, String> {
+     |    ^^^^^^^^
+
+warning: function `read_u64` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1270:4
+     |
+1270 | fn read_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64, String> {
+     |    ^^^^^^^^
+
+warning: function `digest` is never used
+    --> crates/forthdb-world/src/admission_epoch.rs:1278:4
+     |
+1278 | fn digest(bytes: &[u8]) -> u64 {
+     |    ^^^^^^
+
+warning: method `io_mut` is never used
+   --> crates/forthdb-world/src/file_epoch_store.rs:470:19
+    |
+321 | impl<I: EpochFileIo> FileEpochStore<I> {
+    | -------------------------------------- method in this implementation
+...
+470 |     pub(crate) fn io_mut(&mut self) -> &mut I {
+    |                   ^^^^^^
+
+warning: constant `WRITE_USER_DATA_TAG` is never used
+  --> crates/forthdb-world/src/io_uring_epoch_io.rs:12:7
+   |
+12 | const WRITE_USER_DATA_TAG: u64 = 0x5752_4954_0000_0000;
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `WRITE_USER_DATA_MASK` is never used
+  --> crates/forthdb-world/src/io_uring_epoch_io.rs:13:7
+   |
+13 | const WRITE_USER_DATA_MASK: u64 = 0xffff_ffff_0000_0000;
+   |       ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FSYNC_USER_DATA` is never used
+  --> crates/forthdb-world/src/io_uring_epoch_io.rs:14:7
+   |
+14 | const FSYNC_USER_DATA: u64 = 0x4653_594e_435f_4d36;
+   |       ^^^^^^^^^^^^^^^
+
+warning: field `path` is never read
+  --> crates/forthdb-world/src/io_uring_epoch_io.rs:27:5
+   |
+26 | pub struct IoUringEpochFileIo {
+   |            ------------------ field in this struct
+27 |     path: PathBuf,
+   |     ^^^^
+   |
+   = note: `IoUringEpochFileIo` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: struct `PendingIoUringEpoch` is never constructed
+  --> crates/forthdb-world/src/io_uring_epoch_io.rs:55:19
+   |
+55 | pub(crate) struct PendingIoUringEpoch;
+   |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `submit_contiguous_epoch` and `complete_contiguous_epoch` are never used
+   --> crates/forthdb-world/src/io_uring_epoch_io.rs:222:19
+    |
+ 57 | impl IoUringEpochFileIo {
+    | ----------------------- methods in this implementation
+...
+222 |     pub(crate) fn submit_contiguous_epoch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^
+...
+281 |     pub(crate) fn complete_contiguous_epoch(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `invalid_completion` is never used
+   --> crates/forthdb-world/src/io_uring_epoch_io.rs:301:4
+    |
+301 | fn invalid_completion(
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_completion_batch` is never used
+   --> crates/forthdb-world/src/io_uring_epoch_io.rs:311:4
+    |
+311 | fn validate_completion_batch(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_user_data` is never used
+   --> crates/forthdb-world/src/io_uring_epoch_io.rs:414:4
+    |
+414 | fn write_user_data(index: usize) -> u64 {
+    |    ^^^^^^^^^^^^^^^
+
+warning: constant `SLOTS` is never used
+  --> crates/forthdb-world/src/mmap_vm_snapshot.rs:25:7
+   |
+25 | const SLOTS: usize = 0;
+   |       ^^^^^
+
+warning: constant `PREDICATES` is never used
+  --> crates/forthdb-world/src/mmap_vm_snapshot.rs:26:7
+   |
+26 | const PREDICATES: usize = 1;
+   |       ^^^^^^^^^^
+
+warning: constant `LITERALS` is never used
+  --> crates/forthdb-world/src/mmap_vm_snapshot.rs:27:7
+   |
+27 | const LITERALS: usize = 2;
+   |       ^^^^^^^^
+
+warning: associated function `parse` is never used
+  --> crates/forthdb-world/src/mmap_vm_snapshot.rs:71:8
+   |
+70 | impl StringTable {
+   | ---------------- associated function in this implementation
+71 |     fn parse(mapping: &[u8], section: Range<usize>) -> Result<Self, String> {
+   |        ^^^^^
+
+warning: fields `epoch_count`, `journal_offset`, `next_entity`, `operation_count`, `record_count`, and `frame_count` are never read
+   --> crates/forthdb-world/src/mmap_vm_snapshot.rs:159:5
+    |
+156 | pub(crate) struct MmapVmSnapshot {
+    |                   -------------- fields in this struct
+...
+159 |     epoch_count: u64,
+    |     ^^^^^^^^^^^
+160 |     journal_offset: u64,
+    |     ^^^^^^^^^^^^^^
+...
+163 |     next_entity: u64,
+    |     ^^^^^^^^^^^
+164 |     operation_count: usize,
+    |     ^^^^^^^^^^^^^^^
+165 |     active_slot_count: usize,
+166 |     record_count: usize,
+    |     ^^^^^^^^^^^^
+167 |     frame_count: usize,
+    |     ^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> crates/forthdb-world/src/mmap_vm_snapshot.rs:391:19
+    |
+189 | impl MmapVmSnapshot {
+    | ------------------- associated items in this implementation
+...
+391 |     pub(crate) fn open(journal_path: &Path, journal: &[u8]) -> Result<Arc<Self>, String> {
+    |                   ^^^^
+...
+499 |     fn validate_records_and_indexes(&self) -> Result<(), String> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+536 |     pub(crate) fn epoch_count(&self) -> u64 {
+    |                   ^^^^^^^^^^^
+...
+540 |     pub(crate) fn journal_offset(&self) -> u64 {
+    |                   ^^^^^^^^^^^^^^
+...
+544 |     pub(crate) fn world_id(&self) -> WorldId {
+    |                   ^^^^^^^^
+...
+548 |     pub(crate) fn world_version(&self) -> u64 {
+    |                   ^^^^^^^^^^^^^
+...
+552 |     pub(crate) fn next_entity(&self) -> u64 {
+    |                   ^^^^^^^^^^^
+...
+556 |     pub(crate) fn operation_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^
+...
+560 |     pub(crate) fn active_slot_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+564 |     pub(crate) fn record_count(&self) -> usize {
+    |                   ^^^^^^^^^^^^
+...
+568 |     pub(crate) fn snapshot_bytes(&self) -> u64 {
+    |                   ^^^^^^^^^^^^^^
+...
+610 |     pub(crate) fn workspace_image(&self) -> Result<(Vec<FactRecord>, Vec<u32>), String> {
+    |                   ^^^^^^^^^^^^^^^
+...
+653 |     pub(crate) fn display_name(&self, entity: EntityId) -> String {
+    |                   ^^^^^^^^^^^^
+
+warning: function `encode_queued_intent` is never used
+   --> crates/forthdb-world/src/queued.rs:493:15
+    |
+493 | pub(crate) fn encode_queued_intent(intent: &QueuedIntent, output: &mut Vec<u8>) {
+    |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `decode_queued_intent` is never used
+   --> crates/forthdb-world/src/queued.rs:536:15
+    |
+536 | pub(crate) fn decode_queued_intent(input: &mut Cursor<&[u8]>) -> Result<QueuedIntent, String> {
+    |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `encode_temporary` is never used
+   --> crates/forthdb-world/src/queued.rs:582:4
+    |
+582 | fn encode_temporary(output: &mut Vec<u8>, temporary: TempEntity) {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `decode_temporary` is never used
+   --> crates/forthdb-world/src/queued.rs:587:4
+    |
+587 | fn decode_temporary(input: &mut Cursor<&[u8]>) -> Result<TempEntity, String> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `encode_intent_fact` is never used
+   --> crates/forthdb-world/src/queued.rs:594:4
+    |
+594 | fn encode_intent_fact(output: &mut Vec<u8>, fact: &IntentFact) {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `decode_intent_fact` is never used
+   --> crates/forthdb-world/src/queued.rs:600:4
+    |
+600 | fn decode_intent_fact(input: &mut Cursor<&[u8]>) -> Result<IntentFact, String> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `encode_intent_atom` is never used
+   --> crates/forthdb-world/src/queued.rs:608:4
+    |
+608 | fn encode_intent_atom(output: &mut Vec<u8>, atom: &IntentAtom) {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `decode_intent_atom` is never used
+   --> crates/forthdb-world/src/queued.rs:625:4
+    |
+625 | fn decode_intent_atom(input: &mut Cursor<&[u8]>) -> Result<IntentAtom, String> {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `encode_fact` is never used
+   --> crates/forthdb-world/src/queued.rs:634:4
+    |
+634 | fn encode_fact(output: &mut Vec<u8>, fact: &Fact) {
+    |    ^^^^^^^^^^^
+
+warning: function `decode_fact` is never used
+   --> crates/forthdb-world/src/queued.rs:640:4
+    |
+640 | fn decode_fact(input: &mut Cursor<&[u8]>) -> Result<Fact, String> {
+    |    ^^^^^^^^^^^
+
+warning: function `encode_atom` is never used
+   --> crates/forthdb-world/src/queued.rs:648:4
+    |
+648 | fn encode_atom(output: &mut Vec<u8>, atom: &Atom) {
+    |    ^^^^^^^^^^^
+
+warning: function `decode_atom` is never used
+   --> crates/forthdb-world/src/queued.rs:661:4
+    |
+661 | fn decode_atom(input: &mut Cursor<&[u8]>) -> Result<Atom, String> {
+    |    ^^^^^^^^^^^
+
+warning: function `put_u32` is never used
+   --> crates/forthdb-world/src/queued.rs:669:4
+    |
+669 | fn put_u32(output: &mut Vec<u8>, value: u32) {
+    |    ^^^^^^^
+
+warning: function `put_u64` is never used
+   --> crates/forthdb-world/src/queued.rs:673:4
+    |
+673 | fn put_u64(output: &mut Vec<u8>, value: u64) {
+    |    ^^^^^^^
+
+warning: function `put_string` is never used
+   --> crates/forthdb-world/src/queued.rs:677:4
+    |
+677 | fn put_string(output: &mut Vec<u8>, value: &str) {
+    |    ^^^^^^^^^^
+
+warning: function `take_u8` is never used
+   --> crates/forthdb-world/src/queued.rs:682:4
+    |
+682 | fn take_u8(input: &mut Cursor<&[u8]>) -> Result<u8, String> {
+    |    ^^^^^^^
+
+warning: function `take_u32` is never used
+   --> crates/forthdb-world/src/queued.rs:690:4
+    |
+690 | fn take_u32(input: &mut Cursor<&[u8]>) -> Result<u32, String> {
+    |    ^^^^^^^^
+
+warning: function `take_u64` is never used
+   --> crates/forthdb-world/src/queued.rs:698:4
+    |
+698 | fn take_u64(input: &mut Cursor<&[u8]>) -> Result<u64, String> {
+    |    ^^^^^^^^
+
+warning: function `take_string` is never used
+   --> crates/forthdb-world/src/queued.rs:706:4
+    |
+706 | fn take_string(input: &mut Cursor<&[u8]>) -> Result<String, String> {
+    |    ^^^^^^^^^^^
+
+warning: associated function `from_mmap` is never used
+   --> crates/forthdb-world/src/queued.rs:922:19
+    |
+909 | impl VmEpochMaterializer {
+    | ------------------------ associated function in this implementation
+...
+922 |     pub(crate) fn from_mmap(snapshot: Arc<MmapVmSnapshot>) -> Result<Self, String> {
+    |                   ^^^^^^^^^
+
+warning: associated function `from_physical_snapshot` is never used
+   --> crates/forthdb-world/src/stack_vm.rs:540:19
+    |
+462 | impl Workspace {
+    | -------------- associated function in this implementation
+...
+540 |     pub(crate) fn from_physical_snapshot(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `forthdb-world` (lib) generated 76 warnings (run `cargo fix --lib -p forthdb-world` to apply 8 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.10s
+     Running `target/release/semantic_intent_pipeline`

@@ -129,6 +129,42 @@ impl TicketRejection {
 }
 
 #[derive(Debug)]
+pub enum SemanticTicketRejection {
+    WorldPrecondition {
+        expected: WorldId,
+        actual: WorldId,
+    },
+    SlotPrecondition {
+        slot: SlotId,
+        expected: Option<Fact>,
+        actual: Option<Fact>,
+    },
+    Validation(String),
+    Lowering(String),
+}
+
+impl fmt::Display for SemanticTicketRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorldPrecondition { expected, actual } => write!(
+                f,
+                "world precondition mismatch: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::SlotPrecondition {
+                slot,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "slot precondition mismatch on {slot:?}: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::Validation(msg) => write!(f, "validation failure: {msg}"),
+            Self::Lowering(msg) => write!(f, "semantic lowering failure: {msg}"),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum TicketOutcome {
     Accepted {
         world: Arc<World>,
@@ -146,6 +182,60 @@ impl TicketOutcome {
             },
             EpochOutcome::Rejected(rejected) => {
                 Self::Rejected(TicketRejection::from_intent_rejection(rejected.error()))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SemanticTicketOutcome {
+    Accepted {
+        world: Arc<World>,
+        bindings: crate::transaction_ast::SemanticBindings,
+    },
+    Rejected(SemanticTicketRejection),
+}
+
+#[derive(Debug)]
+pub struct SemanticCommitTicket {
+    id: u64,
+    receiver: Option<mpsc::Receiver<SemanticTicketOutcome>>,
+    lifecycle: Arc<TicketLifecycle>,
+    metrics: Arc<ControllerMetricsInner>,
+    observed: bool,
+}
+
+impl SemanticCommitTicket {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn state(&self) -> TicketState {
+        self.lifecycle.snapshot()
+    }
+
+    pub fn wait(mut self) -> Result<SemanticTicketOutcome, TicketWaitError> {
+        let receiver = self
+            .receiver
+            .take()
+            .expect("wait can be called at most once");
+        match receiver.recv() {
+            Ok(outcome) => {
+                self.observed = true;
+                Ok(outcome)
+            }
+            Err(_) => Err(TicketWaitError::WorkerStopped),
+        }
+    }
+}
+
+impl Drop for SemanticCommitTicket {
+    fn drop(&mut self) {
+        if !self.observed {
+            if self.lifecycle.abandon() {
+                self.metrics
+                    .abandoned_tickets
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -227,6 +317,23 @@ impl fmt::Display for SubmitError {
 }
 
 impl Error for SubmitError {}
+
+#[derive(Debug)]
+pub enum SemanticSubmitError {
+    Full(crate::transaction_ast::SemanticIntent),
+    Closed(crate::transaction_ast::SemanticIntent),
+}
+
+impl fmt::Display for SemanticSubmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full(_) => write!(formatter, "semantic intent controller channel full"),
+            Self::Closed(_) => write!(formatter, "semantic intent controller worker stopped"),
+        }
+    }
+}
+
+impl Error for SemanticSubmitError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControllerConfigError {
@@ -486,11 +593,21 @@ impl ControllerMetricsInner {
     }
 }
 
-struct StagedIntent {
-    intent: QueuedIntent,
-    completion: mpsc::Sender<TicketOutcome>,
-    lifecycle: Arc<TicketLifecycle>,
-    enqueued_at: Instant,
+pub(crate) enum ControllerIntent {
+    Queued(QueuedIntent),
+    Semantic(crate::transaction_ast::SemanticIntent),
+}
+
+pub(crate) enum CompletionRoute {
+    Queued(mpsc::Sender<TicketOutcome>),
+    Semantic(mpsc::Sender<SemanticTicketOutcome>),
+}
+
+pub(crate) struct StagedIntent {
+    pub(crate) intent: ControllerIntent,
+    pub(crate) completion: CompletionRoute,
+    pub(crate) lifecycle: Arc<TicketLifecycle>,
+    pub(crate) enqueued_at: Instant,
 }
 
 enum ControllerCommand {
@@ -633,43 +750,100 @@ impl QueuedIntentController {
         let Some(sender) = self.sender.as_ref() else {
             return Err(SubmitError::Closed(intent));
         };
-        let Some(depth) = self.metrics.reserve_ingress(self.capacity) else {
+        let Some(queue_depth) = self.metrics.reserve_ingress(self.capacity) else {
             self.metrics.backpressured.fetch_add(1, Ordering::Relaxed);
             return Err(SubmitError::Full(intent));
         };
-
+        self.metrics.observe_queue_depth(queue_depth);
+        let id = NEXT_TICKET_ID.fetch_add(1, Ordering::Relaxed);
+        let (completion_tx, completion_rx) = mpsc::channel();
         let lifecycle = Arc::new(TicketLifecycle::new());
-        let (completion, receiver) = mpsc::channel();
-        let command = ControllerCommand::Intent(StagedIntent {
-            intent,
-            completion,
+        let staged = StagedIntent {
+            intent: ControllerIntent::Queued(intent),
+            completion: CompletionRoute::Queued(completion_tx),
             lifecycle: lifecycle.clone(),
             enqueued_at: Instant::now(),
-        });
-
-        match sender.try_send(command) {
-            Ok(()) => {
-                self.metrics.observe_queue_depth(depth);
-                self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
-                Ok(CommitTicket {
-                    id: NEXT_TICKET_ID.fetch_add(1, Ordering::Relaxed),
-                    receiver: Some(receiver),
-                    lifecycle,
-                    metrics: self.metrics.clone(),
-                    observed: false,
-                })
-            }
+        };
+        self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
+        self.metrics.in_flight.fetch_add(1, Ordering::AcqRel);
+        match sender.try_send(ControllerCommand::Intent(staged)) {
+            Ok(()) => Ok(CommitTicket {
+                id,
+                receiver: Some(completion_rx),
+                lifecycle,
+                metrics: self.metrics.clone(),
+                observed: false,
+            }),
             Err(TrySendError::Full(ControllerCommand::Intent(staged))) => {
+                let ControllerIntent::Queued(intent) = staged.intent else {
+                    unreachable!()
+                };
                 self.metrics.release_ingress();
+                self.metrics.in_flight.fetch_sub(1, Ordering::AcqRel);
                 self.metrics.backpressured.fetch_add(1, Ordering::Relaxed);
-                Err(SubmitError::Full(staged.intent))
+                Err(SubmitError::Full(intent))
             }
             Err(TrySendError::Disconnected(ControllerCommand::Intent(staged))) => {
+                let ControllerIntent::Queued(intent) = staged.intent else {
+                    unreachable!()
+                };
                 self.metrics.release_ingress();
-                Err(SubmitError::Closed(staged.intent))
+                self.metrics.in_flight.fetch_sub(1, Ordering::AcqRel);
+                Err(SubmitError::Closed(intent))
             }
-            Err(TrySendError::Full(ControllerCommand::Barrier(_)))
-            | Err(TrySendError::Disconnected(ControllerCommand::Barrier(_))) => unreachable!(),
+            Err(_) => unreachable!("unexpected sync sender error"),
+        }
+    }
+
+    pub fn submit_semantic(
+        &self,
+        intent: crate::transaction_ast::SemanticIntent,
+    ) -> Result<SemanticCommitTicket, SemanticSubmitError> {
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(SemanticSubmitError::Closed(intent));
+        };
+        let Some(queue_depth) = self.metrics.reserve_ingress(self.capacity) else {
+            self.metrics.backpressured.fetch_add(1, Ordering::Relaxed);
+            return Err(SemanticSubmitError::Full(intent));
+        };
+        self.metrics.observe_queue_depth(queue_depth);
+        let id = NEXT_TICKET_ID.fetch_add(1, Ordering::Relaxed);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let lifecycle = Arc::new(TicketLifecycle::new());
+        let staged = StagedIntent {
+            intent: ControllerIntent::Semantic(intent),
+            completion: CompletionRoute::Semantic(completion_tx),
+            lifecycle: lifecycle.clone(),
+            enqueued_at: Instant::now(),
+        };
+        self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
+        self.metrics.in_flight.fetch_add(1, Ordering::AcqRel);
+        match sender.try_send(ControllerCommand::Intent(staged)) {
+            Ok(()) => Ok(SemanticCommitTicket {
+                id,
+                receiver: Some(completion_rx),
+                lifecycle,
+                metrics: self.metrics.clone(),
+                observed: false,
+            }),
+            Err(TrySendError::Full(ControllerCommand::Intent(staged))) => {
+                let ControllerIntent::Semantic(intent) = staged.intent else {
+                    unreachable!()
+                };
+                self.metrics.release_ingress();
+                self.metrics.in_flight.fetch_sub(1, Ordering::AcqRel);
+                self.metrics.backpressured.fetch_add(1, Ordering::Relaxed);
+                Err(SemanticSubmitError::Full(intent))
+            }
+            Err(TrySendError::Disconnected(ControllerCommand::Intent(staged))) => {
+                let ControllerIntent::Semantic(intent) = staged.intent else {
+                    unreachable!()
+                };
+                self.metrics.release_ingress();
+                self.metrics.in_flight.fetch_sub(1, Ordering::AcqRel);
+                Err(SemanticSubmitError::Closed(intent))
+            }
+            Err(_) => unreachable!("unexpected sync sender error"),
         }
     }
 
@@ -719,6 +893,7 @@ fn run_worker(
 ) {
     let _liveness = WorkerLiveness(metrics.clone());
     let mut pending = VecDeque::new();
+    let mut materializer = crate::queued::VmEpochMaterializer::new(1);
 
     let (min_batch, max_batch) = match policy {
         BatchPolicy::ImmediateDrain { max_batch } => (1, max_batch),
@@ -899,7 +1074,7 @@ fn run_worker(
                 };
 
                 metrics.record_seal_reason(seal_reason);
-                process_batch(&database, batch, &metrics);
+                process_batch(&database, batch, &metrics, &mut materializer);
             }
             ControllerCommand::Barrier(completed) => {
                 metrics.record_seal_reason(BatchSealReason::Barrier);
@@ -920,37 +1095,89 @@ fn process_batch(
     database: &Database<MemoryCommitStore>,
     batch: Vec<StagedIntent>,
     metrics: &ControllerMetricsInner,
+    materializer: &mut crate::queued::VmEpochMaterializer,
 ) {
     metrics
         .in_flight
         .store(batch.len() as u64, Ordering::Release);
 
+    let mut routes: Vec<(CompletionRoute, Arc<TicketLifecycle>)> = Vec::with_capacity(batch.len());
     let mut intents = Vec::with_capacity(batch.len());
-    let mut routes = Vec::with_capacity(batch.len());
     for staged in batch {
         intents.push(staged.intent);
         routes.push((staged.completion, staged.lifecycle));
     }
 
-    let plan = database.commit_queued_epoch(intents);
+    let plan = database.commit_mixed_epoch(intents, materializer);
     debug_assert_eq!(plan.outcomes().len(), routes.len());
 
-    for ((completion, lifecycle), outcome) in routes.into_iter().zip(plan.outcomes()) {
-        let ticket_outcome = TicketOutcome::from_epoch_outcome(outcome);
-        match &ticket_outcome {
-            TicketOutcome::Accepted { .. } => {
-                metrics.accepted.fetch_add(1, Ordering::Relaxed);
+    for ((completion, lifecycle), outcome) in routes.into_iter().zip(plan.into_outcomes()) {
+        let ticket_outcome = match (completion, outcome) {
+            (
+                CompletionRoute::Queued(tx),
+                crate::queued::MixedEpochOutcome::QueuedAccepted(accepted),
+            ) => {
+                let out = TicketOutcome::Accepted {
+                    world: accepted.world(),
+                    entities: accepted.entities().clone(),
+                };
+                if tx.send(out).is_err() {
+                    metrics
+                        .completion_delivery_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                true
             }
-            TicketOutcome::Rejected(_) => {
-                metrics.rejected.fetch_add(1, Ordering::Relaxed);
+            (
+                CompletionRoute::Queued(tx),
+                crate::queued::MixedEpochOutcome::QueuedRejected(rejected),
+            ) => {
+                let out = TicketOutcome::Rejected(TicketRejection::from_intent_rejection(
+                    rejected.error(),
+                ));
+                if tx.send(out).is_err() {
+                    metrics
+                        .completion_delivery_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                false
             }
+            (
+                CompletionRoute::Semantic(tx),
+                crate::queued::MixedEpochOutcome::SemanticAccepted(accepted),
+            ) => {
+                let out = SemanticTicketOutcome::Accepted {
+                    world: accepted.world(),
+                    bindings: accepted.into_bindings(),
+                };
+                if tx.send(out).is_err() {
+                    metrics
+                        .completion_delivery_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+            (
+                CompletionRoute::Semantic(tx),
+                crate::queued::MixedEpochOutcome::SemanticRejected(rejected),
+            ) => {
+                let out = SemanticTicketOutcome::Rejected(rejected.into_error());
+                if tx.send(out).is_err() {
+                    metrics
+                        .completion_delivery_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                false
+            }
+            _ => unreachable!("controller intent routing mismatch"),
+        };
+
+        if ticket_outcome {
+            metrics.accepted.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics.rejected.fetch_add(1, Ordering::Relaxed);
         }
         lifecycle.resolve();
-        if completion.send(ticket_outcome).is_err() {
-            metrics
-                .completion_delivery_failures
-                .fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     metrics.epochs.fetch_add(1, Ordering::Relaxed);

@@ -441,7 +441,7 @@ pub enum ExecutionOutcome {
 
 /// A single-threaded epoch workspace. Trial writes remain private until an
 /// intent is accepted, so rejection restores POD frontiers without undoing a
-/// shared hash map or dropping heap-owned values.
+#[derive(Clone)]
 pub struct Workspace {
     stack: Vec<Cell>,
     stack_pointer: usize,

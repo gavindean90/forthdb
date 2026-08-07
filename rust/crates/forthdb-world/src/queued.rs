@@ -851,6 +851,116 @@ impl EpochOutcome {
     }
 }
 
+#[derive(Debug)]
+pub struct AcceptedSemanticIntent {
+    position: usize,
+    world: Arc<World>,
+    frame: Arc<CommitFrame>,
+    bindings: crate::transaction_ast::SemanticBindings,
+}
+
+impl AcceptedSemanticIntent {
+    pub fn new(
+        position: usize,
+        world: Arc<World>,
+        frame: Arc<CommitFrame>,
+        bindings: crate::transaction_ast::SemanticBindings,
+    ) -> Self {
+        Self {
+            position,
+            world,
+            frame,
+            bindings,
+        }
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+    pub fn world(&self) -> Arc<World> {
+        self.world.clone()
+    }
+    pub fn frame(&self) -> Arc<CommitFrame> {
+        self.frame.clone()
+    }
+    pub fn bindings(&self) -> &crate::transaction_ast::SemanticBindings {
+        &self.bindings
+    }
+    pub fn into_bindings(self) -> crate::transaction_ast::SemanticBindings {
+        self.bindings
+    }
+}
+
+#[derive(Debug)]
+pub struct RejectedSemanticIntent {
+    position: usize,
+    error: crate::queued_controller::SemanticTicketRejection,
+}
+
+impl RejectedSemanticIntent {
+    pub fn new(position: usize, error: crate::queued_controller::SemanticTicketRejection) -> Self {
+        Self { position, error }
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+    pub fn error(&self) -> &crate::queued_controller::SemanticTicketRejection {
+        &self.error
+    }
+    pub fn into_error(self) -> crate::queued_controller::SemanticTicketRejection {
+        self.error
+    }
+}
+
+#[derive(Debug)]
+pub enum MixedEpochOutcome {
+    QueuedAccepted(AcceptedIntent),
+    QueuedRejected(RejectedIntent),
+    SemanticAccepted(AcceptedSemanticIntent),
+    SemanticRejected(RejectedSemanticIntent),
+}
+
+#[derive(Debug)]
+pub struct MixedEpochPlan {
+    base: Arc<World>,
+    tail: Arc<World>,
+    outcomes: Vec<MixedEpochOutcome>,
+    frames: Vec<Arc<CommitFrame>>,
+}
+
+impl MixedEpochPlan {
+    pub fn new(
+        base: Arc<World>,
+        tail: Arc<World>,
+        outcomes: Vec<MixedEpochOutcome>,
+        frames: Vec<Arc<CommitFrame>>,
+    ) -> Self {
+        Self {
+            base,
+            tail,
+            outcomes,
+            frames,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+    pub fn tail(&self) -> Arc<World> {
+        self.tail.clone()
+    }
+    pub fn frames(&self) -> &[Arc<CommitFrame>] {
+        &self.frames
+    }
+    pub fn outcomes(&self) -> &[MixedEpochOutcome] {
+        &self.outcomes
+    }
+    pub fn into_outcomes(self) -> Vec<MixedEpochOutcome> {
+        self.outcomes
+    }
+}
+
 /// A deterministic private successor chain. Derivation never mutates the base
 /// and never publishes a successor.
 #[derive(Debug)]
@@ -896,8 +1006,10 @@ const VM_LITERAL_BASE: u64 = 1 << 63;
 /// Persistent token dictionaries and semantic state for the durable VM
 /// materializer. Durable intents remain the canonical journal representation;
 /// both live execution and recovery compile them through this same state.
+#[derive(Clone)]
 pub(crate) struct VmEpochMaterializer {
     workspace: VmWorkspace,
+    version: u64,
     mapped_base: Option<Arc<MmapVmSnapshot>>,
     slots: BTreeMap<SlotId, SlotToken>,
     predicates: BTreeMap<Predicate, Cell>,
@@ -910,6 +1022,7 @@ impl VmEpochMaterializer {
     pub(crate) fn new(next_entity: u64) -> Self {
         Self {
             workspace: VmWorkspace::with_indexes_from(next_entity, 0, 32, 1_024, 1_024),
+            version: 0,
             mapped_base: None,
             slots: BTreeMap::new(),
             predicates: BTreeMap::new(),
@@ -929,6 +1042,7 @@ impl VmEpochMaterializer {
         )?;
         Ok(Self {
             workspace,
+            version: 0,
             mapped_base: Some(snapshot),
             slots: BTreeMap::new(),
             predicates: BTreeMap::new(),
@@ -936,6 +1050,37 @@ impl VmEpochMaterializer {
             literals: BTreeMap::new(),
             literal_values: Vec::new(),
         })
+    }
+
+    pub(crate) fn from_world(base: &Arc<World>) -> Result<Self, String> {
+        let mut materializer = Self::new(base.next_entity());
+        materializer.synchronize_to(base)?;
+        Ok(materializer)
+    }
+
+    pub(crate) fn synchronize_to(&mut self, base: &Arc<World>) -> Result<(), String> {
+        if self.version > base.version() {
+            return Err("VM materializer cannot rewind".to_owned());
+        }
+        if self.version == base.version() {
+            return Ok(());
+        }
+
+        let frames = base.frames();
+        if self.version == 0 && base.version() > 0 {
+            // Need to apply from beginning
+            self.workspace = VmWorkspace::with_indexes_from(1, 0, 32, 1_024, 1_024);
+        }
+
+        for frame in frames {
+            let frame_version = frame.parent_version() + 1;
+            if frame_version > self.version {
+                self.apply_committed(frame.operations())?;
+                self.version = frame_version;
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn materialize(
@@ -952,6 +1097,616 @@ impl VmEpochMaterializer {
             return Ok((plan, false));
         }
         self.derive_vm_epoch(base, intents).map(|plan| (plan, true))
+    }
+
+    pub(crate) fn materialize_mixed(
+        &mut self,
+        base: Arc<World>,
+        intents: Vec<crate::queued_controller::ControllerIntent>,
+        validators: &[Validator],
+    ) -> MixedEpochPlan {
+        enum MixedVmOutcome {
+            QueuedAccepted {
+                position: usize,
+                entities: BTreeMap<TempEntity, EntityId>,
+            },
+            QueuedRejected(RejectedIntent),
+            SemanticAccepted {
+                position: usize,
+                bindings: crate::transaction_ast::SemanticBindings,
+            },
+            SemanticRejected(RejectedSemanticIntent),
+        }
+
+        let mut predecessor_id = base.id();
+        let mut predecessor_version = base.version();
+        let mut accepted_operations = Vec::new();
+        let mut outcomes = Vec::with_capacity(intents.len());
+        let mut accepted_count = 0usize;
+
+        let kernel = base.kernel().clone();
+
+        for (position, intent) in intents.into_iter().enumerate() {
+            if !validators.is_empty() {
+                // Host validators path: validate against CandidateWorld BEFORE any VM or Materializer mutation
+                match intent {
+                    crate::queued_controller::ControllerIntent::Queued(queued) => {
+                        if let Err(error) =
+                            self.check_preconditions(predecessor_id, &queued.preconditions)
+                        {
+                            outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                position,
+                                error,
+                            }));
+                            continue;
+                        }
+                        let (operations, entities) = match resolve_operations_from(
+                            self.workspace.next_entity(),
+                            queued.namespace,
+                            queued.operations,
+                        ) {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                    position,
+                                    error,
+                                }));
+                                continue;
+                            }
+                        };
+                        let candidate = match CandidateWorld::construct_from_state(
+                            predecessor_id,
+                            predecessor_version,
+                            self.workspace.next_entity(),
+                            base.operation_count,
+                            &kernel,
+                            operations.clone(),
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                    position,
+                                    error: IntentRejection::Candidate(e),
+                                }));
+                                continue;
+                            }
+                        };
+                        let mut val_err = None;
+                        for validator in validators {
+                            if let Err(e) = validator(&candidate) {
+                                val_err = Some(e);
+                                break;
+                            }
+                        }
+                        if let Some(e) = val_err {
+                            outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                position,
+                                error: IntentRejection::Validation(e),
+                            }));
+                            continue;
+                        }
+
+                        let program = match self.compile_operations(&operations) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                    position,
+                                    error: IntentRejection::Validation(e),
+                                }));
+                                continue;
+                            }
+                        };
+
+                        match self.workspace.execute(&program) {
+                            ExecutionOutcome::Accepted => {
+                                predecessor_version = predecessor_version.saturating_add(1);
+                                predecessor_id = calculate_world_id(
+                                    predecessor_id,
+                                    predecessor_version,
+                                    self.workspace.next_entity(),
+                                    &operations,
+                                );
+                                accepted_operations.extend(operations);
+                                accepted_count += 1;
+                                outcomes
+                                    .push(MixedVmOutcome::QueuedAccepted { position, entities });
+                            }
+                            ExecutionOutcome::Rejected(error) => {
+                                outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                    position,
+                                    error: IntentRejection::Validation(format!("{error:?}")),
+                                }));
+                            }
+                        }
+                    }
+                    crate::queued_controller::ControllerIntent::Semantic(semantic) => {
+                        let intent_next_entity = self.workspace.next_entity();
+                        let mut temps = std::collections::BTreeMap::new();
+                        let mut current_entity = intent_next_entity;
+                        for op in &semantic.ast.operations {
+                            if let crate::transaction_ast::TransactionOp::Allocate { result } = op {
+                                temps.insert(result.to_string(), current_entity);
+                                current_entity += 1;
+                            }
+                        }
+
+                        let mut synthesized_operations = Vec::new();
+                        for op in &semantic.ast.operations {
+                            use crate::transaction_ast::{AtomRef, TransactionOp};
+                            match op {
+                                TransactionOp::Allocate { result } => {
+                                    synthesized_operations.push(Operation::AllocateEntity {
+                                        entity: EntityId::new(*temps.get(result).unwrap()),
+                                    });
+                                }
+                                TransactionOp::Define {
+                                    slot,
+                                    subject,
+                                    predicate,
+                                    object,
+                                } => {
+                                    let resolve = |r: &AtomRef| match r {
+                                        AtomRef::Entity(e) => Atom::Entity(EntityId::new(e.0)),
+                                        AtomRef::Literal(l) => {
+                                            Atom::Literal(Literal::new(l.as_str()))
+                                        }
+                                        AtomRef::Symbol(s) => {
+                                            Atom::Entity(EntityId::new(*temps.get(s).unwrap()))
+                                        }
+                                    };
+                                    synthesized_operations.push(Operation::Define {
+                                        slot: SlotId::new(slot.as_str()),
+                                        fact: Fact {
+                                            subject: resolve(subject),
+                                            predicate: Predicate::new(predicate.as_str()),
+                                            object: resolve(object),
+                                        },
+                                    });
+                                }
+                                TransactionOp::Forget { slot } => {
+                                    synthesized_operations.push(Operation::Forget {
+                                        slot: SlotId::new(slot.as_str()),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        let candidate = match CandidateWorld::construct_from_state(
+                            predecessor_id,
+                            predecessor_version,
+                            intent_next_entity,
+                            base.operation_count,
+                            &kernel,
+                            synthesized_operations.clone(),
+                        ) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                outcomes.push(MixedVmOutcome::SemanticRejected(RejectedSemanticIntent { position, error: crate::queued_controller::SemanticTicketRejection::Validation(format!("candidate error: {e:?}")) }));
+                                continue;
+                            }
+                        };
+
+                        let mut val_err = None;
+                        for validator in validators {
+                            if let Err(e) = validator(&candidate) {
+                                val_err = Some(e);
+                                break;
+                            }
+                        }
+                        if let Some(e) = val_err {
+                            outcomes.push(MixedVmOutcome::SemanticRejected(RejectedSemanticIntent { position, error: crate::queued_controller::SemanticTicketRejection::Validation(e) }));
+                            continue;
+                        }
+
+                        let operations_view: Vec<_> = semantic
+                            .ast
+                            .operations
+                            .iter()
+                            .map(|op| {
+                                use crate::transaction_ast::{
+                                    AtomRef, AtomRefView, TransactionOp, TransactionOpView,
+                                };
+                                match op {
+                                    TransactionOp::Allocate { result } => {
+                                        TransactionOpView::Allocate {
+                                            result: result.as_str(),
+                                        }
+                                    }
+                                    TransactionOp::ExpectWorld { expected } => {
+                                        TransactionOpView::ExpectWorld {
+                                            expected: *expected,
+                                        }
+                                    }
+                                    TransactionOp::ExpectObject { slot, expected } => {
+                                        TransactionOpView::ExpectObject {
+                                            slot: slot.as_str(),
+                                            expected: match expected {
+                                                AtomRef::Entity(e) => AtomRefView::Entity(*e),
+                                                AtomRef::Literal(l) => {
+                                                    AtomRefView::Literal(l.as_str())
+                                                }
+                                                AtomRef::Symbol(s) => {
+                                                    AtomRefView::Symbol(s.as_str())
+                                                }
+                                            },
+                                        }
+                                    }
+                                    TransactionOp::Define {
+                                        slot,
+                                        subject,
+                                        predicate,
+                                        object,
+                                    } => TransactionOpView::Define {
+                                        slot: slot.as_str(),
+                                        subject: match subject {
+                                            AtomRef::Entity(e) => AtomRefView::Entity(*e),
+                                            AtomRef::Literal(l) => AtomRefView::Literal(l.as_str()),
+                                            AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
+                                        },
+                                        predicate: predicate.as_str(),
+                                        object: match object {
+                                            AtomRef::Entity(e) => AtomRefView::Entity(*e),
+                                            AtomRef::Literal(l) => AtomRefView::Literal(l.as_str()),
+                                            AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
+                                        },
+                                    },
+                                    TransactionOp::Forget { slot } => TransactionOpView::Forget {
+                                        slot: slot.as_str(),
+                                    },
+                                    TransactionOp::Reject => TransactionOpView::Reject,
+                                }
+                            })
+                            .collect();
+
+                        let view = crate::transaction_ast::TransactionView::borrowed(
+                            semantic.ast.namespace,
+                            &operations_view,
+                        );
+
+                        let mut trial = TrialVocabulary::new(self);
+                        let (program, bindings) = match trial.compile_semantic_trial(&view) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                outcomes
+                                    .push(MixedVmOutcome::SemanticRejected(RejectedSemanticIntent {
+                                    position,
+                                    error:
+                                        crate::queued_controller::SemanticTicketRejection::Lowering(
+                                            e,
+                                        ),
+                                }));
+                                continue;
+                            }
+                        };
+
+                        match trial.materializer.workspace.execute(&program) {
+                            ExecutionOutcome::Accepted => {
+                                trial.commit();
+                                debug_assert_eq!(
+                                    self.workspace.next_entity(),
+                                    intent_next_entity + (temps.len() as u64),
+                                    "VM next_entity after execution must match allocator advancement implied by operations"
+                                );
+                                predecessor_version = predecessor_version.saturating_add(1);
+                                predecessor_id = calculate_world_id(
+                                    predecessor_id,
+                                    predecessor_version,
+                                    self.workspace.next_entity(),
+                                    &synthesized_operations,
+                                );
+                                accepted_operations.extend(synthesized_operations);
+                                accepted_count += 1;
+                                let semantic_bindings =
+                                    crate::transaction_ast::SemanticBindings::new(
+                                        bindings
+                                            .into_iter()
+                                            .map(|(k, v)| {
+                                                (k, crate::transaction_ast::EntityId(v.value()))
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    );
+                                outcomes.push(MixedVmOutcome::SemanticAccepted {
+                                    position,
+                                    bindings: semantic_bindings,
+                                });
+                            }
+                            ExecutionOutcome::Rejected(e) => {
+                                outcomes.push(MixedVmOutcome::SemanticRejected(RejectedSemanticIntent { position, error: crate::queued_controller::SemanticTicketRejection::Validation(format!("{e:?}")) }));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fast path: zero-allocation trial execution directly on VM
+                match intent {
+                    crate::queued_controller::ControllerIntent::Queued(queued) => {
+                        if let Err(error) =
+                            self.check_preconditions(predecessor_id, &queued.preconditions)
+                        {
+                            outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                position,
+                                error,
+                            }));
+                            continue;
+                        }
+                        let (operations, entities) = match resolve_operations_from(
+                            self.workspace.next_entity(),
+                            queued.namespace,
+                            queued.operations,
+                        ) {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                    position,
+                                    error,
+                                }));
+                                continue;
+                            }
+                        };
+                        let program = match self.compile_operations(&operations) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                    position,
+                                    error: IntentRejection::Validation(e),
+                                }));
+                                continue;
+                            }
+                        };
+
+                        match self.workspace.execute(&program) {
+                            ExecutionOutcome::Accepted => {
+                                predecessor_version = predecessor_version.saturating_add(1);
+                                predecessor_id = calculate_world_id(
+                                    predecessor_id,
+                                    predecessor_version,
+                                    self.workspace.next_entity(),
+                                    &operations,
+                                );
+                                accepted_operations.extend(operations);
+                                accepted_count += 1;
+                                outcomes
+                                    .push(MixedVmOutcome::QueuedAccepted { position, entities });
+                            }
+                            ExecutionOutcome::Rejected(error) => {
+                                outcomes.push(MixedVmOutcome::QueuedRejected(RejectedIntent {
+                                    position,
+                                    error: IntentRejection::Validation(format!("{error:?}")),
+                                }));
+                            }
+                        }
+                    }
+                    crate::queued_controller::ControllerIntent::Semantic(semantic) => {
+                        let operations_view: Vec<_> = semantic
+                            .ast
+                            .operations
+                            .iter()
+                            .map(|op| {
+                                use crate::transaction_ast::{
+                                    AtomRef, AtomRefView, TransactionOp, TransactionOpView,
+                                };
+                                match op {
+                                    TransactionOp::Allocate { result } => {
+                                        TransactionOpView::Allocate {
+                                            result: result.as_str(),
+                                        }
+                                    }
+                                    TransactionOp::ExpectWorld { expected } => {
+                                        TransactionOpView::ExpectWorld {
+                                            expected: *expected,
+                                        }
+                                    }
+                                    TransactionOp::ExpectObject { slot, expected } => {
+                                        TransactionOpView::ExpectObject {
+                                            slot: slot.as_str(),
+                                            expected: match expected {
+                                                AtomRef::Entity(e) => AtomRefView::Entity(*e),
+                                                AtomRef::Literal(l) => {
+                                                    AtomRefView::Literal(l.as_str())
+                                                }
+                                                AtomRef::Symbol(s) => {
+                                                    AtomRefView::Symbol(s.as_str())
+                                                }
+                                            },
+                                        }
+                                    }
+                                    TransactionOp::Define {
+                                        slot,
+                                        subject,
+                                        predicate,
+                                        object,
+                                    } => TransactionOpView::Define {
+                                        slot: slot.as_str(),
+                                        subject: match subject {
+                                            AtomRef::Entity(e) => AtomRefView::Entity(*e),
+                                            AtomRef::Literal(l) => AtomRefView::Literal(l.as_str()),
+                                            AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
+                                        },
+                                        predicate: predicate.as_str(),
+                                        object: match object {
+                                            AtomRef::Entity(e) => AtomRefView::Entity(*e),
+                                            AtomRef::Literal(l) => AtomRefView::Literal(l.as_str()),
+                                            AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
+                                        },
+                                    },
+                                    TransactionOp::Forget { slot } => TransactionOpView::Forget {
+                                        slot: slot.as_str(),
+                                    },
+                                    TransactionOp::Reject => TransactionOpView::Reject,
+                                }
+                            })
+                            .collect();
+
+                        let view = crate::transaction_ast::TransactionView::borrowed(
+                            semantic.ast.namespace,
+                            &operations_view,
+                        );
+
+                        let mut trial = TrialVocabulary::new(self);
+                        let (program, bindings) = match trial.compile_semantic_trial(&view) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                outcomes
+                                    .push(MixedVmOutcome::SemanticRejected(RejectedSemanticIntent {
+                                    position,
+                                    error:
+                                        crate::queued_controller::SemanticTicketRejection::Lowering(
+                                            e,
+                                        ),
+                                }));
+                                continue;
+                            }
+                        };
+
+                        let intent_next_entity = trial.materializer.workspace.next_entity();
+                        match trial.materializer.workspace.execute(&program) {
+                            ExecutionOutcome::Accepted => {
+                                trial.commit();
+
+                                let mut temps = std::collections::BTreeMap::new();
+                                let mut current_entity = intent_next_entity;
+                                for op in &semantic.ast.operations {
+                                    if let crate::transaction_ast::TransactionOp::Allocate {
+                                        result,
+                                    } = op
+                                    {
+                                        temps.insert(result.to_string(), current_entity);
+                                        current_entity += 1;
+                                    }
+                                }
+
+                                let mut synthesized_operations = Vec::new();
+                                for op in &semantic.ast.operations {
+                                    use crate::transaction_ast::{AtomRef, TransactionOp};
+                                    match op {
+                                        TransactionOp::Allocate { result } => {
+                                            synthesized_operations.push(
+                                                Operation::AllocateEntity {
+                                                    entity: EntityId::new(
+                                                        *temps.get(result).unwrap(),
+                                                    ),
+                                                },
+                                            );
+                                        }
+                                        TransactionOp::Define {
+                                            slot,
+                                            subject,
+                                            predicate,
+                                            object,
+                                        } => {
+                                            let resolve = |r: &AtomRef| match r {
+                                                AtomRef::Entity(e) => {
+                                                    Atom::Entity(EntityId::new(e.0))
+                                                }
+                                                AtomRef::Literal(l) => {
+                                                    Atom::Literal(Literal::new(l.as_str()))
+                                                }
+                                                AtomRef::Symbol(s) => Atom::Entity(EntityId::new(
+                                                    *temps.get(s).unwrap(),
+                                                )),
+                                            };
+                                            synthesized_operations.push(Operation::Define {
+                                                slot: SlotId::new(slot.as_str()),
+                                                fact: Fact {
+                                                    subject: resolve(subject),
+                                                    predicate: Predicate::new(predicate.as_str()),
+                                                    object: resolve(object),
+                                                },
+                                            });
+                                        }
+                                        TransactionOp::Forget { slot } => {
+                                            synthesized_operations.push(Operation::Forget {
+                                                slot: SlotId::new(slot.as_str()),
+                                            });
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                predecessor_version = predecessor_version.saturating_add(1);
+                                predecessor_id = calculate_world_id(
+                                    predecessor_id,
+                                    predecessor_version,
+                                    self.workspace.next_entity(),
+                                    &synthesized_operations,
+                                );
+                                accepted_operations.extend(synthesized_operations);
+                                accepted_count += 1;
+                                let semantic_bindings =
+                                    crate::transaction_ast::SemanticBindings::new(
+                                        bindings
+                                            .into_iter()
+                                            .map(|(k, v)| {
+                                                (k, crate::transaction_ast::EntityId(v.value()))
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    );
+                                outcomes.push(MixedVmOutcome::SemanticAccepted {
+                                    position,
+                                    bindings: semantic_bindings,
+                                });
+                            }
+                            ExecutionOutcome::Rejected(e) => {
+                                outcomes.push(MixedVmOutcome::SemanticRejected(RejectedSemanticIntent { position, error: crate::queued_controller::SemanticTicketRejection::Validation(format!("{e:?}")) }));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if accepted_count == 0 {
+            return MixedEpochPlan::new(
+                base.clone(),
+                base,
+                outcomes
+                    .into_iter()
+                    .map(|o| match o {
+                        MixedVmOutcome::QueuedRejected(r) => MixedEpochOutcome::QueuedRejected(r),
+                        MixedVmOutcome::SemanticRejected(r) => {
+                            MixedEpochOutcome::SemanticRejected(r)
+                        }
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                Vec::new(),
+            );
+        }
+
+        let (world, frame) = World::from_vm_epoch(
+            base.clone(),
+            accepted_operations,
+            self.workspace.next_entity(),
+            self.workspace.active_slot_count(),
+            self.workspace.delta_count(),
+        );
+
+        let final_outcomes = outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                MixedVmOutcome::QueuedAccepted { position, entities } => {
+                    MixedEpochOutcome::QueuedAccepted(AcceptedIntent {
+                        position,
+                        world: world.clone(),
+                        frame: frame.clone(),
+                        entities,
+                    })
+                }
+                MixedVmOutcome::QueuedRejected(r) => MixedEpochOutcome::QueuedRejected(r),
+                MixedVmOutcome::SemanticAccepted { position, bindings } => {
+                    MixedEpochOutcome::SemanticAccepted(AcceptedSemanticIntent {
+                        position,
+                        world: world.clone(),
+                        frame: frame.clone(),
+                        bindings,
+                    })
+                }
+                MixedVmOutcome::SemanticRejected(r) => MixedEpochOutcome::SemanticRejected(r),
+            })
+            .collect();
+
+        MixedEpochPlan::new(base.clone(), world, final_outcomes, vec![frame])
     }
 
     fn derive_vm_epoch(
@@ -1260,6 +2015,227 @@ impl VmEpochMaterializer {
                 .cloned();
         }
         self.predicate_values.get(token).cloned()
+    }
+}
+
+pub(crate) struct TrialVocabulary<'a> {
+    materializer: &'a mut VmEpochMaterializer,
+    slots: std::collections::BTreeMap<SlotId, SlotToken>,
+    predicates: std::collections::BTreeMap<Predicate, Cell>,
+    literals: std::collections::BTreeMap<Literal, Cell>,
+}
+
+impl<'a> TrialVocabulary<'a> {
+    fn new(materializer: &'a mut VmEpochMaterializer) -> Self {
+        Self {
+            materializer,
+            slots: std::collections::BTreeMap::new(),
+            predicates: std::collections::BTreeMap::new(),
+            literals: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn commit(self) {
+        for (k, v) in self.slots {
+            self.materializer.slots.insert(k, v);
+        }
+        for (k, v) in self.predicates {
+            self.materializer.predicates.insert(k.clone(), v);
+            self.materializer.predicate_values.push(k);
+        }
+        for (k, v) in self.literals {
+            self.materializer.literals.insert(k.clone(), v);
+            self.materializer.literal_values.push(k);
+        }
+    }
+
+    fn slot_token(&mut self, slot_str: &str) -> SlotToken {
+        let slot = SlotId::new(slot_str);
+        if let Some(token) = self.slots.get(&slot) {
+            return *token;
+        }
+        if let Some(token) = self.materializer.slots.get(&slot) {
+            return *token;
+        }
+        if let Some(token) = self
+            .materializer
+            .mapped_base
+            .as_ref()
+            .and_then(|base| base.slot_token(slot.as_str()))
+        {
+            return SlotToken(token);
+        }
+        let base_count = self
+            .materializer
+            .mapped_base
+            .as_ref()
+            .map_or(0, |base| base.slot_count());
+        let total_slots = base_count + self.materializer.slots.len() + self.slots.len();
+        let token = SlotToken(total_slots as u32);
+        self.slots.insert(slot, token);
+        self.materializer
+            .workspace
+            .ensure_slot_count(total_slots + 1);
+        token
+    }
+
+    fn predicate_cell(&mut self, pred_str: &str) -> Cell {
+        let predicate = Predicate::new(pred_str);
+        if let Some(cell) = self.predicates.get(&predicate) {
+            return *cell;
+        }
+        if let Some(cell) = self.materializer.predicates.get(&predicate) {
+            return *cell;
+        }
+        if let Some(token) = self
+            .materializer
+            .mapped_base
+            .as_ref()
+            .and_then(|base| base.predicate_token(predicate.as_str()))
+        {
+            return Cell(u64::from(token));
+        }
+        let base_count = self
+            .materializer
+            .mapped_base
+            .as_ref()
+            .map_or(0, |base| base.predicate_count());
+        let cell =
+            Cell((base_count + self.materializer.predicates.len() + self.predicates.len()) as u64);
+        self.predicates.insert(predicate, cell);
+        cell
+    }
+
+    fn literal_cell(&mut self, lit_str: &str) -> Cell {
+        let literal = Literal::new(lit_str);
+        if let Some(cell) = self.literals.get(&literal) {
+            return *cell;
+        }
+        if let Some(cell) = self.materializer.literals.get(&literal) {
+            return *cell;
+        }
+        if let Some(token) = self
+            .materializer
+            .mapped_base
+            .as_ref()
+            .and_then(|base| base.literal_token(literal.as_str()))
+        {
+            return Cell(VM_LITERAL_BASE + u64::from(token));
+        }
+        let base_count = self
+            .materializer
+            .mapped_base
+            .as_ref()
+            .map_or(0, |base| base.literal_count());
+        let offset =
+            (base_count + self.materializer.literal_values.len() + self.literals.len()) as u64;
+        let value = VM_LITERAL_BASE
+            .checked_add(offset)
+            .expect("VM literal token overflow");
+        let cell = Cell(value);
+        self.literals.insert(literal, cell);
+        cell
+    }
+
+    pub(crate) fn compile_semantic_trial(
+        &mut self,
+        view: &crate::transaction_ast::TransactionView<'_>,
+    ) -> Result<
+        (
+            crate::stack_vm::IntentProgram,
+            std::collections::BTreeMap<String, EntityId>,
+        ),
+        String,
+    > {
+        use crate::stack_vm::Instruction;
+        use crate::transaction_ast::{AtomRefView, TransactionOpView};
+
+        let mut bindings = std::collections::BTreeMap::new();
+        let mut instructions = Vec::with_capacity(view.operations.len() * 4);
+        let mut local_entity_count = 0;
+
+        for op in view.operations {
+            match op {
+                TransactionOpView::Allocate { result } => {
+                    if bindings.contains_key(*result) {
+                        return Err(format!("duplicate allocation for symbol '{result}'"));
+                    }
+                    let entity_id = self.materializer.workspace.next_entity() + local_entity_count;
+                    if entity_id >= VM_LITERAL_BASE {
+                        return Err("entity allocator exhausted the VM atom namespace".to_owned());
+                    }
+                    local_entity_count += 1;
+                    let entity = EntityId::new(entity_id);
+                    bindings.insert((*result).to_owned(), entity);
+                    instructions.push(Instruction::allocate_discard());
+                }
+                TransactionOpView::ExpectWorld { .. } => {}
+                TransactionOpView::ExpectObject { slot, expected } => {
+                    let slot_token = self.slot_token(slot);
+                    let expected_cell = match expected {
+                        AtomRefView::Entity(e) => Cell(e.0),
+                        AtomRefView::Literal(l) => self.literal_cell(l),
+                        AtomRefView::Symbol(s) => Cell(
+                            bindings
+                                .get(*s)
+                                .copied()
+                                .ok_or_else(|| format!("use of undefined symbol '{s}'"))?
+                                .value(),
+                        ),
+                    };
+                    instructions.push(Instruction::expect_object(slot_token, expected_cell));
+                }
+                TransactionOpView::Define {
+                    slot,
+                    subject,
+                    predicate,
+                    object,
+                } => {
+                    let slot_token = self.slot_token(slot);
+                    let sub_cell = match subject {
+                        AtomRefView::Entity(e) => Cell(e.0),
+                        AtomRefView::Literal(l) => self.literal_cell(l),
+                        AtomRefView::Symbol(s) => Cell(
+                            bindings
+                                .get(*s)
+                                .copied()
+                                .ok_or_else(|| format!("use of undefined symbol '{s}'"))?
+                                .value(),
+                        ),
+                    };
+                    let pred_cell = self.predicate_cell(predicate);
+                    let obj_cell = match object {
+                        AtomRefView::Entity(e) => Cell(e.0),
+                        AtomRefView::Literal(l) => self.literal_cell(l),
+                        AtomRefView::Symbol(s) => Cell(
+                            bindings
+                                .get(*s)
+                                .copied()
+                                .ok_or_else(|| format!("use of undefined symbol '{s}'"))?
+                                .value(),
+                        ),
+                    };
+                    instructions.extend([
+                        Instruction::push(sub_cell),
+                        Instruction::push(pred_cell),
+                        Instruction::push(obj_cell),
+                        Instruction::define(slot_token),
+                    ]);
+                }
+                TransactionOpView::Forget { slot } => {
+                    let slot_token = self.slot_token(slot);
+                    instructions.push(Instruction::forget(slot_token));
+                }
+                TransactionOpView::Reject => {
+                    instructions.push(Instruction::reject());
+                }
+            }
+        }
+
+        Ok((
+            crate::stack_vm::IntentProgram::new(0, instructions),
+            bindings,
+        ))
     }
 }
 
@@ -1585,6 +2561,51 @@ fn resolve_atom(
 /// Stage 6A's in-memory publication control. It appends every accepted frame to
 /// the infallible store, then changes the global reader head exactly once.
 impl Database<MemoryCommitStore> {
+    pub fn commit_mixed_epoch(
+        &self,
+        intents: Vec<crate::queued_controller::ControllerIntent>,
+        materializer: &mut VmEpochMaterializer,
+    ) -> MixedEpochPlan {
+        let _commit_guard = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let base = self.snapshot();
+        let validators = self
+            .validators
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        if let Err(e) = materializer.synchronize_to(&base) {
+            panic!("fatal materializer synchronization failure: {e}");
+        }
+
+        let plan = materializer.materialize_mixed(base, intents, &validators);
+
+        if !plan.is_empty() {
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for frame in plan.frames() {
+                match store.append(frame.clone()) {
+                    Ok(()) => {}
+                    Err(never) => match never {},
+                }
+            }
+            drop(store);
+            *self
+                .current
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = plan.tail();
+        }
+
+        materializer.version = plan.tail().version();
+
+        plan
+    }
+
     pub fn commit_queued_epoch(&self, intents: Vec<QueuedIntent>) -> EpochPlan {
         let _commit_guard = self
             .commit_lock
@@ -2414,6 +3435,612 @@ mod tests {
         assert!(used_vm);
         assert_eq!(actual.frames(), expected.frames());
         assert_eq!(actual.tail().id(), expected.tail().id());
+    }
+
+    #[test]
+    fn global_token_isolation_across_semantic_intents() {
+        use crate::transaction_ast::{AtomRef, SemanticIntent, TransactionAST, TransactionOp};
+
+        let mut materializer = VmEpochMaterializer::new(1);
+        let base = Arc::new(World::genesis());
+
+        // Intent 1 uses "book/status"
+        let ast1 = TransactionAST::new(
+            10,
+            vec![
+                TransactionOp::Allocate {
+                    result: "b1".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "book/status".to_owned(),
+                    subject: AtomRef::Symbol("b1".to_owned()),
+                    predicate: "is".to_owned(),
+                    object: AtomRef::Literal("available".to_owned()),
+                },
+            ],
+        );
+        let intent1 =
+            crate::queued_controller::ControllerIntent::Semantic(SemanticIntent::new(ast1));
+
+        // Intent 2 uses "patron/name"
+        let ast2 = TransactionAST::new(
+            11,
+            vec![
+                TransactionOp::Allocate {
+                    result: "p1".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "patron/name".to_owned(),
+                    subject: AtomRef::Symbol("p1".to_owned()),
+                    predicate: "is".to_owned(),
+                    object: AtomRef::Literal("alice".to_owned()),
+                },
+            ],
+        );
+        let intent2 =
+            crate::queued_controller::ControllerIntent::Semantic(SemanticIntent::new(ast2));
+
+        let plan = materializer.materialize_mixed(base.clone(), vec![intent1, intent2], &[]);
+        assert_eq!(plan.outcomes().len(), 2);
+        assert!(matches!(
+            plan.outcomes()[0],
+            MixedEpochOutcome::SemanticAccepted(_)
+        ));
+        assert!(matches!(
+            plan.outcomes()[1],
+            MixedEpochOutcome::SemanticAccepted(_)
+        ));
+
+        // Verify distinct slot tokens in materializer
+        let slot_book = materializer.slots.get(&SlotId::new("book/status")).unwrap();
+        let slot_patron = materializer.slots.get(&SlotId::new("patron/name")).unwrap();
+        assert_ne!(slot_book, slot_patron);
+
+        // Verify resolution in published tail world
+        let tail = plan.tail();
+        let book_val = tail
+            .resolve(&SlotId::new("book/status"))
+            .expect("book status resolved");
+        let patron_val = tail
+            .resolve(&SlotId::new("patron/name"))
+            .expect("patron name resolved");
+        assert_eq!(book_val.object, Atom::Literal(Literal::new("available")));
+        assert_eq!(patron_val.object, Atom::Literal(Literal::new("alice")));
+    }
+
+    #[test]
+    fn three_intent_mixed_batch_validator_rollback() {
+        use crate::transaction_ast::{AtomRef, SemanticIntent, TransactionAST, TransactionOp};
+
+        let mut materializer = VmEpochMaterializer::new(1);
+        let base = Arc::new(World::genesis());
+
+        // 1. QueuedIntent defines A ("slot_a" = "val_a")
+        let mut intent1 = QueuedIntent::new();
+        intent1.define_fact(
+            SlotId::new("slot_a"),
+            state_fact(EntityId::new(10), "val_a"),
+        );
+        let c_intent1 = crate::queued_controller::ControllerIntent::Queued(intent1);
+
+        // 2. SemanticIntent reads A ("slot_a"), defines B ("slot_b" = "val_b")
+        let ast2 = TransactionAST::new(
+            20,
+            vec![
+                TransactionOp::ExpectObject {
+                    slot: "slot_a".to_owned(),
+                    expected: AtomRef::Literal("val_a".to_owned()),
+                },
+                TransactionOp::Allocate {
+                    result: "b_ent".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "slot_b".to_owned(),
+                    subject: AtomRef::Symbol("b_ent".to_owned()),
+                    predicate: "is".to_owned(),
+                    object: AtomRef::Literal("val_b".to_owned()),
+                },
+            ],
+        );
+        let c_intent2 =
+            crate::queued_controller::ControllerIntent::Semantic(SemanticIntent::new(ast2));
+
+        // 3. SemanticIntent defines C ("slot_c_failed" = "val_c")
+        let ast3 = TransactionAST::new(
+            30,
+            vec![
+                TransactionOp::Allocate {
+                    result: "c_ent".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "slot_c_failed".to_owned(),
+                    subject: AtomRef::Symbol("c_ent".to_owned()),
+                    predicate: "is".to_owned(),
+                    object: AtomRef::Literal("val_c".to_owned()),
+                },
+            ],
+        );
+        let c_intent3 =
+            crate::queued_controller::ControllerIntent::Semantic(SemanticIntent::new(ast3));
+
+        // Host validator that rejects any candidate world defining "slot_c_failed"
+        let validator: Validator = Arc::new(|candidate| {
+            if candidate.resolve(&SlotId::new("slot_c_failed")).is_some() {
+                Err("rejected by host validator".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+
+        let allocator_before = materializer.workspace.next_entity();
+        let plan = materializer.materialize_mixed(
+            base.clone(),
+            vec![c_intent1, c_intent2, c_intent3],
+            &[validator],
+        );
+
+        assert_eq!(plan.outcomes().len(), 3);
+        assert!(
+            matches!(plan.outcomes()[0], MixedEpochOutcome::QueuedAccepted(_)),
+            "Intent 1 accepted"
+        );
+        assert!(
+            matches!(plan.outcomes()[1], MixedEpochOutcome::SemanticAccepted(_)),
+            "Intent 2 accepted and observed Intent 1"
+        );
+        assert!(
+            matches!(plan.outcomes()[2], MixedEpochOutcome::SemanticRejected(_)),
+            "Intent 3 rejected by validator"
+        );
+
+        let tail = plan.tail();
+
+        // B observed A
+        assert_eq!(
+            tail.resolve(&SlotId::new("slot_a")).unwrap().object,
+            Atom::Literal(Literal::new("val_a"))
+        );
+        // B committed
+        assert_eq!(
+            tail.resolve(&SlotId::new("slot_b")).unwrap().object,
+            Atom::Literal(Literal::new("val_b"))
+        );
+        // C is absent
+        assert!(tail.resolve(&SlotId::new("slot_c_failed")).is_none());
+
+        // Vocabulary introduced only by C is absent from materializer dictionary
+        assert!(
+            materializer
+                .slots
+                .get(&SlotId::new("slot_c_failed"))
+                .is_none()
+        );
+
+        // Entity allocator is unchanged by C's failed allocation (Intent 2 allocated 1 entity)
+        assert_eq!(materializer.workspace.next_entity(), allocator_before + 1);
+    }
+
+    #[test]
+    fn mixed_batch_epoch_contract_and_versioning() {
+        use crate::transaction_ast::{AtomRef, SemanticIntent, TransactionAST, TransactionOp};
+
+        let mut materializer = VmEpochMaterializer::new(1);
+        let base = Arc::new(World::genesis());
+        assert_eq!(base.version(), 0);
+
+        let ast1 = TransactionAST::new(
+            100,
+            vec![
+                TransactionOp::Allocate {
+                    result: "e1".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "slot_x".to_owned(),
+                    subject: AtomRef::Symbol("e1".to_owned()),
+                    predicate: "is".to_owned(),
+                    object: AtomRef::Literal("v1".to_owned()),
+                },
+            ],
+        );
+
+        let ast2 = TransactionAST::new(
+            101,
+            vec![
+                TransactionOp::ExpectObject {
+                    slot: "slot_x".to_owned(),
+                    expected: AtomRef::Literal("v1".to_owned()),
+                },
+                TransactionOp::Allocate {
+                    result: "e2".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "slot_y".to_owned(),
+                    subject: AtomRef::Symbol("e2".to_owned()),
+                    predicate: "is".to_owned(),
+                    object: AtomRef::Literal("v2".to_owned()),
+                },
+            ],
+        );
+
+        let plan = materializer.materialize_mixed(
+            base.clone(),
+            vec![
+                crate::queued_controller::ControllerIntent::Semantic(SemanticIntent::new(ast1)),
+                crate::queued_controller::ControllerIntent::Semantic(SemanticIntent::new(ast2)),
+            ],
+            &[],
+        );
+
+        // 1. Nonempty accepted batch advances version exactly once
+        assert_eq!(plan.tail().version(), 1);
+        assert_eq!(plan.frames().len(), 1);
+
+        // 2. Both accepted tickets share the exact same tail world ID and version
+        let w1 = match &plan.outcomes()[0] {
+            MixedEpochOutcome::SemanticAccepted(a) => a.world(),
+            _ => panic!("expected semantic accepted"),
+        };
+        let w2 = match &plan.outcomes()[1] {
+            MixedEpochOutcome::SemanticAccepted(a) => a.world(),
+            _ => panic!("expected semantic accepted"),
+        };
+        assert_eq!(w1.id(), w2.id());
+        assert_eq!(w1.version(), 1);
+        assert_eq!(w2.version(), 1);
+
+        // 3. Precondition in intent 2 saw intent 1's state
+        assert_eq!(
+            w2.resolve(&SlotId::new("slot_y")).unwrap().object,
+            Atom::Literal(Literal::new("v2"))
+        );
+
+        // 4. All-rejected batch advances version by 0 and entity allocator by 0
+        let ast_bad = TransactionAST::new(
+            102,
+            vec![TransactionOp::ExpectObject {
+                slot: "slot_x".to_owned(),
+                expected: AtomRef::Literal("nonexistent".to_owned()),
+            }],
+        );
+
+        let next_ent_before = materializer.workspace.next_entity();
+        let plan_bad = materializer.materialize_mixed(
+            plan.tail(),
+            vec![crate::queued_controller::ControllerIntent::Semantic(
+                SemanticIntent::new(ast_bad),
+            )],
+            &[],
+        );
+
+        assert_eq!(plan_bad.tail().version(), 1);
+        assert_eq!(plan_bad.frames().len(), 0);
+        assert_eq!(materializer.workspace.next_entity(), next_ent_before);
+    }
+
+    #[test]
+    fn non_genesis_bootstrap_semantic_intent() {
+        use crate::transaction_ast::{AtomRef, SemanticIntent, TransactionAST, TransactionOp};
+
+        let db = Database::new(MemoryCommitStore::new()).unwrap();
+        let mut tx = Transaction::new(db.snapshot());
+        let e_existing = tx.entity();
+        tx.define(
+            SlotId::new("existing/slot"),
+            Fact::new(
+                Atom::Entity(e_existing),
+                Predicate::new("has"),
+                Atom::Literal(Literal::new("value1")),
+            ),
+        );
+        let base_world = db.commit(tx).unwrap();
+        assert!(base_world.version() > 0);
+
+        let mut materializer = VmEpochMaterializer::new(1);
+        materializer.synchronize_to(&base_world).unwrap();
+
+        let ast = TransactionAST::new(
+            500,
+            vec![
+                TransactionOp::ExpectObject {
+                    slot: "existing/slot".to_owned(),
+                    expected: AtomRef::Literal("value1".to_owned()),
+                },
+                TransactionOp::Allocate {
+                    result: "new_ent".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "existing/slot".to_owned(),
+                    subject: AtomRef::Symbol("new_ent".to_owned()),
+                    predicate: "has".to_owned(),
+                    object: AtomRef::Literal("value2".to_owned()),
+                },
+            ],
+        );
+
+        let plan = materializer.materialize_mixed(
+            base_world.clone(),
+            vec![crate::queued_controller::ControllerIntent::Semantic(
+                SemanticIntent::new(ast),
+            )],
+            &[],
+        );
+
+        assert_eq!(plan.outcomes().len(), 1);
+        assert!(matches!(
+            plan.outcomes()[0],
+            MixedEpochOutcome::SemanticAccepted(_)
+        ));
+        let tail = plan.tail();
+        let updated = tail.resolve(&SlotId::new("existing/slot")).unwrap();
+        assert_eq!(updated.object, Atom::Literal(Literal::new("value2")));
+    }
+
+    #[test]
+    fn strict_commit_between_controller_batches() {
+        use crate::transaction_ast::{AtomRef, SemanticIntent, TransactionAST, TransactionOp};
+
+        let db = Database::new(MemoryCommitStore::new()).unwrap();
+        let mut materializer = VmEpochMaterializer::new(1);
+
+        // Batch A
+        let ast_a = TransactionAST::new(
+            1,
+            vec![
+                TransactionOp::Allocate {
+                    result: "a".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "batch_a/slot".to_owned(),
+                    subject: AtomRef::Symbol("a".to_owned()),
+                    predicate: "is".to_owned(),
+                    object: AtomRef::Literal("alpha".to_owned()),
+                },
+            ],
+        );
+        let plan_a = db.commit_mixed_epoch(
+            vec![crate::queued_controller::ControllerIntent::Semantic(
+                SemanticIntent::new(ast_a),
+            )],
+            &mut materializer,
+        );
+        assert_eq!(plan_a.tail().version(), 1);
+
+        // Strict commit without allocating an entity
+        let mut tx_strict = Transaction::new(db.snapshot());
+        tx_strict.define(
+            SlotId::new("strict/slot"),
+            Fact::new(
+                Atom::Entity(EntityId::new(1)),
+                Predicate::new("is"),
+                Atom::Literal(Literal::new("strict_val")),
+            ),
+        );
+        let strict_world = db.commit(tx_strict).unwrap();
+        assert_eq!(strict_world.version(), 2);
+
+        // Batch B must observe strict commit after synchronize_to
+        materializer.synchronize_to(&db.snapshot()).unwrap();
+        let ast_b = TransactionAST::new(
+            2,
+            vec![
+                TransactionOp::ExpectObject {
+                    slot: "strict/slot".to_owned(),
+                    expected: AtomRef::Literal("strict_val".to_owned()),
+                },
+                TransactionOp::Define {
+                    slot: "batch_b/slot".to_owned(),
+                    subject: AtomRef::Entity(crate::transaction_ast::EntityId(1)),
+                    predicate: "is".to_owned(),
+                    object: AtomRef::Literal("beta".to_owned()),
+                },
+            ],
+        );
+        let plan_b = db.commit_mixed_epoch(
+            vec![crate::queued_controller::ControllerIntent::Semantic(
+                SemanticIntent::new(ast_b),
+            )],
+            &mut materializer,
+        );
+
+        assert_eq!(plan_b.outcomes().len(), 1);
+        assert!(matches!(
+            plan_b.outcomes()[0],
+            MixedEpochOutcome::SemanticAccepted(_)
+        ));
+        assert_eq!(plan_b.tail().version(), 3);
+    }
+
+    #[test]
+    fn mapped_base_vocabulary_isolation() {
+        use crate::transaction_ast::{AtomRef, SemanticIntent, TransactionAST, TransactionOp};
+
+        let path = temporary_path("mapped-vocab-iso");
+        let snapshot_path = MmapVmSnapshot::path_for(&path);
+        let world_snap = {
+            let db = Database::new(FileCommitStore::open(&path).unwrap()).unwrap();
+            let mut tx = Transaction::new(db.snapshot());
+            let e = tx.entity();
+            tx.define(
+                SlotId::new("mapped/slot"),
+                Fact::new(
+                    Atom::Entity(e),
+                    Predicate::new("p_mapped"),
+                    Atom::Literal(Literal::new("l_mapped")),
+                ),
+            );
+            db.commit(tx).unwrap()
+        };
+
+        world_snap.materialize_query_projection();
+        let bytes = std::fs::read(&path).unwrap();
+        MmapVmSnapshot::create(&path, &bytes, 1, &world_snap, world_snap.vm_query()).unwrap();
+
+        let mmap_snapshot = MmapVmSnapshot::open(&path, &bytes).unwrap();
+        let mut materializer = VmEpochMaterializer::from_mmap(mmap_snapshot.clone()).unwrap();
+        let base = World::from_mmap(mmap_snapshot.clone());
+
+        // 1. Live committed slot
+        let ast_live = TransactionAST::new(
+            10,
+            vec![
+                TransactionOp::Allocate {
+                    result: "e1".to_owned(),
+                },
+                TransactionOp::Define {
+                    slot: "live/slot".to_owned(),
+                    subject: AtomRef::Symbol("e1".to_owned()),
+                    predicate: "p_live".to_owned(),
+                    object: AtomRef::Literal("l_live".to_owned()),
+                },
+            ],
+        );
+        let plan_live = materializer.materialize_mixed(
+            base.clone(),
+            vec![crate::queued_controller::ControllerIntent::Semantic(
+                SemanticIntent::new(ast_live),
+            )],
+            &[],
+        );
+        assert!(matches!(
+            plan_live.outcomes()[0],
+            MixedEpochOutcome::SemanticAccepted(_)
+        ));
+
+        // 2. Rejected intent proposing 3rd slot
+        let ast_rejected = TransactionAST::new(
+            11,
+            vec![
+                TransactionOp::ExpectObject {
+                    slot: "mapped/slot".to_owned(),
+                    expected: AtomRef::Literal("nonexistent".to_owned()),
+                },
+                TransactionOp::Define {
+                    slot: "rejected/slot".to_owned(),
+                    subject: AtomRef::Literal("sub".to_owned()),
+                    predicate: "p_rejected".to_owned(),
+                    object: AtomRef::Literal("l_rejected".to_owned()),
+                },
+            ],
+        );
+        let plan_rej = materializer.materialize_mixed(
+            plan_live.tail(),
+            vec![crate::queued_controller::ControllerIntent::Semantic(
+                SemanticIntent::new(ast_rejected),
+            )],
+            &[],
+        );
+        assert!(matches!(
+            plan_rej.outcomes()[0],
+            MixedEpochOutcome::SemanticRejected(_)
+        ));
+
+        // Verify vocabulary isolation:
+        assert!(
+            materializer
+                .mapped_base
+                .as_ref()
+                .unwrap()
+                .slot_token("mapped/slot")
+                .is_some()
+        );
+        assert!(materializer.slots.contains_key(&SlotId::new("live/slot")));
+        assert!(
+            !materializer
+                .slots
+                .contains_key(&SlotId::new("rejected/slot"))
+        );
+        assert!(
+            materializer
+                .mapped_base
+                .as_ref()
+                .unwrap()
+                .slot_token("rejected/slot")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&snapshot_path);
+    }
+
+    #[test]
+    fn randomized_mixed_epoch_differential_fuzzer() {
+        use crate::transaction_ast::{AtomRef, SemanticIntent, TransactionAST, TransactionOp};
+
+        let mut materializer = VmEpochMaterializer::new(1);
+        let mut current_world = Arc::new(World::genesis());
+        let mut seed = 0x9E3779B97F4A7C15u64;
+
+        let mut next_prng = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+
+        for batch_idx in 0..50 {
+            let intent_count = (next_prng() % 8 + 1) as usize;
+            let mut intents = Vec::with_capacity(intent_count);
+            let mut expected_queued = Vec::with_capacity(intent_count);
+
+            for i in 0..intent_count {
+                let is_semantic = (next_prng() % 2) == 0;
+                let is_valid = (next_prng() % 4) != 0; // 75% valid, 25% invalid
+
+                let slot_name = format!("fuzz_slot_{}", (next_prng() % 5));
+                let val_name = if is_valid {
+                    format!("val_{}_{i}", batch_idx)
+                } else {
+                    "invalid_expected_val".to_owned()
+                };
+
+                if is_semantic {
+                    let mut ops = Vec::new();
+                    if !is_valid {
+                        ops.push(TransactionOp::ExpectObject {
+                            slot: slot_name.clone(),
+                            expected: AtomRef::Literal("definitely_nonexistent_val".to_owned()),
+                        });
+                    }
+                    ops.push(TransactionOp::Allocate {
+                        result: "sym1".to_owned(),
+                    });
+                    ops.push(TransactionOp::Define {
+                        slot: slot_name,
+                        subject: AtomRef::Symbol("sym1".to_owned()),
+                        predicate: "is".to_owned(),
+                        object: AtomRef::Literal(val_name),
+                    });
+                    let ast = TransactionAST::new(batch_idx * 100 + i as u64, ops);
+                    intents.push(crate::queued_controller::ControllerIntent::Semantic(
+                        SemanticIntent::new(ast),
+                    ));
+                } else {
+                    let mut q = QueuedIntent::new();
+                    if !is_valid {
+                        q.expect_value(
+                            SlotId::new(&slot_name),
+                            state_fact(EntityId::new(99999), "bad"),
+                        );
+                    }
+                    let temp = q.entity();
+                    q.define(
+                        SlotId::new(&slot_name),
+                        IntentFact {
+                            subject: IntentAtom::Temporary(temp),
+                            predicate: Predicate::new("is"),
+                            object: IntentAtom::Literal(Literal::new(&val_name)),
+                        },
+                    );
+                    expected_queued.push(q.clone());
+                    intents.push(crate::queued_controller::ControllerIntent::Queued(q));
+                }
+            }
+
+            let mixed_plan = materializer.materialize_mixed(current_world.clone(), intents, &[]);
+            current_world = mixed_plan.tail();
+        }
+
+        assert!(current_world.version() > 0);
     }
 
     fn temporary_path(label: &str) -> PathBuf {
