@@ -1007,7 +1007,7 @@ const VM_LITERAL_BASE: u64 = 1 << 63;
 /// materializer. Durable intents remain the canonical journal representation;
 /// both live execution and recovery compile them through this same state.
 #[derive(Clone)]
-pub(crate) struct VmEpochMaterializer {
+pub struct VmEpochMaterializer {
     workspace: VmWorkspace,
     version: u64,
     mapped_base: Option<Arc<MmapVmSnapshot>>,
@@ -1019,7 +1019,7 @@ pub(crate) struct VmEpochMaterializer {
 }
 
 impl VmEpochMaterializer {
-    pub(crate) fn new(next_entity: u64) -> Self {
+    pub fn new(next_entity: u64) -> Self {
         Self {
             workspace: VmWorkspace::with_indexes_from(next_entity, 0, 32, 1_024, 1_024),
             version: 0,
@@ -1099,7 +1099,7 @@ impl VmEpochMaterializer {
         self.derive_vm_epoch(base, intents).map(|plan| (plan, true))
     }
 
-    pub(crate) fn materialize_mixed(
+    pub fn materialize_mixed(
         &mut self,
         base: Arc<World>,
         intents: Vec<crate::queued_controller::ControllerIntent>,

@@ -593,7 +593,7 @@ impl ControllerMetricsInner {
     }
 }
 
-pub(crate) enum ControllerIntent {
+pub enum ControllerIntent {
     Queued(QueuedIntent),
     Semantic(crate::transaction_ast::SemanticIntent),
 }

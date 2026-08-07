@@ -37,11 +37,13 @@ pub use mmap_store::{MmapCommitStore, MmapCommitStoreError};
 pub use mmap_vm_snapshot::MmapSnapshotMetadata;
 pub use queued::{
     AcceptedIntent, EpochOutcome, EpochPlan, IntentAtom, IntentFact, IntentPrecondition,
-    IntentRejection, QueuedIntent, RejectedIntent, TempEntity, derive_epoch, derive_epoch_world,
+    IntentRejection, QueuedIntent, RejectedIntent, TempEntity, VmEpochMaterializer, derive_epoch,
+    derive_epoch_world,
 };
 pub use queued_controller::{
-    BatchPolicy, CommitTicket, ControllerConfigError, ControllerStopped, QueuedControllerMetrics,
-    QueuedIntentController, SubmitError, TicketOutcome, TicketPhase, TicketRejection, TicketState,
+    BatchPolicy, CommitTicket, ControllerConfigError, ControllerIntent, ControllerStopped,
+    QueuedControllerMetrics, QueuedIntentController, SemanticCommitTicket, SemanticSubmitError,
+    SemanticTicketOutcome, SubmitError, TicketOutcome, TicketPhase, TicketRejection, TicketState,
     TicketWaitError,
 };
 
