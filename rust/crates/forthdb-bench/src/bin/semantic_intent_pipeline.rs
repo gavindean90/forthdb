@@ -1,13 +1,11 @@
-use forthdb_world::semantic_isa::InstructionStreamFrame;
-use forthdb_world::stack_vm::{IntentProgram, Workspace};
-use forthdb_world::transaction_ast::{AtomRef, TransactionAST, TransactionOp};
+use forthdb_world::stack_vm::{IntentProgram, Workspace, ExecutionOutcome};
+use forthdb_world::transaction_ast::{AtomRef, TransactionAST, TransactionOp, LoweringContext, TransactionView, TransactionOpView, OwnedOperationSource, BorrowedOperationSource, OperationSource};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const TOTAL_INTENTS: usize = 8_192;
-const REJECT_EVERY: usize = 17;
 const ROUNDS: usize = 50;
 
 struct CountingAllocator;
@@ -50,58 +48,77 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
-// NOTE: To get uninstrumented timings, comment out the global allocator.
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 #[derive(Clone, Copy, Debug)]
 struct Counters {
-    allocated_bytes: u64,
     allocations: u64,
-    deallocations: u64,
 }
 
 impl Counters {
     fn capture() -> Self {
         Self {
-            allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
             allocations: ALLOCATION_COUNT.load(Ordering::Relaxed),
-            deallocations: DEALLOCATION_COUNT.load(Ordering::Relaxed),
         }
     }
 
     fn since(self, before: Self) -> Self {
         Self {
-            allocated_bytes: self.allocated_bytes.saturating_sub(before.allocated_bytes),
             allocations: self.allocations.saturating_sub(before.allocations),
-            deallocations: self.deallocations.saturating_sub(before.deallocations),
         }
     }
 }
 
-fn ast_transaction(index: usize, reject_slot: &str) -> TransactionAST {
-    let mut operations = Vec::new();
-    let slot = if index % REJECT_EVERY == 0 {
-        reject_slot.to_string()
-    } else {
-        format!("phase1/accepted/{index}")
-    };
+struct Lcg { seed: u32 }
+impl Lcg {
+    fn next_u32(&mut self) -> u32 {
+        self.seed = self.seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.seed
+    }
+    fn next_string(&mut self, opts: &[&str]) -> String {
+        let idx = (self.next_u32() as usize) % opts.len();
+        opts[idx].to_string()
+    }
+    fn next_atom(&mut self) -> AtomRef {
+        match self.next_u32() % 2 {
+            0 => AtomRef::Literal(self.next_string(&["a", "b", "c", "d", "e", "f"])),
+            _ => AtomRef::Symbol(self.next_string(&["temp0", "temp1", "temp2"])),
+        }
+    }
+}
 
-    operations.push(TransactionOp::Allocate {
-        result: "temp".to_string(),
-    });
-    operations.push(TransactionOp::Define {
-        slot,
-        subject: AtomRef::Symbol("temp".to_string()),
-        predicate: "phase1_value".to_string(),
-        object: AtomRef::Literal(index.to_string()),
-    });
+fn generate_transaction(rng: &mut Lcg, op_count: usize) -> TransactionAST {
+    let slots = ["slot1", "slot2", "slot3", "slot4", "slot5", "slot6"];
+    let predicates = ["is", "has", "can", "should"];
+    let symbols = ["temp0", "temp1", "temp2"];
 
-    if index % REJECT_EVERY == 0 {
-        operations.push(TransactionOp::Reject);
+    let mut operations = Vec::with_capacity(op_count);
+    
+    // Allocate all local symbols up front
+    for sym in &symbols {
+        operations.push(TransactionOp::Allocate { result: sym.to_string() });
     }
 
-    TransactionAST::new(1, operations)
+    let remaining = op_count.saturating_sub(symbols.len());
+    for _ in 0..remaining {
+        let op = match rng.next_u32() % 3 {
+            0 => TransactionOp::ExpectObject { 
+                slot: rng.next_string(&slots), 
+                expected: rng.next_atom() 
+            },
+            1 => TransactionOp::Define {
+                slot: rng.next_string(&slots),
+                subject: AtomRef::Symbol(rng.next_string(&symbols)),
+                predicate: rng.next_string(&predicates),
+                object: rng.next_atom(),
+            },
+            _ => TransactionOp::Forget { slot: rng.next_string(&slots) },
+        };
+        operations.push(op);
+    }
+    
+    TransactionAST::new(rng.next_u32() as u64, operations)
 }
 
 fn time_batch<F>(mut f: F) -> (u64, u64, u64)
@@ -133,9 +150,7 @@ where
     }
 
     let mut min_counters = Counters {
-        allocated_bytes: u64::MAX,
         allocations: u64::MAX,
-        deallocations: u64::MAX,
     };
 
     for _ in 0..ROUNDS {
@@ -150,219 +165,69 @@ where
     min_counters
 }
 
-fn main() {
-    let reject_slot = "phase1/reject";
-
-    println!("Phase                 | min ns | med ns | max ns | allocs");
-    println!("------------------------------------------------------------");
-
-    let t = TOTAL_INTENTS as u64;
-
-    // 1. AST Build
-    let (min, med, max) = time_batch(|| {
-        for i in 0..TOTAL_INTENTS {
-            black_box(ast_transaction(i, reject_slot));
-        }
-    });
-    let allocs = allocs_batch(|| {
-        for i in 0..TOTAL_INTENTS {
-            black_box(ast_transaction(i, reject_slot));
-        }
-    });
-    println!(
-        "AST build             | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
-    );
-
-    // Prepare ASTs for phase 2
-    let mut asts = Vec::with_capacity(TOTAL_INTENTS);
-    for i in 0..TOTAL_INTENTS {
-        asts.push(ast_transaction(i, reject_slot));
+fn run_matrix_benchmark(name: &str, asts: &[TransactionAST], t: u64) {
+    let mut native_views = Vec::with_capacity(asts.len());
+    for ast in asts {
+        let view_ops: Vec<TransactionOpView> = (0..ast.operations.len())
+            .map(|idx| OwnedOperationSource(&ast.operations).operation(idx))
+            .collect();
+        let view_ops_leaked = Box::leak(view_ops.into_boxed_slice());
+        native_views.push(TransactionView::borrowed(ast.namespace, view_ops_leaked));
     }
-
-    // 2a. Validation & Lowering (One-shot)
-    let (min, med, max) = time_batch(|| {
-        for ast in &asts {
-            black_box(ast.lower_to_sisa().unwrap());
-        }
-    });
-    let allocs = allocs_batch(|| {
-        for ast in &asts {
-            black_box(ast.lower_to_sisa().unwrap());
-        }
-    });
-    println!(
-        "Lowering (One-shot)   | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
-    );
-
-    // 2b. Validation & Lowering (Pooled)
-    let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
-    let (min, med, max) = time_batch(|| {
-        for ast in &asts {
-            let frame = ast.lower_to_sisa_with(&mut ctx).unwrap();
-            ctx.reclaim(frame);
-        }
-    });
-    let allocs = allocs_batch(|| {
-        for ast in &asts {
-            let frame = ast.lower_to_sisa_with(&mut ctx).unwrap();
-            ctx.reclaim(frame);
-        }
-    });
-    println!(
-        "Lowering (Pooled)     | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
-    );
-
-    // Prepare programs for phase 3
-    let mut programs = Vec::with_capacity(TOTAL_INTENTS);
-    for ast in &asts {
+    
+    let mut programs = Vec::with_capacity(asts.len());
+    for ast in asts {
         let frame = ast.lower_to_sisa().unwrap();
         programs.push(IntentProgram::new(frame.local_count, frame.instructions));
     }
 
-    // 3. VM Execution
-    let mut workspace =
-        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
+    println!("\n=== {} ===", name);
+    println!("Path                            | min ns | med ns | max ns | Allocations");
+    println!("------------------------------------------------------------------------");
+    
+    // 1. Predecoded VM
+    let mut workspace = Workspace::with_capacity(TOTAL_INTENTS + 1, 64, TOTAL_INTENTS * 4, TOTAL_INTENTS * 4);
     let (min, med, max) = time_batch(|| {
+        let mut acc_acc = 0;
+        let mut acc_rej = 0;
+        let mut acc_hash = 0u64;
+        for program in &programs {
+            match workspace.execute(program) {
+                ExecutionOutcome::Accepted => acc_acc += 1,
+                ExecutionOutcome::Rejected(_) => acc_rej += 1,
+            }
+            acc_hash = acc_hash.wrapping_add(workspace.semantic_hash());
+        }
+        black_box((acc_acc, acc_rej, acc_hash));
+    });
+    let allocs = allocs_batch(|| {
         for program in &programs {
             black_box(workspace.execute(program));
         }
     });
-    let allocs = allocs_batch(|| {
-        for program in &programs {
-            black_box(workspace.execute(program));
-        }
-    });
     println!(
-        "VM execution          | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
+        "{:<31} | {:>6} | {:>6} | {:>6} | {:>11}",
+        "Predecoded VM", min / t, med / t, max / t, allocs.allocations / t
     );
-
-    // 4. One-Shot Full Pipeline
-    let mut workspace =
-        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
+    
+    // 2. Preconstructed Borrowed View -> Transient Execute
+    let mut workspace = Workspace::with_capacity(TOTAL_INTENTS + 1, 64, TOTAL_INTENTS * 4, TOTAL_INTENTS * 4);
+    let mut ctx = LoweringContext::with_capacity(128, 128);
     let (min, med, max) = time_batch(|| {
-        for i in 0..TOTAL_INTENTS {
-            let ast = ast_transaction(i, reject_slot);
-            let frame = ast.lower_to_sisa().unwrap();
-            let program = IntentProgram::new(frame.local_count, frame.instructions);
-            black_box(workspace.execute(&program));
-        }
-    });
-    let allocs = allocs_batch(|| {
-        for i in 0..TOTAL_INTENTS {
-            let ast = ast_transaction(i, reject_slot);
-            let frame = ast.lower_to_sisa().unwrap();
-            let program = IntentProgram::new(frame.local_count, frame.instructions);
-            black_box(workspace.execute(&program));
-        }
-    });
-    println!(
-        "Full Pipe (One-shot)  | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
-    );
-
-    // 5. Pooled Full Pipeline
-    let mut workspace =
-        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
-    let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
-    let (min, med, max) = time_batch(|| {
-        for i in 0..TOTAL_INTENTS {
-            let ast = ast_transaction(i, reject_slot);
-            let frame = ast.lower_to_sisa_with(&mut ctx).unwrap();
-            let program = IntentProgram::new(frame.local_count, frame.instructions.clone());
-            black_box(workspace.execute(&program));
-            ctx.reclaim(frame);
-        }
-    });
-    let allocs = allocs_batch(|| {
-        for i in 0..TOTAL_INTENTS {
-            let ast = ast_transaction(i, reject_slot);
-            let frame = ast.lower_to_sisa_with(&mut ctx).unwrap();
-            let program = IntentProgram::new(frame.local_count, frame.instructions.clone());
-            black_box(workspace.execute(&program));
-            ctx.reclaim(frame);
-        }
-    });
-    println!(
-        "Full Pipe (Pooled)    | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
-    );
-
-    // 6. Native Borrowed -> Owned Frame - Pooled
-    // We preconstruct the views to simulate the input already being in borrowed view form.
-    let mut native_views = Vec::with_capacity(TOTAL_INTENTS);
-    let mut native_asts = Vec::with_capacity(TOTAL_INTENTS);
-    for i in 0..TOTAL_INTENTS {
-        native_asts.push(ast_transaction(i, reject_slot));
-    }
-    for ast in &native_asts {
-        let view_ops: Vec<TransactionOpView> = (0..ast.operations.len())
-            .map(|idx| OwnedOperationSource(&ast.operations).operation(idx))
-            .collect();
-        // Since we need the views to live as long as the benchmark, we leak them just for benchmark purposes
-        let view_ops_leaked = Box::leak(view_ops.into_boxed_slice());
-        native_views.push(TransactionView::borrowed(ast.namespace, view_ops_leaked));
-    }
-    let mut workspace =
-        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
-    let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
-    use forthdb_world::transaction_ast::{OwnedOperationSource, OperationSource, TransactionView, TransactionOpView, BorrowedOperationSource};
-    let (min, med, max) = time_batch(|| {
-        for view in &native_views {
-            let frame = view.lower_to_sisa_with(&mut ctx).unwrap();
-            let program = IntentProgram::new(frame.local_count, frame.instructions.clone());
-            black_box(workspace.execute(&program));
-            ctx.reclaim(frame);
-        }
-    });
-    let allocs = allocs_batch(|| {
-        for view in &native_views {
-            let frame = view.lower_to_sisa_with(&mut ctx).unwrap();
-            let program = IntentProgram::new(frame.local_count, frame.instructions.clone());
-            black_box(workspace.execute(&program));
-            ctx.reclaim(frame);
-        }
-    });
-    println!(
-        "Native Borrowed Frame | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
-    );
-
-    // 7. Native Borrowed -> Transient Execute
-    let mut workspace =
-        Workspace::with_capacity(TOTAL_INTENTS + 1, 16, TOTAL_INTENTS, TOTAL_INTENTS);
-    let mut ctx = forthdb_world::transaction_ast::LoweringContext::new();
-    let (min, med, max) = time_batch(|| {
+        let mut acc_acc = 0;
+        let mut acc_rej = 0;
+        let mut acc_hash = 0u64;
         for view in &native_views {
             let source = BorrowedOperationSource(view.operations);
             ctx.with_lowered(view.namespace, &source, |program| {
-                black_box(workspace.execute_instructions(program.local_count, program.instructions));
+                match workspace.execute_instructions(program.local_count, program.instructions) {
+                    ExecutionOutcome::Accepted => acc_acc += 1,
+                    ExecutionOutcome::Rejected(_) => acc_rej += 1,
+                }
             }).unwrap();
+            acc_hash = acc_hash.wrapping_add(workspace.semantic_hash());
         }
+        black_box((acc_acc, acc_rej, acc_hash));
     });
     let allocs = allocs_batch(|| {
         for view in &native_views {
@@ -373,15 +238,80 @@ fn main() {
         }
     });
     println!(
-        "Transient Execute     | {:>6} | {:>6} | {:>6} | {:>6}",
-        min / t,
-        med / t,
-        max / t,
-        allocs.allocations / t
+        "{:<31} | {:>6} | {:>6} | {:>6} | {:>11}",
+        "Preconstructed Borrowed View", min / t, med / t, max / t, allocs.allocations / t
     );
-    println!("============================================================");
+    
+    // 3. Construct Borrowed View -> Transient Execute
+    let mut workspace = Workspace::with_capacity(TOTAL_INTENTS + 1, 64, TOTAL_INTENTS * 4, TOTAL_INTENTS * 4);
+    let mut ctx = LoweringContext::with_capacity(128, 128);
+    let (min, med, max) = time_batch(|| {
+        let mut acc_acc = 0;
+        let mut acc_rej = 0;
+        let mut acc_hash = 0u64;
+        for ast in asts {
+            let view_ops: Vec<TransactionOpView> = (0..ast.operations.len())
+                .map(|idx| OwnedOperationSource(&ast.operations).operation(idx))
+                .collect();
+            let view = TransactionView::borrowed(ast.namespace, &view_ops);
+            let source = BorrowedOperationSource(view.operations);
+            ctx.with_lowered(view.namespace, &source, |program| {
+                match workspace.execute_instructions(program.local_count, program.instructions) {
+                    ExecutionOutcome::Accepted => acc_acc += 1,
+                    ExecutionOutcome::Rejected(_) => acc_rej += 1,
+                }
+            }).unwrap();
+            acc_hash = acc_hash.wrapping_add(workspace.semantic_hash());
+        }
+        black_box((acc_acc, acc_rej, acc_hash));
+    });
+    let allocs = allocs_batch(|| {
+        for ast in asts {
+            let view_ops: Vec<TransactionOpView> = (0..ast.operations.len())
+                .map(|idx| OwnedOperationSource(&ast.operations).operation(idx))
+                .collect();
+            let view = TransactionView::borrowed(ast.namespace, &view_ops);
+            let source = BorrowedOperationSource(view.operations);
+            ctx.with_lowered(view.namespace, &source, |program| {
+                black_box(workspace.execute_instructions(program.local_count, program.instructions));
+            }).unwrap();
+        }
+    });
+    println!(
+        "{:<31} | {:>6} | {:>6} | {:>6} | {:>11}",
+        "Construct Borrowed View", min / t, med / t, max / t, allocs.allocations / t
+    );
+}
 
-    // Calculate transactions per second for the pooled full pipeline (based on median time)
-    let tps = 1_000_000_000u64 / (med / t);
-    println!("Pooled Transactions/Sec: {}", tps);
+fn main() {
+    let mut rng = Lcg { seed: 12345 };
+    
+    let mut random_asts = Vec::with_capacity(TOTAL_INTENTS);
+    for _ in 0..TOTAL_INTENTS {
+        let op_count = (rng.next_u32() % 16 + 1) as usize; // 1 to 16 ops
+        let mut ast = generate_transaction(&mut rng, op_count);
+        while ast.lower_to_sisa().is_err() {
+            ast = generate_transaction(&mut rng, op_count);
+        }
+        random_asts.push(ast);
+    }
+    
+    let mut small_asts = Vec::with_capacity(TOTAL_INTENTS);
+    for _ in 0..TOTAL_INTENTS {
+        let mut ast = generate_transaction(&mut rng, 2);
+        while ast.lower_to_sisa().is_err() { ast = generate_transaction(&mut rng, 2); }
+        small_asts.push(ast);
+    }
+    
+    let mut large_asts = Vec::with_capacity(TOTAL_INTENTS);
+    for _ in 0..TOTAL_INTENTS {
+        let mut ast = generate_transaction(&mut rng, 64);
+        while ast.lower_to_sisa().is_err() { ast = generate_transaction(&mut rng, 64); }
+        large_asts.push(ast);
+    }
+    
+    println!("Transactions executed per benchmark round: {}", TOTAL_INTENTS);
+    run_matrix_benchmark("Mixed Size (1-16 ops)", &random_asts, TOTAL_INTENTS as u64);
+    run_matrix_benchmark("Small Size (2 ops)", &small_asts, TOTAL_INTENTS as u64);
+    run_matrix_benchmark("Large Size (64 ops)", &large_asts, TOTAL_INTENTS as u64);
 }
