@@ -28,6 +28,9 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Steady-State Semantic Ingress Benchmark
+        run: cargo run --manifest-path rust/Cargo.toml --release --bin semantic_ingress_steady_state
+
       - name: Semantic Intent AST to SISA Pipeline Benchmark
         run: cargo run --manifest-path rust/Cargo.toml --release --bin semantic_intent_pipeline
 
