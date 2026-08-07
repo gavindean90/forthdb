@@ -179,7 +179,9 @@ fn run_workload(
     let elapsed = started.elapsed();
     let metrics = controller.metrics();
 
-    assert_eq!(database.snapshot().version(), base_version + total as u64);
+    // The controller now publishes one world per accepted epoch, not one world
+    // per intent. Version advancement therefore tracks committed epochs.
+    assert_eq!(database.snapshot().version(), base_version + metrics.epochs);
     assert_eq!(metrics.submitted, total as u64);
     assert_eq!(metrics.claimed, total as u64);
     assert_eq!(metrics.accepted, total as u64);
