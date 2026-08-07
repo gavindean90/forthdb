@@ -3,10 +3,10 @@ use crate::stack_vm::{Cell, Instruction, Opcode, SlotToken};
 use forthdb_core::{Literal, Predicate, SlotId};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct EntityId(pub u64);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct WorldId(pub u64);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +47,128 @@ pub struct TransactionAST {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AtomRefView<'a> {
+    Entity(EntityId),
+    Literal(&'a str),
+    Symbol(&'a str),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TransactionOpView<'a> {
+    Allocate {
+        result: &'a str,
+    },
+    ExpectWorld {
+        expected: WorldId,
+    },
+    ExpectObject {
+        slot: &'a str,
+        expected: AtomRefView<'a>,
+    },
+    Define {
+        slot: &'a str,
+        subject: AtomRefView<'a>,
+        predicate: &'a str,
+        object: AtomRefView<'a>,
+    },
+    Forget {
+        slot: &'a str,
+    },
+    Reject,
+}
+
+pub trait OperationSource<'a> {
+    fn len(&self) -> usize;
+    fn operation(&self, index: usize) -> TransactionOpView<'a>;
+}
+
+pub struct OwnedOperationSource<'a>(pub &'a [TransactionOp]);
+impl<'a> OperationSource<'a> for OwnedOperationSource<'a> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn operation(&self, index: usize) -> TransactionOpView<'a> {
+        match &self.0[index] {
+            TransactionOp::Allocate { result } => TransactionOpView::Allocate { result: result.as_str() },
+            TransactionOp::ExpectWorld { expected } => TransactionOpView::ExpectWorld { expected: expected.clone() },
+            TransactionOp::ExpectObject { slot, expected } => TransactionOpView::ExpectObject {
+                slot: slot.as_str(),
+                expected: match expected {
+                    AtomRef::Entity(e) => AtomRefView::Entity(e.clone()),
+                    AtomRef::Literal(l) => AtomRefView::Literal(l.as_str()),
+                    AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
+                },
+            },
+            TransactionOp::Define { slot, subject, predicate, object } => TransactionOpView::Define {
+                slot: slot.as_str(),
+                subject: match subject {
+                    AtomRef::Entity(e) => AtomRefView::Entity(e.clone()),
+                    AtomRef::Literal(l) => AtomRefView::Literal(l.as_str()),
+                    AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
+                },
+                predicate: predicate.as_str(),
+                object: match object {
+                    AtomRef::Entity(e) => AtomRefView::Entity(e.clone()),
+                    AtomRef::Literal(l) => AtomRefView::Literal(l.as_str()),
+                    AtomRef::Symbol(s) => AtomRefView::Symbol(s.as_str()),
+                },
+            },
+            TransactionOp::Forget { slot } => TransactionOpView::Forget { slot: slot.as_str() },
+            TransactionOp::Reject => TransactionOpView::Reject,
+        }
+    }
+}
+
+pub struct BorrowedOperationSource<'a>(pub &'a [TransactionOpView<'a>]);
+impl<'a> OperationSource<'a> for BorrowedOperationSource<'a> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn operation(&self, index: usize) -> TransactionOpView<'a> {
+        self.0[index]
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct TransactionView<'a> {
+    pub namespace: u64,
+    pub operations: &'a [TransactionOpView<'a>],
+}
+
+impl<'a> TransactionView<'a> {
+    pub fn borrowed(namespace: u64, operations: &'a [TransactionOpView<'a>]) -> Self {
+        Self { namespace, operations }
+    }
+
+    pub fn lower_to_sisa_with(
+        &self,
+        ctx: &mut LoweringContext,
+    ) -> Result<InstructionStreamFrame, LoweringError> {
+        let source = BorrowedOperationSource(self.operations);
+        ctx.lower_from_source(self.namespace, &source)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoweringError {
+    DuplicateAllocation(String),
+    UndefinedSymbol(String),
+    LocalCountOverflow,
+    UnsupportedDynamicSymbolExpectObject,
+}
+
+impl std::fmt::Display for LoweringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoweringError::DuplicateAllocation(sym) => write!(f, "duplicate allocation for symbol '{}'", sym),
+            LoweringError::UndefinedSymbol(sym) => write!(f, "use of undefined symbol '{}'", sym),
+            LoweringError::LocalCountOverflow => write!(f, "local count overflow"),
+            LoweringError::UnsupportedDynamicSymbolExpectObject => write!(f, "ExpectObject cannot take a dynamic symbol as expected value in SISA v1"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum StrRef {
     Alloc(usize),
     ExpectSlot(usize),
@@ -59,47 +181,47 @@ enum StrRef {
 }
 
 impl StrRef {
-    fn as_str<'a>(&self, ops: &'a [TransactionOp]) -> &'a str {
+    fn as_str<'a, S: OperationSource<'a>>(&self, ops: &S) -> &'a str {
         match *self {
-            StrRef::Alloc(idx) => match &ops[idx] {
-                TransactionOp::Allocate { result } => result.as_str(),
+            StrRef::Alloc(idx) => match ops.operation(idx) {
+                TransactionOpView::Allocate { result } => result,
                 _ => unreachable!(),
             },
-            StrRef::ExpectSlot(idx) => match &ops[idx] {
-                TransactionOp::ExpectObject { slot, .. } => slot.as_str(),
+            StrRef::ExpectSlot(idx) => match ops.operation(idx) {
+                TransactionOpView::ExpectObject { slot, .. } => slot,
                 _ => unreachable!(),
             },
-            StrRef::ExpectExpected(idx) => match &ops[idx] {
-                TransactionOp::ExpectObject {
-                    expected: AtomRef::Literal(l),
+            StrRef::ExpectExpected(idx) => match ops.operation(idx) {
+                TransactionOpView::ExpectObject {
+                    expected: AtomRefView::Literal(l),
                     ..
-                } => l.as_str(),
+                } => l,
                 _ => unreachable!(),
             },
-            StrRef::DefSlot(idx) => match &ops[idx] {
-                TransactionOp::Define { slot, .. } => slot.as_str(),
+            StrRef::DefSlot(idx) => match ops.operation(idx) {
+                TransactionOpView::Define { slot, .. } => slot,
                 _ => unreachable!(),
             },
-            StrRef::DefSubject(idx) => match &ops[idx] {
-                TransactionOp::Define {
-                    subject: AtomRef::Literal(l),
+            StrRef::DefSubject(idx) => match ops.operation(idx) {
+                TransactionOpView::Define {
+                    subject: AtomRefView::Literal(l),
                     ..
-                } => l.as_str(),
+                } => l,
                 _ => unreachable!(),
             },
-            StrRef::DefPredicate(idx) => match &ops[idx] {
-                TransactionOp::Define { predicate, .. } => predicate.as_str(),
+            StrRef::DefPredicate(idx) => match ops.operation(idx) {
+                TransactionOpView::Define { predicate, .. } => predicate,
                 _ => unreachable!(),
             },
-            StrRef::DefObject(idx) => match &ops[idx] {
-                TransactionOp::Define {
-                    object: AtomRef::Literal(l),
+            StrRef::DefObject(idx) => match ops.operation(idx) {
+                TransactionOpView::Define {
+                    object: AtomRefView::Literal(l),
                     ..
-                } => l.as_str(),
+                } => l,
                 _ => unreachable!(),
             },
-            StrRef::ForgetSlot(idx) => match &ops[idx] {
-                TransactionOp::Forget { slot } => slot.as_str(),
+            StrRef::ForgetSlot(idx) => match ops.operation(idx) {
+                TransactionOpView::Forget { slot } => slot,
                 _ => unreachable!(),
             },
         }
@@ -144,6 +266,199 @@ impl LoweringContext {
         self.dict_literals = std::mem::take(&mut frame.dictionary.literals);
         self.clear();
     }
+
+    pub fn lower_from_source<'a, S: OperationSource<'a>>(
+        &mut self,
+        namespace: u64,
+        source: &S,
+    ) -> Result<InstructionStreamFrame, LoweringError> {
+        self.clear();
+
+        for i in 0..source.len() {
+            let op = source.operation(i);
+            match op {
+                TransactionOpView::Allocate { result } => {
+                    if self
+                        .scratch_symbols
+                        .iter()
+                        .any(|r| r.as_str(source) == result)
+                    {
+                        return Err(LoweringError::DuplicateAllocation(result.to_string()));
+                    }
+                    self.scratch_symbols.push(StrRef::Alloc(i));
+                }
+                TransactionOpView::ExpectWorld { .. } => {}
+                TransactionOpView::ExpectObject { expected, .. } => {
+                    self.scratch_slots.push(StrRef::ExpectSlot(i));
+                    if let AtomRefView::Literal(_) = expected {
+                        self.scratch_literals.push(StrRef::ExpectExpected(i));
+                    }
+                }
+                TransactionOpView::Define {
+                    subject, object, ..
+                } => {
+                    self.scratch_slots.push(StrRef::DefSlot(i));
+                    self.scratch_predicates.push(StrRef::DefPredicate(i));
+                    if let AtomRefView::Literal(_) = subject {
+                        self.scratch_literals.push(StrRef::DefSubject(i));
+                    }
+                    if let AtomRefView::Literal(_) = object {
+                        self.scratch_literals.push(StrRef::DefObject(i));
+                    }
+                }
+                TransactionOpView::Forget { .. } => {
+                    self.scratch_slots.push(StrRef::ForgetSlot(i));
+                }
+                TransactionOpView::Reject => {}
+            }
+        }
+
+        let local_count = self.scratch_symbols.len() as u32;
+
+        self.scratch_slots
+            .sort_unstable_by_key(|&r| r.as_str(source));
+        self.scratch_slots
+            .dedup_by(|a, b| a.as_str(source) == b.as_str(source));
+
+        self.scratch_predicates
+            .sort_unstable_by_key(|&r| r.as_str(source));
+        self.scratch_predicates
+            .dedup_by(|a, b| a.as_str(source) == b.as_str(source));
+
+        self.scratch_literals
+            .sort_unstable_by_key(|&r| r.as_str(source));
+        self.scratch_literals
+            .dedup_by(|a, b| a.as_str(source) == b.as_str(source));
+
+        for (i, slot_ref) in self.scratch_slots.iter().enumerate() {
+            let token = SlotToken(i as u32);
+            self.dict_slots
+                .push((token, SlotId::new(slot_ref.as_str(source))));
+        }
+
+        for (i, pred_ref) in self.scratch_predicates.iter().enumerate() {
+            let cell = Cell(i as u64);
+            self.dict_predicates
+                .push((cell, Predicate::new(pred_ref.as_str(source))));
+        }
+
+        let literal_offset = self.scratch_predicates.len();
+        for (i, lit_ref) in self.scratch_literals.iter().enumerate() {
+            let cell = Cell((i + literal_offset) as u64);
+            self.dict_literals
+                .push((cell, Literal::new(lit_ref.as_str(source))));
+        }
+
+        let load_atom = |atom: &AtomRefView<'a>| -> Result<Instruction, LoweringError> {
+            match atom {
+                AtomRefView::Entity(e) => Ok(Instruction::push(Cell(e.0))),
+                AtomRefView::Literal(l) => {
+                    let idx = self
+                        .scratch_literals
+                        .binary_search_by_key(l, |&r| r.as_str(source))
+                        .unwrap();
+                    Ok(Instruction::push(Cell((idx + literal_offset) as u64)))
+                }
+                AtomRefView::Symbol(s) => {
+                    if let Some(local) = self
+                        .scratch_symbols
+                        .iter()
+                        .position(|&sym| sym.as_str(source) == *s)
+                    {
+                        Ok(Instruction::load_local(local as u32))
+                    } else {
+                        Err(LoweringError::UndefinedSymbol(s.to_string()))
+                    }
+                }
+            }
+        };
+
+        for i in 0..source.len() {
+            let op = source.operation(i);
+            match op {
+                TransactionOpView::Allocate { result } => {
+                    let local = self
+                        .scratch_symbols
+                        .iter()
+                        .position(|&sym| sym.as_str(source) == result)
+                        .unwrap() as u32;
+                    self.instructions.push(Instruction::allocate());
+                    self.instructions.push(Instruction::store_local(local));
+                }
+                TransactionOpView::ExpectWorld { expected } => {
+                    self.instructions.push(Instruction::raw(
+                        Opcode::ExpectObject,
+                        u32::MAX,
+                        expected.0,
+                    ));
+                }
+                TransactionOpView::ExpectObject { slot, expected } => {
+                    let token_idx = self
+                        .scratch_slots
+                        .binary_search_by_key(&slot, |&r| r.as_str(source))
+                        .unwrap() as u32;
+                    let cell = match expected {
+                        AtomRefView::Entity(e) => Cell(e.0),
+                        AtomRefView::Literal(l) => {
+                            let idx = self.scratch_literals.binary_search_by_key(&l, |&r| r.as_str(source)).unwrap();
+                            Cell((idx + literal_offset) as u64)
+                        }
+                        AtomRefView::Symbol(_) => return Err(LoweringError::UnsupportedDynamicSymbolExpectObject),
+                    };
+                    self.instructions.push(Instruction::raw(
+                        Opcode::ExpectObject,
+                        token_idx,
+                        cell.0,
+                    ));
+                }
+                TransactionOpView::Define {
+                    slot,
+                    subject,
+                    predicate,
+                    object,
+                } => {
+                    self.instructions.push(load_atom(&subject)?);
+                    let pred_idx = self
+                        .scratch_predicates
+                        .binary_search_by_key(&predicate, |&r| r.as_str(source))
+                        .unwrap();
+                    self.instructions
+                        .push(Instruction::push(Cell(pred_idx as u64)));
+                    self.instructions.push(load_atom(&object)?);
+                    let token_idx = self
+                        .scratch_slots
+                        .binary_search_by_key(&slot, |&r| r.as_str(source))
+                        .unwrap() as u32;
+                    self.instructions
+                        .push(Instruction::define(SlotToken(token_idx)));
+                }
+                TransactionOpView::Forget { slot } => {
+                    let token_idx = self
+                        .scratch_slots
+                        .binary_search_by_key(&slot, |&r| r.as_str(source))
+                        .unwrap() as u32;
+                    self.instructions
+                        .push(Instruction::forget(SlotToken(token_idx)));
+                }
+                TransactionOpView::Reject => {
+                    self.instructions.push(Instruction::reject());
+                }
+            }
+        }
+
+        let dict = StreamDictionary {
+            slots: std::mem::take(&mut self.dict_slots),
+            predicates: std::mem::take(&mut self.dict_predicates),
+            literals: std::mem::take(&mut self.dict_literals),
+        };
+
+        Ok(InstructionStreamFrame::new(
+            namespace,
+            dict,
+            local_count,
+            std::mem::take(&mut self.instructions),
+        ))
+    }
 }
 
 impl TransactionAST {
@@ -154,7 +469,7 @@ impl TransactionAST {
         }
     }
 
-    pub fn lower_to_sisa(&self) -> Result<InstructionStreamFrame, String> {
+    pub fn lower_to_sisa(&self) -> Result<InstructionStreamFrame, LoweringError> {
         let mut context = LoweringContext::new();
         self.lower_to_sisa_with(&mut context)
     }
@@ -162,192 +477,9 @@ impl TransactionAST {
     pub fn lower_to_sisa_with(
         &self,
         ctx: &mut LoweringContext,
-    ) -> Result<InstructionStreamFrame, String> {
-        ctx.clear();
-
-        for (i, op) in self.operations.iter().enumerate() {
-            match op {
-                TransactionOp::Allocate { result } => {
-                    let s = result.as_str();
-                    if ctx
-                        .scratch_symbols
-                        .iter()
-                        .any(|r| r.as_str(&self.operations) == s)
-                    {
-                        return Err(format!("duplicate allocation for symbol '{}'", s));
-                    }
-                    ctx.scratch_symbols.push(StrRef::Alloc(i));
-                }
-                TransactionOp::ExpectWorld { .. } => {}
-                TransactionOp::ExpectObject { expected, .. } => {
-                    ctx.scratch_slots.push(StrRef::ExpectSlot(i));
-                    if let AtomRef::Literal(_) = expected {
-                        ctx.scratch_literals.push(StrRef::ExpectExpected(i));
-                    }
-                }
-                TransactionOp::Define {
-                    subject, object, ..
-                } => {
-                    ctx.scratch_slots.push(StrRef::DefSlot(i));
-                    ctx.scratch_predicates.push(StrRef::DefPredicate(i));
-                    if let AtomRef::Literal(_) = subject {
-                        ctx.scratch_literals.push(StrRef::DefSubject(i));
-                    }
-                    if let AtomRef::Literal(_) = object {
-                        ctx.scratch_literals.push(StrRef::DefObject(i));
-                    }
-                }
-                TransactionOp::Forget { .. } => {
-                    ctx.scratch_slots.push(StrRef::ForgetSlot(i));
-                }
-                TransactionOp::Reject => {}
-            }
-        }
-
-        let local_count = ctx.scratch_symbols.len() as u32;
-
-        ctx.scratch_slots
-            .sort_unstable_by_key(|&r| r.as_str(&self.operations));
-        ctx.scratch_slots
-            .dedup_by(|a, b| a.as_str(&self.operations) == b.as_str(&self.operations));
-
-        ctx.scratch_predicates
-            .sort_unstable_by_key(|&r| r.as_str(&self.operations));
-        ctx.scratch_predicates
-            .dedup_by(|a, b| a.as_str(&self.operations) == b.as_str(&self.operations));
-
-        ctx.scratch_literals
-            .sort_unstable_by_key(|&r| r.as_str(&self.operations));
-        ctx.scratch_literals
-            .dedup_by(|a, b| a.as_str(&self.operations) == b.as_str(&self.operations));
-
-        for (i, slot_ref) in ctx.scratch_slots.iter().enumerate() {
-            let token = SlotToken(i as u32);
-            ctx.dict_slots
-                .push((token, SlotId::new(slot_ref.as_str(&self.operations))));
-        }
-
-        for (i, pred_ref) in ctx.scratch_predicates.iter().enumerate() {
-            let cell = Cell(i as u64);
-            ctx.dict_predicates
-                .push((cell, Predicate::new(pred_ref.as_str(&self.operations))));
-        }
-
-        let literal_offset = ctx.scratch_predicates.len();
-        for (i, lit_ref) in ctx.scratch_literals.iter().enumerate() {
-            let cell = Cell((i + literal_offset) as u64);
-            ctx.dict_literals
-                .push((cell, Literal::new(lit_ref.as_str(&self.operations))));
-        }
-
-        let load_atom = |atom: &AtomRef| -> Result<Instruction, String> {
-            match atom {
-                AtomRef::Entity(e) => Ok(Instruction::push(Cell(e.0))),
-                AtomRef::Literal(l) => {
-                    let idx = ctx
-                        .scratch_literals
-                        .binary_search_by_key(&l.as_str(), |&r| r.as_str(&self.operations))
-                        .unwrap();
-                    Ok(Instruction::push(Cell((idx + literal_offset) as u64)))
-                }
-                AtomRef::Symbol(s) => {
-                    if let Some(local) = ctx
-                        .scratch_symbols
-                        .iter()
-                        .position(|&sym| sym.as_str(&self.operations) == s.as_str())
-                    {
-                        Ok(Instruction::load_local(local as u32))
-                    } else {
-                        Err(format!("use of undefined symbol '{}'", s))
-                    }
-                }
-            }
-        };
-
-        for op in &self.operations {
-            match op {
-                TransactionOp::Allocate { result } => {
-                    let local = ctx
-                        .scratch_symbols
-                        .iter()
-                        .position(|&sym| sym.as_str(&self.operations) == result.as_str())
-                        .unwrap() as u32;
-                    ctx.instructions.push(Instruction::allocate());
-                    ctx.instructions.push(Instruction::store_local(local));
-                }
-                TransactionOp::ExpectWorld { expected } => {
-                    ctx.instructions.push(Instruction::raw(
-                        Opcode::ExpectObject,
-                        u32::MAX,
-                        expected.0,
-                    ));
-                }
-                TransactionOp::ExpectObject { slot, expected } => {
-                    let token_idx = ctx
-                        .scratch_slots
-                        .binary_search_by_key(&slot.as_str(), |&r| r.as_str(&self.operations))
-                        .unwrap() as u32;
-                    let cell = match expected {
-                        AtomRef::Entity(e) => Cell(e.0),
-                        AtomRef::Literal(l) => {
-                            let idx = ctx.scratch_literals.binary_search_by_key(&l.as_str(), |&r| r.as_str(&self.operations)).unwrap();
-                            Cell((idx + literal_offset) as u64)
-                        }
-                        AtomRef::Symbol(_) => return Err("ExpectObject cannot take a dynamic symbol as expected value in SISA v1".to_string()),
-                    };
-                    ctx.instructions.push(Instruction::raw(
-                        Opcode::ExpectObject,
-                        token_idx,
-                        cell.0,
-                    ));
-                }
-                TransactionOp::Define {
-                    slot,
-                    subject,
-                    predicate,
-                    object,
-                } => {
-                    ctx.instructions.push(load_atom(subject)?);
-                    let pred_idx = ctx
-                        .scratch_predicates
-                        .binary_search_by_key(&predicate.as_str(), |&r| r.as_str(&self.operations))
-                        .unwrap();
-                    ctx.instructions
-                        .push(Instruction::push(Cell(pred_idx as u64)));
-                    ctx.instructions.push(load_atom(object)?);
-                    let token_idx = ctx
-                        .scratch_slots
-                        .binary_search_by_key(&slot.as_str(), |&r| r.as_str(&self.operations))
-                        .unwrap() as u32;
-                    ctx.instructions
-                        .push(Instruction::define(SlotToken(token_idx)));
-                }
-                TransactionOp::Forget { slot } => {
-                    let token_idx = ctx
-                        .scratch_slots
-                        .binary_search_by_key(&slot.as_str(), |&r| r.as_str(&self.operations))
-                        .unwrap() as u32;
-                    ctx.instructions
-                        .push(Instruction::forget(SlotToken(token_idx)));
-                }
-                TransactionOp::Reject => {
-                    ctx.instructions.push(Instruction::reject());
-                }
-            }
-        }
-
-        let dict = StreamDictionary {
-            slots: std::mem::take(&mut ctx.dict_slots),
-            predicates: std::mem::take(&mut ctx.dict_predicates),
-            literals: std::mem::take(&mut ctx.dict_literals),
-        };
-
-        Ok(InstructionStreamFrame::new(
-            self.namespace,
-            dict,
-            local_count,
-            std::mem::take(&mut ctx.instructions),
-        ))
+    ) -> Result<InstructionStreamFrame, LoweringError> {
+        let source = OwnedOperationSource(&self.operations);
+        ctx.lower_from_source(self.namespace, &source)
     }
 }
 
@@ -379,7 +511,7 @@ mod tests {
             ],
         );
         let err = ast.lower_to_sisa().unwrap_err();
-        assert_eq!(err, "duplicate allocation for symbol 'foo'");
+        assert_eq!(err, LoweringError::DuplicateAllocation("foo".to_string()));
     }
 
     #[test]
@@ -396,7 +528,7 @@ mod tests {
             ],
         );
         let err = ast.lower_to_sisa().unwrap_err();
-        assert_eq!(err, "use of undefined symbol 'undefined'");
+        assert_eq!(err, LoweringError::UndefinedSymbol("undefined".to_string()));
     }
 
     // Original lowering implementation preserved for differential testing
@@ -592,22 +724,32 @@ mod tests {
             let ast = TransactionAST::new(rng.next_u32() as u64, operations);
             
             let ref_res = ast.lower_to_sisa_reference();
-            let new_res_oneshot = ast.lower_to_sisa();
-            let new_res_pooled = ast.lower_to_sisa_with(&mut ctx);
-            if let Ok(frame) = &new_res_pooled {
-                let frame_clone = InstructionStreamFrame::new(
-                    frame.namespace,
-                    frame.dictionary.clone(),
-                    frame.local_count,
-                    frame.instructions.clone(),
-                );
-                ctx.reclaim(frame_clone);
+            let new_res_oneshot = ast.lower_to_sisa().map_err(|e| e.to_string());
+            
+            let res_pooled = ast.lower_to_sisa_with(&mut ctx);
+            let new_res_pooled = res_pooled.clone().map_err(|e| e.to_string());
+            if let Ok(frame) = res_pooled {
+                ctx.reclaim(frame);
+            } else {
+                ctx.clear();
+            }
+
+            let view_ops: Vec<TransactionOpView> = (0..op_count)
+                .map(|i| OwnedOperationSource(&ast.operations).operation(i))
+                .collect();
+            let view = TransactionView::borrowed(ast.namespace, &view_ops);
+            
+            let res_view = view.lower_to_sisa_with(&mut ctx);
+            let new_res_view = res_view.clone().map_err(|e| e.to_string());
+            if let Ok(frame) = res_view {
+                ctx.reclaim(frame);
             } else {
                 ctx.clear();
             }
             
             assert_eq!(ref_res, new_res_oneshot);
             assert_eq!(ref_res, new_res_pooled);
+            assert_eq!(ref_res, new_res_view);
         }
     }
 
@@ -656,12 +798,6 @@ mod tests {
         assert_eq!(frame.dictionary.literals.len(), 2);
         assert_eq!(frame.dictionary.literals[0].1.as_str(), "ant");
         assert_eq!(frame.dictionary.literals[1].1.as_str(), "zoo");
-
-        // Check local assignments (symbols). BTreeMap means apple=0, zebra=1
-        // Wait, local allocation order in the current code:
-        // TransactionOp::Allocate assigns local_count sequentially as operations are visited.
-        // It does NOT sort symbols for local ID assignment! It just checks `symbols.contains_key`.
-        // Let's verify by checking the instruction stream.
 
         let mut insts = frame.instructions.iter();
 
