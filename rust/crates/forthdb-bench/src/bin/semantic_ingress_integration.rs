@@ -1,5 +1,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -89,7 +90,7 @@ fn populate_database(size: usize) -> (Arc<Database<MemoryCommitStore>>, Arc<Worl
     }
 
     let mut materializer = VmEpochMaterializer::new(1);
-    let batch_size = 1000;
+    let batch_size = 10000;
     let mut current_base = database.snapshot();
 
     for batch_start in (0..size).step_by(batch_size) {
@@ -437,16 +438,35 @@ fn run_full_controller_benchmarks() {
     println!("                FULL CONTROLLER BENCHMARK MATRIX (CONTROLS A-G)                   ");
     println!("==================================================================================");
 
-    let controls = [
-        BenchmarkControl::A_QueuedLegacy,
-        BenchmarkControl::B_QueuedMixed,
-        BenchmarkControl::C_SemanticWarm,
-        BenchmarkControl::D_SemanticNew,
-        BenchmarkControl::E_MixedFiftyFifty,
-        BenchmarkControl::F_SemanticAcceptingValidator,
-        BenchmarkControl::G_SemanticRejectingValidator,
-    ];
+    run_controller_matrix();
+}
 
+fn populate_base_store(size: usize) -> MemoryCommitStore {
+    let store = MemoryCommitStore::new();
+    if size == 0 {
+        return store;
+    }
+    let database = Arc::new(Database::new(store).unwrap());
+    let mut mat = VmEpochMaterializer::new(1);
+    let mut intents = Vec::with_capacity(size);
+    for i in 0..size {
+        let mut q = QueuedIntent::new();
+        let ent = q.entity();
+        q.define(
+            SlotId::new(&format!("init_slot_{i}")),
+            IntentFact {
+                subject: IntentAtom::Temporary(ent),
+                predicate: Predicate::new("init_pred"),
+                object: IntentAtom::Literal(Literal::new(&format!("init_val_{i}"))),
+            },
+        );
+        intents.push(ControllerIntent::Queued(q));
+    }
+    database.commit_mixed_epoch(intents, &mut mat);
+    database.store_clone()
+}
+
+fn run_controller_matrix() {
     let state_sizes = [
         ("Genesis / Tiny", 0usize),
         ("10,000 Defs", 10_000usize),
@@ -467,10 +487,21 @@ fn run_full_controller_benchmarks() {
         ),
     ];
 
+    let controls = [
+        BenchmarkControl::A_QueuedLegacy,
+        BenchmarkControl::B_QueuedMixed,
+        BenchmarkControl::C_SemanticWarm,
+        BenchmarkControl::D_SemanticNew,
+        BenchmarkControl::E_MixedFiftyFifty,
+        BenchmarkControl::F_SemanticAcceptingValidator,
+        BenchmarkControl::G_SemanticRejectingValidator,
+    ];
+
     let concurrencies = [1, 16, 64];
 
     for (state_name, state_size) in state_sizes {
         println!("\n>>>>>>>> STATE SIZE: {} <<<<<<<<", state_name);
+        let base_store = populate_base_store(state_size);
 
         for (policy_name, policy) in batch_configs {
             for concurrency in concurrencies {
@@ -480,7 +511,7 @@ fn run_full_controller_benchmarks() {
                 );
 
                 for control in controls {
-                    execute_single_benchmark_run(control, state_size, policy, concurrency);
+                    execute_single_benchmark_run(control, state_size, policy, concurrency, &base_store);
                 }
             }
         }
@@ -492,12 +523,19 @@ fn execute_single_benchmark_run(
     retained_state_size: usize,
     batch_policy: BatchPolicy,
     procurrency: usize,
+    base_store: &MemoryCommitStore,
 ) {
-    let total_intents = 10_000usize;
-    let intents_per_producer = total_intents / procurrency;
+    let total_intents = match (retained_state_size, matches!(batch_policy, BatchPolicy::ImmediateDrain { max_batch: 1 })) {
+        (0, _) => 2_000usize,
+        (10_000, _) => 1_000usize,
+        (_, true) => 50usize,
+        (_, false) => 500usize,
+    };
+    let intents_per_producer = (total_intents / procurrency).max(1);
     let total_intents = intents_per_producer * procurrency;
 
-    let (database, initial_base) = populate_database(retained_state_size);
+    let database = Arc::new(Database::new(base_store.clone()).unwrap());
+    let initial_base = database.snapshot();
 
     if matches!(control, BenchmarkControl::F_SemanticAcceptingValidator) {
         database.register_validator(|_| Ok(()));
@@ -798,10 +836,15 @@ fn execute_single_benchmark_run(
     let tps = total_intents as f64 / total_elapsed.as_secs_f64();
 
     latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p50 = latencies_us[latencies_us.len() / 2];
-    let p95 = latencies_us[(latencies_us.len() as f64 * 0.95) as usize];
-    let p99 = latencies_us[(latencies_us.len() as f64 * 0.99) as usize];
-    let max_lat = latencies_us.last().copied().unwrap_or(0.0);
+    let (p50, p95, p99, max_lat) = if latencies_us.is_empty() {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let p50 = latencies_us[latencies_us.len() / 2];
+        let p95 = latencies_us[((latencies_us.len() as f64 * 0.95) as usize).min(latencies_us.len() - 1)];
+        let p99 = latencies_us[((latencies_us.len() as f64 * 0.99) as usize).min(latencies_us.len() - 1)];
+        let max_lat = latencies_us.last().copied().unwrap_or(0.0);
+        (p50, p95, p99, max_lat)
+    };
 
     // Correctness Assertions
     let final_world = database.snapshot();
@@ -832,6 +875,8 @@ fn execute_single_benchmark_run(
         accepted_count,
         rejected_count
     );
+    std::io::stdout().flush().ok();
+    std::io::stdout().flush().ok();
 }
 
 enum TicketEnum {

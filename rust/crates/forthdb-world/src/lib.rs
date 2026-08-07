@@ -92,7 +92,7 @@ pub trait CommitStore: Send {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct MemoryCommitStore {
     frames: Vec<Arc<CommitFrame>>,
 }
@@ -1094,6 +1094,16 @@ impl<S: CommitStore> Database<S> {
     pub fn snapshot(&self) -> Arc<World> {
         self.current
             .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn store_clone(&self) -> S
+    where
+        S: Clone,
+    {
+        self.store
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
