@@ -1,102 +1,137 @@
 # AGENTS.md
 
 This file defines how coding agents should operate in the ForthDB repository.
-It is intentionally not a second architecture specification. Agents and human
-contributors should derive technical meaning from the same project documents.
+It is intentionally not a second architecture specification. Agents and humans
+derive technical meaning from the same project documents and executable evidence.
 
-## Working model
+## ForthDB agent philosophy
 
-ForthDB is developed as a research system with executable evidence. Prefer
-small, testable changes that preserve documented contracts and accumulated
-regression evidence.
+ForthDB is developed through human-directed, agent-assisted research. Agents may
+do substantial implementation work, but the repository—not the conversation—is
+the project's durable memory.
 
-Do not infer a new architectural contract from implementation alone. If code,
-tests, and documentation disagree, surface the discrepancy and resolve it
-explicitly rather than silently choosing one source.
+### Humans and agents share one technical reality
 
-Do not remove or "clean up" older implementations merely because they appear
-superseded. Some are retained as historical controls, semantic references, or
-falsification evidence.
+There is no agent-only architecture.
 
-## Read before changing
+Architecture, contracts, rationale, and research results belong in normal
+repository documentation and executable evidence that a human contributor would
+also use. `AGENTS.md` describes how an agent works with that material; it is not
+a private substitute for it.
 
-Use the narrowest authoritative documentation set that governs the change.
+If an agent needs durable knowledge to work correctly, first ask whether that
+knowledge belongs in ordinary project documentation, a test, or an executable
+contract rather than in an agent-only instruction.
 
-- Repository orientation and project history: `README.md`
-- Architectural layering and preservation rules: `ARCHITECTURE.md`
-- Current committed-world semantic contract: `WORLD_CONTRACT.md`
-- Durable file-format behavior: `FILE_FORMAT.md`
-- Stable Semantic ISA contract: `SEMANTIC_ISA_SPEC.md`
-- AST-to-SISA lowering rules: `AST_TO_SISA_LOWERING.md`
-- Current Rust engine, milestones, commands, and correctness gates: `rust/README.md`
-- Historical Python-era research status: `STATUS.md`
+### Evidence outranks elegance
 
-For Rust subsystem work, also read the specific design document associated with
-the subsystem being changed. Examples include:
+ForthDB evolves by constructing executable models and attempting to break its
+current explanations. Failed experiments, superseded implementations, negative
+benchmarks, and historical controls may be valuable evidence.
 
-- `rust/STRUCTURAL_SHARING.md`
-- `rust/QUEUED_DURABILITY.md`
-- `rust/FILE_EPOCHS.md`
-- `rust/IO_URING_EPOCHS.md`
-- `rust/ADMISSION_EPOCH_WORLDS.md`
-- `rust/DURABLE_TOKEN_VM.md`
-- `rust/VM_DIRECT_QUERIES.md`
-- `rust/LIFECYCLE_SAFETY.md`
+Do not optimize the history of the project into a cleaner story than actually
+happened. A simpler repository is not necessarily a better repository if the
+simplification destroys evidence explaining why the current architecture exists.
 
-The subsystem document may describe implementation detail or experimental
-evidence. Root-level contracts remain authoritative for semantics that they
-explicitly define.
+### Implementation answers questions
+
+For substantial work, identify the research question or contract being changed
+before writing code. Be able to say what observation would count against the
+proposed approach.
+
+Do not turn requests such as "make this faster" or "improve the architecture"
+into an open-ended license to redesign the system. Prefer the smallest coherent
+experiment capable of distinguishing between competing explanations.
+
+A useful experiment can falsify its motivating idea.
+
+### Conversation is working memory; the repository is durable memory
+
+Do not rely on conversation history to preserve a decision, invariant, negative
+result, or non-obvious constraint needed by future work. Put durable knowledge in
+the appropriate shared document, test, conformance case, benchmark record, or
+executable contract.
+
+A future human or agent starting from a clean checkout should be able to
+understand why the resulting system exists without reconstructing the
+conversation that produced it.
+
+### Do not make the architecture silently smarter
+
+Implementation may reveal that the current model is incomplete or wrong. That is
+useful evidence, not permission to quietly repair the architecture in code.
+
+When code, tests, and documentation disagree, surface the discrepancy. Determine
+whether the implementation is wrong, the document is stale, or the contract is
+intentionally changing, then make that resolution visible.
+
+Architectural evolution should be explicit, evidenced, and understandable to the
+next contributor.
+
+## Finding the governing contract
+
+Do not read every Markdown file by default. Use the narrowest documentation set
+that governs the work, then follow references when the change crosses a boundary.
+
+The main entry points are:
+
+- `README.md` — repository orientation and project history
+- `ARCHITECTURE.md` — architectural layering and preservation rules
+- `WORLD_CONTRACT.md` — committed-world semantic contract
+- `FILE_FORMAT.md` — durable file-format behavior
+- `SEMANTIC_ISA_SPEC.md` — stable Semantic ISA contract
+- `AST_TO_SISA_LOWERING.md` — canonical AST-to-SISA lowering
+- `rust/README.md` — current Rust engine, milestones, commands, and correctness gates
+- `STATUS.md` — historical Python-era research status; evidence, not current roadmap
+
+For Rust subsystem work, read the subsystem document associated with the code
+being changed. The `rust/` design documents record both active contracts and
+experimental evidence. Root-level contracts remain authoritative for semantics
+they explicitly define.
 
 ## Change discipline
 
 When modifying ForthDB:
 
-1. Identify the contract or research question affected by the change.
-2. Read the governing documentation before editing implementation code.
+1. State the contract, hypothesis, or research question affected by the change.
+2. Read the governing shared documentation before editing implementation code.
 3. Preserve existing semantic and durability invariants unless the task
    explicitly changes them.
-4. Prefer the smallest coherent implementation that can answer the question.
-5. Extend tests or conformance evidence for behavior changes.
-6. Update shared project documentation when a contract, architecture, or
-   established result changes.
-7. Keep experimental findings, including negative results, when they explain
-   why the current design exists.
+4. Prefer the smallest coherent implementation or experiment that can answer the
+   question.
+5. Extend tests, conformance cases, or benchmark evidence when behavior changes.
+6. Record durable conclusions in the repository rather than leaving them only in
+   conversation.
+7. Preserve negative results and historical controls when they explain why the
+   current design exists.
 
-Do not change documented semantics merely to make an implementation easier.
-Do not promote an implementation observation into a repository-wide contract
+Do not change documented semantics merely to make an implementation easier. Do
+not promote an implementation observation into a repository-wide contract
 without explicit documentation and evidence.
 
-## Important invariants
+## Invariants worth knowing before you touch the engine
 
-Unless a task explicitly changes a documented contract, preserve these rules:
+Unless a task explicitly changes a documented contract:
 
 - Committed Worlds are immutable logical states.
 - Transactions and queued intents construct private successors rather than
   mutating a published World.
 - Durable history is authoritative; derived indexes and caches are rebuildable.
-- Rollback is represented by a later committed World, not history deletion.
+- Rollback is a later committed World, not deletion of history.
 - Strict transactions retain stale-writer rejection semantics.
-- A rejected candidate or intent must not consume committed history or allocator
+- A rejected candidate or intent does not consume committed history or allocator
   state unless the governing contract explicitly says otherwise.
-- Durability and publication ordering must follow the active store/controller
+- Durability and publication ordering follow the active store/controller
   contract.
-- Corruption must fail closed where the documented format requires it.
-- Existing public format and Semantic ISA contracts must remain stable unless a
-  versioned change is intentional.
+- Corruption fails closed where the documented format requires it.
+- Public format and Semantic ISA contracts remain stable unless a versioned
+  change is intentional.
 
-## Historical and reference implementations
-
-Treat historical code as evidence, not dead weight.
-
-The Python semantic kernel and applications remain useful references for the
-meaning and evolution of ForthDB. The Rust engine contains newer implementation
-work and extensive differential, conformance, recovery, and durability evidence.
-Do not rewrite one to resemble the other unless the change has a specific
-semantic or experimental purpose.
-
-When a newer implementation replaces an older mechanism, preserve tests or
-controls that still establish semantic continuity or document a falsified
-approach.
+Treat historical code as evidence, not dead weight. The Python semantic kernel
+and applications remain reference material for ForthDB's meaning and evolution.
+The Rust engine contains newer implementation work plus differential,
+conformance, recovery, and durability evidence. Do not rewrite one to resemble
+the other merely for consistency of style.
 
 ## Validation
 
@@ -113,40 +148,24 @@ cargo run --quiet --manifest-path rust/Cargo.toml \
   -p forthdb-conformance -- conformance/v1/kernel_cases.json
 ```
 
-Do not run expensive release benchmarks unless the task changes performance,
-concurrency, durability transport, allocation behavior, or a benchmarked claim.
-When performance is the question, compare against an appropriate existing
+Do not run expensive release benchmarks merely because they exist. Run them when
+the task changes performance, concurrency, durability transport, allocation
+behavior, or a benchmarked claim. Compare against an appropriate existing
 control and preserve enough information to reproduce the result.
 
 Linux-specific io_uring behavior should not be assumed available on every
 machine or CI environment.
 
-## Documentation rules
+## Completion
 
-Keep durable knowledge in normal repository documentation so humans and agents
-share the same source of truth.
+Before declaring work complete, ask whether a future contributor with only a
+clean checkout has everything needed to understand and verify the change.
 
-Use `AGENTS.md` for repository operating rules, navigation, validation
-expectations, and agent-specific workflow constraints. Do not duplicate detailed
-architecture or subsystem specifications here.
+Relevant tests and conformance checks should pass. Intentional contract changes
+should be documented. Comments and docs should not claim evidence the work did
+not establish. Historical controls and negative evidence should remain intact
+unless their removal is itself justified. Generated artifacts, caches, benchmark
+output, and local state should not be accidentally committed.
 
-When implementation and documentation diverge, do not silently patch around the
-mismatch. Determine whether the implementation is wrong, the document is stale,
-or the contract is intentionally changing, then make that resolution visible in
-the change.
-
-## Completion criteria
-
-Before declaring work complete:
-
-- the change satisfies the requested behavior or research question;
-- relevant tests and conformance checks pass;
-- preserved contracts still hold, or intentional contract changes are documented;
-- comments and docs do not claim evidence the change did not establish;
-- historical controls and negative experimental evidence remain intact unless
-  their removal is itself justified;
-- generated artifacts, caches, benchmark output, and local state are not
-  accidentally committed.
-
-If a task reveals an unresolved architectural contradiction, report it instead
+If the work reveals an unresolved architectural contradiction, report it instead
 of hiding it behind a local implementation workaround.
